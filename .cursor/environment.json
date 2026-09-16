@@ -1,0 +1,4 @@
+{
+  "name": "horse_racing_prediction",
+  "install": "bash .cursor/install.sh"
+}
