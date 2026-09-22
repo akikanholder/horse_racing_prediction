@@ -1,0 +1,36 @@
+[project]
+name = "horse-racing-prediction"
+version = "1.0.0"
+description = "JRA競馬のレース情報、競走馬情報、コース情報を提供するバックエンドシステム"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "LOG",    # flake8-logging
+]
+ignore = [
+    "BLE001", # Catching broad exception (intentional in API endpoints)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
