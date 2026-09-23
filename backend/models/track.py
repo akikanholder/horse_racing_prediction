@@ -1,8 +1,7 @@
-"""Data models for track information."""
+"""Detailed track (baba) information models."""
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -83,16 +82,16 @@ class Weather(str, Enum):
 class MoistureContent(BaseModel):
     """含水率 (Moisture content)."""
 
-    goal_front: Optional[float] = Field(None, description="ゴール前の含水率")
-    fourth_corner: Optional[float] = Field(None, description="4コーナーの含水率")
-    measured_at: Optional[datetime] = Field(None, description="測定時刻")
+    goal_front: float | None = Field(None, description="ゴール前の含水率")
+    fourth_corner: float | None = Field(None, description="4コーナーの含水率")
+    measured_at: datetime | None = Field(None, description="測定時刻")
 
 
 class CushionValue(BaseModel):
     """クッション値 (Cushion value)."""
 
-    value: Optional[float] = Field(None, description="クッション値")
-    measured_at: Optional[datetime] = Field(None, description="測定時刻")
+    value: float | None = Field(None, description="クッション値")
+    measured_at: datetime | None = Field(None, description="測定時刻")
 
     @property
     def hardness_level(self) -> str:
@@ -101,27 +100,24 @@ class CushionValue(BaseModel):
             return "不明"
         if self.value >= 12:
             return "硬め"
-        elif self.value >= 10:
+        if self.value >= 10:
             return "やや硬め"
-        elif self.value >= 8:
+        if self.value >= 8:
             return "標準"
-        elif self.value >= 7:
+        if self.value >= 7:
             return "やや軟らか"
-        else:
-            return "軟らか"
+        return "軟らか"
 
 
 class CourseInfo(BaseModel):
-    """コース情報."""
+    """芝またはダートの馬場情報."""
 
     course_type: CourseType = Field(..., description="コースタイプ (芝/ダート)")
     condition: TrackCondition = Field(
         default=TrackCondition.UNKNOWN, description="馬場状態"
     )
-    moisture: Optional[MoistureContent] = Field(None, description="含水率情報")
-    cushion: Optional[CushionValue] = Field(
-        None, description="クッション値 (芝コースのみ)"
-    )
+    moisture: MoistureContent | None = Field(None, description="含水率情報")
+    cushion: CushionValue | None = Field(None, description="クッション値 (芝コースのみ)")
 
 
 class WeeklyInfo(BaseModel):
@@ -129,32 +125,32 @@ class WeeklyInfo(BaseModel):
 
     date: datetime = Field(..., description="日付")
     weather: Weather = Field(default=Weather.UNKNOWN, description="天候")
-    rainfall_mm: Optional[float] = Field(None, description="降水量 (mm)")
+    rainfall_mm: float | None = Field(None, description="降水量 (mm)")
     watering: bool = Field(default=False, description="散水の有無")
 
 
 class GrassInfo(BaseModel):
     """芝情報."""
 
-    native_grass_cm: Optional[tuple[float, float]] = Field(
+    native_grass_cm: tuple[float, float] | None = Field(
         None, description="野芝の芝丈 (min, max) cm"
     )
-    western_grass_cm: Optional[tuple[float, float]] = Field(
+    western_grass_cm: tuple[float, float] | None = Field(
         None, description="洋芝の芝丈 (min, max) cm"
     )
-    course_name: Optional[str] = Field(None, description="使用コース (A/B/Cコースなど)")
-    condition_notes: Optional[str] = Field(None, description="芝の状態メモ")
+    course_name: str | None = Field(None, description="使用コース (A/B/Cコースなど)")
+    condition_notes: str | None = Field(None, description="芝の状態メモ")
 
 
 class TrackInfo(BaseModel):
-    """競馬場情報."""
+    """競馬場の馬場情報."""
 
     racecourse: str = Field(..., description="競馬場名")
     date: datetime = Field(..., description="開催日")
     weather: Weather = Field(default=Weather.UNKNOWN, description="天候")
-    turf: Optional[CourseInfo] = Field(None, description="芝コース情報")
-    dirt: Optional[CourseInfo] = Field(None, description="ダートコース情報")
-    grass_info: Optional[GrassInfo] = Field(None, description="芝丈・コース情報")
+    turf: CourseInfo | None = Field(None, description="芝コース情報")
+    dirt: CourseInfo | None = Field(None, description="ダートコース情報")
+    grass_info: GrassInfo | None = Field(None, description="芝丈・コース情報")
     weekly_info: list[WeeklyInfo] = Field(
         default_factory=list, description="週間天候情報"
     )

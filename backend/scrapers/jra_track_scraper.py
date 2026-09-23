@@ -1,15 +1,16 @@
-"""JRA (Japan Racing Association) track information scraper."""
+"""JRA baba (track condition) scraper.
+
+Source: https://www.jra.go.jp/keiba/baba/index.html
+"""
 
 import logging
 import re
 from datetime import datetime
-from typing import Optional
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
-from .base import BaseScraper
-from .models import (
+from backend.models.track import (
     CourseInfo,
     CourseType,
     CushionValue,
@@ -20,15 +21,13 @@ from .models import (
     Weather,
     WeeklyInfo,
 )
+from backend.scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
 
-class JRAScraper(BaseScraper):
-    """Scraper for JRA track information.
-
-    Source: https://www.jra.go.jp/keiba/baba/index.html
-    """
+class JRATrackScraper(BaseScraper):
+    """Scraper for JRA track (baba) information."""
 
     BASE_URL = "https://www.jra.go.jp"
     TRACK_INFO_PATH = "/keiba/baba/index.html"
@@ -50,7 +49,7 @@ class JRAScraper(BaseScraper):
         """Return the base URL for JRA."""
         return self.BASE_URL
 
-    def get_track_url(self, racecourse: Optional[str] = None) -> str:
+    def get_track_url(self, racecourse: str | None = None) -> str:
         """Get the URL for track information.
 
         Args:
@@ -64,7 +63,7 @@ class JRAScraper(BaseScraper):
             return urljoin(self.BASE_URL, f"/keiba/baba/{racecourse}.html")
         return urljoin(self.BASE_URL, self.TRACK_INFO_PATH)
 
-    def scrape(self, racecourse: Optional[str] = None) -> TrackInfo:
+    def scrape(self, racecourse: str | None = None) -> TrackInfo:
         """Scrape track information from JRA.
 
         Args:
@@ -79,7 +78,7 @@ class JRAScraper(BaseScraper):
         return self._parse_track_info(soup, racecourse)
 
     def _parse_track_info(
-        self, soup: BeautifulSoup, racecourse: Optional[str]
+        self, soup: BeautifulSoup, racecourse: str | None
     ) -> TrackInfo:
         """Parse track information from the page."""
         racecourse_name = self._extract_racecourse_name(soup, racecourse)
@@ -120,7 +119,7 @@ class JRAScraper(BaseScraper):
         )
 
     def _extract_racecourse_name(
-        self, soup: BeautifulSoup, racecourse: Optional[str]
+        self, soup: BeautifulSoup, racecourse: str | None
     ) -> str:
         """Extract the racecourse name from the page title or mapping."""
         if racecourse and racecourse in self.RACECOURSE_MAPPING:
@@ -208,7 +207,7 @@ class JRAScraper(BaseScraper):
 
         return TrackCondition.UNKNOWN
 
-    def _extract_cushion_value(self, soup: BeautifulSoup) -> Optional[CushionValue]:
+    def _extract_cushion_value(self, soup: BeautifulSoup) -> CushionValue | None:
         """Extract cushion value for turf course."""
         text = soup.get_text()
         pattern = r"クッション値[^\d]*(\d+\.?\d*)"
@@ -223,7 +222,7 @@ class JRAScraper(BaseScraper):
 
     def _extract_moisture_content(
         self, soup: BeautifulSoup
-    ) -> tuple[Optional[MoistureContent], Optional[MoistureContent]]:
+    ) -> tuple[MoistureContent | None, MoistureContent | None]:
         """Extract moisture content for turf and dirt courses."""
         turf_moisture = None
         dirt_moisture = None
@@ -260,7 +259,7 @@ class JRAScraper(BaseScraper):
 
     def _extract_measurement_time(
         self, soup: BeautifulSoup, section_name: str
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         """Extract measurement time for a specific section."""
         text = soup.get_text()
         pattern = rf"{section_name}[^\n]*?(\d{{1,2}})月(\d{{1,2}})日[^\d]*(\d{{1,2}})[時:](\d{{1,2}})"
@@ -281,7 +280,7 @@ class JRAScraper(BaseScraper):
 
         return None
 
-    def _extract_grass_info(self, soup: BeautifulSoup) -> Optional[GrassInfo]:
+    def _extract_grass_info(self, soup: BeautifulSoup) -> GrassInfo | None:
         """Extract grass length and course information."""
         text = soup.get_text()
 
@@ -386,7 +385,7 @@ class JRAScraper(BaseScraper):
 
         return weekly_info
 
-    def _parse_float(self, text: str) -> Optional[float]:
+    def _parse_float(self, text: str) -> float | None:
         """Parse a float from text, returning None if not possible."""
         try:
             cleaned = re.sub(r"[^\d.]", "", text)

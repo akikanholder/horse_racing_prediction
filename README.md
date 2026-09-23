@@ -1,25 +1,55 @@
 # horse_racing_prediction
 競馬予測
 
+## 概要
+
+JRA（日本中央競馬会）の競馬データをスクレイピングして、レース情報、競走馬情報、コース情報、馬場情報を提供するバックエンドシステムです。パッケージは `backend` ディレクトリです。
+
 ## 機能
 
-### 馬場情報スクレイピング
+### スクレイピング対象
 
-競馬場の馬場情報（馬場状態、含水率、クッション値など）を取得するスクレイパーを提供します。
+- **JRA公式サイト** (https://jra.jp/keiba/)
+  - 今週のレーススケジュール
+  - 競馬場スケジュール
+  - コース情報
+- **JRA馬場情報** (https://www.jra.go.jp/keiba/baba/index.html)
+  - 馬場状態（芝/ダート）
+  - クッション値
+  - 含水率（ゴール前、4コーナー）
+  - 週間天候・芝丈・使用コース
+- **netkeiba** (https://race.netkeiba.com/top)
+  - 詳細なレース情報
+  - 出馬表（出走馬リスト）
+  - レース結果
+  - 競走馬の詳細情報（血統、過去成績など）
+- **netkeiba馬場情報** (https://race.netkeiba.com/race/track.html)
+  - 馬場状態、クッション値、含水率
 
-#### 対応データソース
+### 取得できる情報
 
-- **JRA（日本中央競馬会）**: https://www.jra.go.jp/keiba/baba/index.html
-- **Netkeiba**: https://race.netkeiba.com/race/track.html
+1. **レース情報** (Race)
+   - レース名、レース番号
+   - 開催日、発走時刻
+   - 競馬場、距離、コース種別（芝/ダート/障害）
+   - 馬場状態、天候
+   - クラス、グレード
 
-#### 取得可能な情報
+2. **競走馬情報** (Horse)
+   - 馬名、性別、年齢
+   - 血統（父、母、母父）
+   - 調教師、馬主
+   - 過去の成績
 
-- 馬場状態（良/稍重/重/不良）
-- クッション値（芝コース）
-- 含水率（ゴール前、4コーナー）
-- 天候
-- 週間天候情報（JRA）
-- 芝丈・使用コース情報（JRA）
+3. **コース情報** (Course)
+   - 競馬場データ（周回距離、直線距離）
+   - 現在の馬場状態
+
+4. **馬場情報** (TrackInfo)
+   - 芝/ダートの馬場状態（良/稍重/重/不良）
+   - クッション値と硬さレベル
+   - 含水率（ゴール前、4コーナー）
+   - 天候、週間天候、芝丈、使用コース
 
 ## インストール
 
@@ -27,129 +57,135 @@
 pip install -r requirements.txt
 ```
 
-または
-
-```bash
-pip install -e .
-```
-
 ## 使用方法
 
-### JRAスクレイパー
-
-```python
-from src.scrapers import JRAScraper
-
-with JRAScraper() as scraper:
-    # デフォルトページ（現在開催中の競馬場）をスクレイピング
-    track_info = scraper.scrape()
-    
-    # 特定の競馬場を指定
-    track_info = scraper.scrape("nakayama")  # 中山
-    
-    print(f"競馬場: {track_info.racecourse}")
-    print(f"芝馬場状態: {track_info.turf.condition.value}")
-    print(f"ダート馬場状態: {track_info.dirt.condition.value}")
-```
-
-### Netkeibaスクレイパー
-
-```python
-from src.scrapers import NetkeibaScraper
-
-with NetkeibaScraper() as scraper:
-    # デフォルトページをスクレイピング
-    track_info = scraper.scrape()
-    
-    # 競馬場IDを指定（中山=06）
-    track_info = scraper.scrape("06")
-    
-    # 日付も指定
-    track_info = scraper.scrape("06", "20260922")
-    
-    print(f"競馬場: {track_info.racecourse}")
-    print(f"クッション値: {track_info.turf.cushion.value}")
-```
-
-### TrackInfoService（統合サービス）
-
-複数のデータソースからデータを取得し、統合することができます。
-
-```python
-from src.scrapers import TrackInfoService
-
-with TrackInfoService() as service:
-    # 両方のソースからデータを取得
-    results = service.get_track_info()
-    
-    # 特定の競馬場を指定
-    results = service.get_track_info(racecourse="中山")
-    
-    # データをマージして取得
-    results = service.get_track_info(merge=True)
-    
-    if "merged" in results:
-        merged_info = results["merged"]
-        print(f"統合データ - 芝: {merged_info.turf.condition.value}")
-```
-
-### JSON出力
-
-```python
-track_info = scraper.scrape()
-json_output = track_info.model_dump_json(indent=2, exclude_none=True)
-print(json_output)
-```
-
-## 競馬場コード
-
-| 競馬場 | JRAコード | NetkeibaID |
-|--------|-----------|------------|
-| 札幌   | sapporo   | 01         |
-| 函館   | hakodate  | 02         |
-| 福島   | fukushima | 03         |
-| 新潟   | niigata   | 04         |
-| 東京   | tokyo     | 05         |
-| 中山   | nakayama  | 06         |
-| 中京   | chukyo    | 07         |
-| 京都   | kyoto     | 08         |
-| 阪神   | hanshin   | 09         |
-| 小倉   | kokura    | 10         |
-
-## テスト
+### REST API サーバー
 
 ```bash
-# 全テスト実行
-pytest
+python -m backend.main
 
-# 単体テストのみ
-pytest -m "not integration"
+# または uvicorn で起動
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-# 統合テストのみ（ネットワークアクセスが必要）
-pytest -m "integration"
+API ドキュメント: http://localhost:8000/docs
+
+### API エンドポイント
+
+| エンドポイント | 説明 |
+|---------------|------|
+| `GET /api/races` | 今週のレース一覧を取得 |
+| `GET /api/races/{race_id}` | 特定のレース情報を取得 |
+| `GET /api/races/{race_id}/card` | 出馬表を取得 |
+| `GET /api/races/{race_id}/result` | レース結果を取得 |
+| `GET /api/races/{race_id}/horses` | 出走馬の詳細情報を取得 |
+| `GET /api/horses/{horse_id}` | 競走馬の詳細情報を取得 |
+| `GET /api/courses` | 全競馬場のコース情報を取得 |
+| `GET /api/courses/{venue}` | 特定競馬場のコース情報を取得 |
+| `GET /api/courses/{venue}/conditions` | 馬場状態を取得 |
+| `GET /api/venues` | 今週の開催競馬場を取得 |
+| `GET /api/tracks` | 馬場情報を取得（`venue`, `date`, `merge`） |
+
+### CLI ツール
+
+```bash
+# 今週のレース一覧
+python -m backend.cli races
+
+# 出馬表を取得
+python -m backend.cli card <race_id>
+
+# 競走馬情報を取得
+python -m backend.cli horse <horse_id>
+
+# コース情報を取得
+python -m backend.cli courses
+python -m backend.cli courses --venue 東京
+
+# 開催競馬場を取得
+python -m backend.cli venues
+
+# 馬場情報を取得
+python -m backend.cli track
+python -m backend.cli track --venue 中山 --merge
+
+# JSON形式で出力
+python -m backend.cli races --json
+
+# 詳細ログ付きで実行
+python -m backend.cli races -v
+```
+
+### Python から直接使用
+
+```python
+from backend.services.race_service import RaceService
+from backend.services.track_info_service import TrackInfoService
+
+with RaceService() as service:
+    schedule = service.get_weekly_races()
+    for race in schedule.races:
+        print(f"{race.race_date} {race.venue} {race.race_name}")
+
+with TrackInfoService() as service:
+    results = service.get_track_info(racecourse="中山", merge=True)
+    merged = results.get("merged") or results.get("jra")
+    if merged and merged.turf:
+        print(f"芝: {merged.turf.condition.value}")
 ```
 
 ## プロジェクト構成
 
 ```
-horse_racing_prediction/
-├── src/
+backend/
+├── __init__.py
+├── main.py              # FastAPI アプリケーション
+├── cli.py               # コマンドラインツール
+├── models/              # データモデル (Pydantic)
 │   ├── __init__.py
-│   └── scrapers/
-│       ├── __init__.py
-│       ├── models.py              # データモデル
-│       ├── base.py                # 基底スクレイパークラス
-│       ├── jra_scraper.py         # JRAスクレイパー
-│       ├── netkeiba_scraper.py    # Netkeibaスクレイパー
-│       └── track_info_service.py  # 統合サービス
-├── tests/
-│   └── test_scrapers.py
-├── examples/
-│   └── demo_scraper.py
-├── requirements.txt
-├── pyproject.toml
-└── pytest.ini
+│   ├── race.py          # レースモデル
+│   ├── horse.py         # 競走馬モデル
+│   ├── course.py        # コースモデル
+│   └── track.py         # 馬場情報モデル
+├── scrapers/            # スクレイパー
+│   ├── __init__.py
+│   ├── base_scraper.py  # 基底クラス
+│   ├── jra_scraper.py   # JRA レース・コース
+│   ├── netkeiba_scraper.py
+│   ├── jra_track_scraper.py      # JRA 馬場情報
+│   └── netkeiba_track_scraper.py
+├── services/            # ビジネスロジック
+│   ├── __init__.py
+│   ├── race_service.py
+│   └── track_info_service.py
+└── utils/               # ユーティリティ
+    ├── __init__.py
+    ├── http_client.py
+    └── date_utils.py
 ```
+
+## テスト
+
+```bash
+pytest
+pytest -m "not integration"
+pytest -m "integration"
+```
+
+## 技術スタック
+
+- **Python 3.11+**
+- **FastAPI** - REST API フレームワーク
+- **Pydantic** - データバリデーション
+- **BeautifulSoup4** - HTML パーシング
+- **requests / httpx** - HTTP クライアント
+- **lxml** - 高速 HTML パーサー
+
+## 注意事項
+
+- スクレイピングはサイトの利用規約に従って行ってください
+- リクエスト間隔を適切に設定し、サーバーに負荷をかけないようにしてください
+- 取得したデータの商用利用には注意が必要です
 
 ## ライセンス
 

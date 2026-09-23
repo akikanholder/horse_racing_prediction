@@ -3,18 +3,18 @@
 import pytest
 from datetime import datetime
 
-from src.scrapers.models import (
-    TrackCondition,
-    Weather,
-    CourseType,
-    MoistureContent,
-    CushionValue,
+from backend.models.track import (
     CourseInfo,
+    CourseType,
+    CushionValue,
+    MoistureContent,
+    TrackCondition,
     TrackInfo,
+    Weather,
 )
-from src.scrapers.jra_scraper import JRAScraper
-from src.scrapers.netkeiba_scraper import NetkeibaScraper
-from src.scrapers.track_info_service import TrackInfoService
+from backend.scrapers.jra_track_scraper import JRATrackScraper
+from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
+from backend.services.track_info_service import TrackInfoService
 
 
 class TestTrackCondition:
@@ -157,56 +157,56 @@ class TestTrackInfo:
         assert "Netkeiba" in json_data
 
 
-class TestJRAScraper:
+class TestJRATrackScraper:
     """Tests for JRA scraper."""
 
     def test_get_base_url(self):
-        scraper = JRAScraper()
+        scraper = JRATrackScraper()
         assert scraper.get_base_url() == "https://www.jra.go.jp"
 
     def test_get_track_url_default(self):
-        scraper = JRAScraper()
+        scraper = JRATrackScraper()
         url = scraper.get_track_url()
         assert url == "https://www.jra.go.jp/keiba/baba/index.html"
 
     def test_get_track_url_with_racecourse(self):
-        scraper = JRAScraper()
+        scraper = JRATrackScraper()
         url = scraper.get_track_url("nakayama")
         assert url == "https://www.jra.go.jp/keiba/baba/nakayama.html"
 
     def test_get_available_racecourses(self):
-        scraper = JRAScraper()
+        scraper = JRATrackScraper()
         courses = scraper.get_available_racecourses()
         assert len(courses) == 10
         assert ("nakayama", "中山") in courses
         assert ("tokyo", "東京") in courses
 
 
-class TestNetkeibaScraper:
+class TestNetkeibaTrackScraper:
     """Tests for Netkeiba scraper."""
 
     def test_get_base_url(self):
-        scraper = NetkeibaScraper()
+        scraper = NetkeibaTrackScraper()
         assert scraper.get_base_url() == "https://race.netkeiba.com"
 
     def test_get_track_url_default(self):
-        scraper = NetkeibaScraper()
+        scraper = NetkeibaTrackScraper()
         url = scraper.get_track_url()
         assert url == "https://race.netkeiba.com/race/track.html"
 
     def test_get_track_url_with_racecourse(self):
-        scraper = NetkeibaScraper()
+        scraper = NetkeibaTrackScraper()
         url = scraper.get_track_url("06")
         assert "jyo=06" in url
 
     def test_get_track_url_with_date(self):
-        scraper = NetkeibaScraper()
+        scraper = NetkeibaTrackScraper()
         url = scraper.get_track_url("06", "20260922")
         assert "jyo=06" in url
         assert "kaisai_date=20260922" in url
 
     def test_get_available_racecourses(self):
-        scraper = NetkeibaScraper()
+        scraper = NetkeibaTrackScraper()
         courses = scraper.get_available_racecourses()
         assert len(courses) == 10
         assert ("06", "中山") in courses
@@ -232,22 +232,22 @@ class TestTrackInfoService:
 
 
 @pytest.mark.integration
-class TestJRAScraperIntegration:
+class TestJRATrackScraperIntegration:
     """Integration tests for JRA scraper (requires network access)."""
 
     def test_scrape_default_page(self):
-        with JRAScraper() as scraper:
+        with JRATrackScraper() as scraper:
             track_info = scraper.scrape()
             assert track_info.source == "JRA"
             assert track_info.racecourse is not None
 
 
 @pytest.mark.integration
-class TestNetkeibaScraperIntegration:
+class TestNetkeibaTrackScraperIntegration:
     """Integration tests for Netkeiba scraper (requires network access)."""
 
     def test_scrape_default_page(self):
-        with NetkeibaScraper() as scraper:
+        with NetkeibaTrackScraper() as scraper:
             track_info = scraper.scrape()
             assert track_info.source == "Netkeiba"
 

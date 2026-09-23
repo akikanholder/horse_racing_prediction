@@ -2,11 +2,10 @@
 
 import logging
 from datetime import datetime
-from typing import Optional
 
-from .jra_scraper import JRAScraper
-from .models import CourseInfo, TrackInfo
-from .netkeiba_scraper import NetkeibaScraper
+from backend.models.track import CourseInfo, TrackInfo
+from backend.scrapers.jra_track_scraper import JRATrackScraper
+from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +33,8 @@ class TrackInfoService:
 
     def __init__(
         self,
-        jra_scraper: Optional[JRAScraper] = None,
-        netkeiba_scraper: Optional[NetkeibaScraper] = None,
+        jra_scraper: JRATrackScraper | None = None,
+        netkeiba_scraper: NetkeibaTrackScraper | None = None,
     ):
         """Initialize the service with scrapers.
 
@@ -49,21 +48,21 @@ class TrackInfoService:
         self._owns_netkeiba_scraper = netkeiba_scraper is None
 
     @property
-    def jra_scraper(self) -> JRAScraper:
+    def jra_scraper(self) -> JRATrackScraper:
         """Get JRA scraper, creating if necessary."""
         if self._jra_scraper is None:
-            self._jra_scraper = JRAScraper()
+            self._jra_scraper = JRATrackScraper()
         return self._jra_scraper
 
     @property
-    def netkeiba_scraper(self) -> NetkeibaScraper:
+    def netkeiba_scraper(self) -> NetkeibaTrackScraper:
         """Get Netkeiba scraper, creating if necessary."""
         if self._netkeiba_scraper is None:
-            self._netkeiba_scraper = NetkeibaScraper()
+            self._netkeiba_scraper = NetkeibaTrackScraper()
         return self._netkeiba_scraper
 
     def get_track_info_from_jra(
-        self, racecourse: Optional[str] = None
+        self, racecourse: str | None = None
     ) -> TrackInfo:
         """Get track information from JRA.
 
@@ -78,7 +77,7 @@ class TrackInfoService:
         return self.jra_scraper.scrape(jra_code)
 
     def get_track_info_from_netkeiba(
-        self, racecourse: Optional[str] = None, date: Optional[str] = None
+        self, racecourse: str | None = None, date: str | None = None
     ) -> TrackInfo:
         """Get track information from Netkeiba.
 
@@ -95,9 +94,9 @@ class TrackInfoService:
 
     def get_track_info(
         self,
-        racecourse: Optional[str] = None,
-        date: Optional[str] = None,
-        sources: Optional[list[str]] = None,
+        racecourse: str | None = None,
+        date: str | None = None,
+        sources: list[str] | None = None,
         merge: bool = False,
     ) -> dict[str, TrackInfo]:
         """Get track information from specified sources.
@@ -159,7 +158,7 @@ class TrackInfoService:
             for name, codes in self.RACECOURSE_CODE_MAPPING.items()
         ]
 
-    def _get_jra_code(self, racecourse: Optional[str]) -> Optional[str]:
+    def _get_jra_code(self, racecourse: str | None) -> str | None:
         """Convert racecourse identifier to JRA code."""
         if racecourse is None:
             return None
@@ -173,7 +172,7 @@ class TrackInfoService:
 
         return racecourse
 
-    def _get_netkeiba_id(self, racecourse: Optional[str]) -> Optional[str]:
+    def _get_netkeiba_id(self, racecourse: str | None) -> str | None:
         """Convert racecourse identifier to Netkeiba ID."""
         if racecourse is None:
             return None
@@ -188,7 +187,7 @@ class TrackInfoService:
         return racecourse
 
     def _merge_track_info(
-        self, jra_info: Optional[TrackInfo], netkeiba_info: Optional[TrackInfo]
+        self, jra_info: TrackInfo | None, netkeiba_info: TrackInfo | None
     ) -> TrackInfo:
         """Merge track information from JRA and Netkeiba.
 
@@ -228,8 +227,8 @@ class TrackInfoService:
         )
 
     def _merge_course_info(
-        self, primary: Optional[CourseInfo], secondary: Optional[CourseInfo]
-    ) -> Optional[CourseInfo]:
+        self, primary: CourseInfo | None, secondary: CourseInfo | None
+    ) -> CourseInfo | None:
         """Merge course information, preferring primary (JRA) data."""
         if primary is None:
             return secondary

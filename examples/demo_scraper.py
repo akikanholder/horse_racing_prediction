@@ -5,11 +5,9 @@ import json
 import logging
 from datetime import datetime
 
-from src.scrapers import (
-    JRAScraper,
-    NetkeibaScraper,
-    TrackInfoService,
-)
+from backend.scrapers.jra_track_scraper import JRATrackScraper
+from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
+from backend.services.track_info_service import TrackInfoService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +21,7 @@ def demo_jra_scraper():
     print("JRA Scraper Demo")
     print("=" * 60)
 
-    with JRAScraper() as scraper:
+    with JRATrackScraper() as scraper:
         print("\nAvailable racecourses:")
         for code, name in scraper.get_available_racecourses():
             print(f"  - {name} ({code})")
@@ -75,7 +73,7 @@ def demo_netkeiba_scraper():
     print("Netkeiba Scraper Demo")
     print("=" * 60)
 
-    with NetkeibaScraper() as scraper:
+    with NetkeibaTrackScraper() as scraper:
         print("\nAvailable racecourses:")
         for id_, name in scraper.get_available_racecourses():
             print(f"  - {name} (ID: {id_})")
@@ -143,7 +141,7 @@ def demo_json_output():
     print("JSON Output Demo")
     print("=" * 60)
 
-    with JRAScraper() as scraper:
+    with JRATrackScraper() as scraper:
         track_info = scraper.scrape()
         json_output = track_info.model_dump_json(indent=2, exclude_none=True)
         print("\nJSON representation:")

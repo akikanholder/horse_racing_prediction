@@ -4,23 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "horse-racing-prediction"
-version = "0.1.0"
-description = "Horse racing track information scraper and prediction tools"
+version = "1.0.0"
+description = "JRA競馬のレース情報、競走馬情報、コース情報、馬場情報を提供するバックエンドシステム"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [
-    {name = "Horse Racing Prediction Team"}
-]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-]
 dependencies = [
     "requests>=2.31.0",
     "httpx>=0.27.0",
@@ -28,6 +16,9 @@ dependencies = [
     "lxml>=5.0.0",
     "pydantic>=2.5.0",
     "aiohttp>=3.9.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "python-dateutil>=2.8.0",
 ]
 
 [project.optional-dependencies]
@@ -42,17 +33,13 @@ dev = [
     "ruff>=0.2.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/horse-racing-prediction"
-Repository = "https://github.com/horse-racing-prediction"
-
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["backend*"]
 
 [tool.ruff]
-line-length = 88
-target-version = "py310"
+line-length = 100
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -63,16 +50,18 @@ select = [
     "B",      # flake8-bugbear
     "C4",     # flake8-comprehensions
     "UP",     # pyupgrade
+    "LOG",    # flake8-logging
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "BLE001", # Catching broad exception (intentional in API endpoints)
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["backend"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
@@ -82,6 +71,7 @@ module = ["bs4.*", "lxml.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]

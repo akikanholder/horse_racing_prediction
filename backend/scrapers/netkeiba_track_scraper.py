@@ -1,15 +1,16 @@
-"""Netkeiba track information scraper."""
+"""Netkeiba track (baba) information scraper.
+
+Source: https://race.netkeiba.com/race/track.html
+"""
 
 import logging
 import re
 from datetime import datetime
-from typing import Optional
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 
-from .base import BaseScraper
-from .models import (
+from backend.models.track import (
     CourseInfo,
     CourseType,
     CushionValue,
@@ -18,15 +19,13 @@ from .models import (
     TrackInfo,
     Weather,
 )
+from backend.scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
 
-class NetkeibaScraper(BaseScraper):
-    """Scraper for Netkeiba track information.
-
-    Source: https://race.netkeiba.com/race/track.html
-    """
+class NetkeibaTrackScraper(BaseScraper):
+    """Scraper for Netkeiba track (baba) information."""
 
     BASE_URL = "https://race.netkeiba.com"
     TRACK_INFO_PATH = "/race/track.html"
@@ -51,7 +50,7 @@ class NetkeibaScraper(BaseScraper):
         return self.BASE_URL
 
     def get_track_url(
-        self, racecourse_id: Optional[str] = None, date: Optional[str] = None
+        self, racecourse_id: str | None = None, date: str | None = None
     ) -> str:
         """Get the URL for track information.
 
@@ -75,7 +74,7 @@ class NetkeibaScraper(BaseScraper):
         return base
 
     def scrape(
-        self, racecourse_id: Optional[str] = None, date: Optional[str] = None
+        self, racecourse_id: str | None = None, date: str | None = None
     ) -> TrackInfo:
         """Scrape track information from Netkeiba.
 
@@ -91,7 +90,7 @@ class NetkeibaScraper(BaseScraper):
         return self._parse_track_info(soup, racecourse_id)
 
     def scrape_by_name(
-        self, racecourse_name: str, date: Optional[str] = None
+        self, racecourse_name: str, date: str | None = None
     ) -> TrackInfo:
         """Scrape track information by racecourse name.
 
@@ -111,7 +110,7 @@ class NetkeibaScraper(BaseScraper):
         return self.scrape(racecourse_id, date)
 
     def _parse_track_info(
-        self, soup: BeautifulSoup, racecourse_id: Optional[str]
+        self, soup: BeautifulSoup, racecourse_id: str | None
     ) -> TrackInfo:
         """Parse track information from the page."""
         racecourse_name = self._extract_racecourse_name(soup, racecourse_id)
@@ -132,7 +131,7 @@ class NetkeibaScraper(BaseScraper):
         )
 
     def _extract_racecourse_name(
-        self, soup: BeautifulSoup, racecourse_id: Optional[str]
+        self, soup: BeautifulSoup, racecourse_id: str | None
     ) -> str:
         """Extract the racecourse name from the page."""
         if racecourse_id and racecourse_id in self.RACECOURSE_ID_MAPPING:
@@ -181,7 +180,7 @@ class NetkeibaScraper(BaseScraper):
 
     def _extract_course_info(
         self, soup: BeautifulSoup, course_type: CourseType
-    ) -> tuple[Optional[CourseInfo], Optional[Weather]]:
+    ) -> tuple[CourseInfo | None, Weather | None]:
         """Extract course information for turf or dirt."""
         course_name = course_type.value
 
@@ -251,7 +250,7 @@ class NetkeibaScraper(BaseScraper):
 
         return Weather.UNKNOWN
 
-    def _extract_cushion_value(self, text: str, soup) -> Optional[CushionValue]:
+    def _extract_cushion_value(self, text: str, soup) -> CushionValue | None:
         """Extract cushion value from text."""
         lines = text.split("\n")
         measured_at = None
@@ -287,7 +286,7 @@ class NetkeibaScraper(BaseScraper):
 
     def _extract_moisture_content(
         self, text: str, soup
-    ) -> Optional[MoistureContent]:
+    ) -> MoistureContent | None:
         """Extract moisture content from text."""
         goal_front = None
         fourth_corner = None
@@ -330,7 +329,7 @@ class NetkeibaScraper(BaseScraper):
 
     def _extract_measurement_time(
         self, text: str, section_name: str
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         """Extract measurement time for a specific section."""
         patterns = [
             rf"{section_name}[^\n]*?(\d{{4}})/(\d{{1,2}})/(\d{{1,2}})\s+(\d{{1,2}}):(\d{{1,2}})",
