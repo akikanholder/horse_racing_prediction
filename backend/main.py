@@ -9,7 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.race import Race, RaceCard, RaceSchedule, RaceWithResults
+from backend.models.track import TrackInfo
 from backend.services.race_service import RaceService
+from backend.services.track_info_service import TrackInfoService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,18 +20,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 race_service: RaceService | None = None
+track_info_service: TrackInfoService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global race_service
+    global race_service, track_info_service
     race_service = RaceService()
+    track_info_service = TrackInfoService()
     logger.info("Race service initialized")
+    logger.info("Track info service initialized")
     yield
     if race_service:
         race_service.close()
-    logger.info("Race service closed")
+    if track_info_service:
+        track_info_service.close()
+    logger.info("Services closed")
 
 
 app = FastAPI(
@@ -63,6 +70,7 @@ async def root():
             "courses": "/api/courses",
             "course_detail": "/api/courses/{venue}",
             "venues": "/api/venues",
+            "tracks": "/api/tracks",
         },
     }
 
@@ -273,6 +281,38 @@ async def get_course_conditions(venue: str):
         raise
     except Exception as e:
         logger.error(f"Failed to get conditions for {venue}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tracks", response_model=dict[str, TrackInfo], tags=["Tracks"])
+async def get_track_info(
+    venue: str | None = None,
+    date: str | None = None,
+    merge: bool = False,
+):
+    """馬場情報（馬場状態、含水率、クッション値）を取得する。
+
+    JRAの馬場情報ページとnetkeibaの馬場情報ページを参照する。
+
+    Args:
+        venue: 競馬場名（例: 中山）。省略時は掲載中の競馬場
+        date: netkeiba用の日付 (YYYYMMDD)
+        merge: Trueのとき両ソースを統合したデータを merged キーで返す
+    """
+    if not track_info_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        results = track_info_service.get_track_info(
+            racecourse=venue, date=date, merge=merge
+        )
+        if not results:
+            raise HTTPException(status_code=404, detail="Track info not found")
+        return results
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get track info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
