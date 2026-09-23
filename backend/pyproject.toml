@@ -1,9 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "horse-racing-prediction"
 version = "1.0.0"
 description = "JRA競馬のレース情報、競走馬情報、コース情報を提供するバックエンドシステム"
-readme = "README.md"
 requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = [
+    "backend",
+    "backend.models",
+    "backend.scrapers",
+    "backend.services",
+    "backend.utils",
+]
+package-dir = { backend = "src" }
 
 [tool.ruff]
 line-length = 100

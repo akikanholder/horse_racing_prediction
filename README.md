@@ -44,7 +44,8 @@ JRA（日本中央競馬会）の競馬データをスクレイピングして�
 
 ```bash
 # 依存パッケージのインストール
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
+pip install -e backend
 ```
 
 ## 使用方法
@@ -129,26 +130,29 @@ with RaceService() as service:
 
 ```
 backend/
-├── __init__.py
-├── main.py              # FastAPI アプリケーション
-├── cli.py               # コマンドラインツール
-├── models/              # データモデル (Pydantic)
-│   ├── __init__.py
-│   ├── race.py         # レースモデル
-│   ├── horse.py        # 競走馬モデル
-│   └── course.py       # コースモデル
-├── scrapers/            # スクレイパー
-│   ├── __init__.py
-│   ├── base_scraper.py # 基底クラス
-│   ├── jra_scraper.py  # JRA公式サイト
-│   └── netkeiba_scraper.py  # netkeiba
-├── services/            # ビジネスロジック
-│   ├── __init__.py
-│   └── race_service.py # レースサービス
-└── utils/               # ユーティリティ
+├── pyproject.toml       # パッケージ定義
+├── requirements.txt     # 依存パッケージ
+└── src/                 # backend パッケージのソース
     ├── __init__.py
-    ├── http_client.py  # HTTPクライアント
-    └── date_utils.py   # 日付ユーティリティ
+    ├── main.py          # FastAPI アプリケーション
+    ├── cli.py           # コマンドラインツール
+    ├── models/          # データモデル (Pydantic)
+    │   ├── __init__.py
+    │   ├── race.py      # レースモデル
+    │   ├── horse.py     # 競走馬モデル
+    │   └── course.py    # コースモデル
+    ├── scrapers/        # スクレイパー
+    │   ├── __init__.py
+    │   ├── base_scraper.py # 基底クラス
+    │   ├── jra_scraper.py  # JRA公式サイト
+    │   └── netkeiba_scraper.py  # netkeiba
+    ├── services/        # ビジネスロジック
+    │   ├── __init__.py
+    │   └── race_service.py # レースサービス
+    └── utils/           # ユーティリティ
+        ├── __init__.py
+        ├── http_client.py  # HTTPクライアント
+        └── date_utils.py   # 日付ユーティリティ
 ```
 
 ## 技術スタック

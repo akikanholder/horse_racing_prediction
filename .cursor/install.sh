@@ -23,19 +23,30 @@ PIP=("$PYTHON" -m pip install --user --break-system-packages)
 
 installed_something=0
 
-if [ -f requirements.txt ]; then
-  echo "Installing from requirements.txt"
-  "${PIP[@]}" -r requirements.txt
+install_requirements() {
+  local req_file="$1"
+  echo "Installing from $req_file"
+  "${PIP[@]}" -r "$req_file"
   installed_something=1
+}
+
+if [ -f backend/requirements.txt ]; then
+  install_requirements backend/requirements.txt
+elif [ -f requirements.txt ]; then
+  install_requirements requirements.txt
 fi
 
-if [ -f requirements-dev.txt ]; then
-  echo "Installing from requirements-dev.txt"
-  "${PIP[@]}" -r requirements-dev.txt
-  installed_something=1
+if [ -f backend/requirements-dev.txt ]; then
+  install_requirements backend/requirements-dev.txt
+elif [ -f requirements-dev.txt ]; then
+  install_requirements requirements-dev.txt
 fi
 
-if [ "$installed_something" -eq 0 ] && [ -f pyproject.toml ]; then
+if [ -f backend/pyproject.toml ]; then
+  echo "Installing project from backend/pyproject.toml (editable)"
+  "${PIP[@]}" -e backend || "${PIP[@]}" backend
+  installed_something=1
+elif [ "$installed_something" -eq 0 ] && [ -f pyproject.toml ]; then
   echo "Installing project from pyproject.toml (editable)"
   "${PIP[@]}" -e . || "${PIP[@]}" .
   installed_something=1
