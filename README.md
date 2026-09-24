@@ -3,7 +3,7 @@
 
 ## 概要
 
-JRA（日本中央競馬会）の競馬データをスクレイピングして、レース情報、競走馬情報、コース情報を提供するバックエンドシステムです。
+JRA（日本中央競馬会）の競馬データをスクレイピングして、レース情報、競走馬情報、コース情報、馬場情報を提供するバックエンドシステムです。パッケージは `backend` ディレクトリです。
 
 ## 機能
 
@@ -13,13 +13,18 @@ JRA（日本中央競馬会）の競馬データをスクレイピングして�
   - 今週のレーススケジュール
   - 競馬場スケジュール
   - コース情報
-  - 馬場状態
-
+- **JRA馬場情報** (https://www.jra.go.jp/keiba/baba/index.html)
+  - 馬場状態（芝/ダート）
+  - クッション値
+  - 含水率（ゴール前、4コーナー）
+  - 週間天候・芝丈・使用コース
 - **netkeiba** (https://race.netkeiba.com/top)
   - 詳細なレース情報
   - 出馬表（出走馬リスト）
   - レース結果
   - 競走馬の詳細情報（血統、過去成績など）
+- **netkeiba馬場情報** (https://race.netkeiba.com/race/track.html)
+  - 馬場状態、クッション値、含水率
 
 ### 取得できる情報
 
@@ -40,6 +45,12 @@ JRA（日本中央競馬会）の競馬データをスクレイピングして�
    - 競馬場データ（周回距離、直線距離）
    - 現在の馬場状態
 
+4. **馬場情報** (TrackInfo)
+   - 芝/ダートの馬場状態（良/稍重/重/不良）
+   - クッション値と硬さレベル
+   - 含水率（ゴール前、4コーナー）
+   - 天候、週間天候、芝丈、使用コース
+
 ## インストール
 
 ```bash
@@ -53,7 +64,6 @@ pip install -e backend
 ### REST API サーバー
 
 ```bash
-# サーバー起動
 python -m backend.main
 
 # または uvicorn で起動
@@ -76,6 +86,7 @@ API ドキュメント: http://localhost:8000/docs
 | `GET /api/courses/{venue}` | 特定競馬場のコース情報を取得 |
 | `GET /api/courses/{venue}/conditions` | 馬場状態を取得 |
 | `GET /api/venues` | 今週の開催競馬場を取得 |
+| `GET /api/tracks` | 馬場情報を取得（`venue`, `date`, `merge`） |
 
 ### CLI ツール
 
@@ -96,6 +107,10 @@ python -m backend.cli courses --venue 東京
 # 開催競馬場を取得
 python -m backend.cli venues
 
+# 馬場情報を取得
+python -m backend.cli track
+python -m backend.cli track --venue 中山 --merge
+
 # JSON形式で出力
 python -m backend.cli races --json
 
@@ -107,23 +122,18 @@ python -m backend.cli races -v
 
 ```python
 from backend.services.race_service import RaceService
+from backend.services.track_info_service import TrackInfoService
 
-# サービスの初期化
 with RaceService() as service:
-    # 今週のレース情報を取得
     schedule = service.get_weekly_races()
     for race in schedule.races:
         print(f"{race.race_date} {race.venue} {race.race_name}")
 
-    # 競走馬情報を取得
-    horse = service.get_horse_info("horse_id")
-    if horse:
-        print(f"{horse.horse_name} ({horse.sire_name} x {horse.dam_name})")
-
-    # コース情報を取得
-    course = service.get_course_info("東京")
-    if course:
-        print(f"芝直線: {course.turf_straight}m")
+with TrackInfoService() as service:
+    results = service.get_track_info(racecourse="中山", merge=True)
+    merged = results.get("merged") or results.get("jra")
+    if merged and merged.turf:
+        print(f"芝: {merged.turf.condition.value}")
 ```
 
 ## プロジェクト構成
@@ -140,19 +150,31 @@ backend/
     │   ├── __init__.py
     │   ├── race.py      # レースモデル
     │   ├── horse.py     # 競走馬モデル
-    │   └── course.py    # コースモデル
+    │   ├── course.py    # コースモデル
+    │   └── track.py     # 馬場情報モデル
     ├── scrapers/        # スクレイパー
     │   ├── __init__.py
     │   ├── base_scraper.py # 基底クラス
-    │   ├── jra_scraper.py  # JRA公式サイト
-    │   └── netkeiba_scraper.py  # netkeiba
+    │   ├── jra_scraper.py  # JRA レース・コース
+    │   ├── netkeiba_scraper.py
+    │   ├── jra_track_scraper.py      # JRA 馬場情報
+    │   └── netkeiba_track_scraper.py
     ├── services/        # ビジネスロジック
     │   ├── __init__.py
-    │   └── race_service.py # レースサービス
+    │   ├── race_service.py
+    │   └── track_info_service.py
     └── utils/           # ユーティリティ
         ├── __init__.py
         ├── http_client.py  # HTTPクライアント
         └── date_utils.py   # 日付ユーティリティ
+```
+
+## テスト
+
+```bash
+pytest
+pytest -m "not integration"
+pytest -m "integration"
 ```
 
 ## 技術スタック

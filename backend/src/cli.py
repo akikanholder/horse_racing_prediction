@@ -8,6 +8,7 @@ import sys
 from datetime import date
 
 from backend.services.race_service import RaceService
+from backend.services.track_info_service import TrackInfoService
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,37 @@ def cmd_courses(args):
                         )
 
 
+def cmd_track(args):
+    """Get detailed track (baba) information."""
+    with TrackInfoService() as service:
+        results = service.get_track_info(
+            racecourse=args.venue,
+            date=args.date,
+            merge=args.merge,
+        )
+        print("\n=== 馬場情報 ===")
+        if args.venue:
+            print(f"競馬場: {args.venue}")
+        print(f"ソース: {', '.join(results.keys()) or 'なし'}\n")
+
+        if args.json:
+            print_json(results)
+            return
+
+        for source, info in results.items():
+            print(f"[{source}] {info.racecourse} 天候: {info.weather.value}")
+            if info.turf:
+                cushion = ""
+                if info.turf.cushion and info.turf.cushion.value is not None:
+                    cushion = (
+                        f" クッション値: {info.turf.cushion.value}"
+                        f" ({info.turf.cushion.hardness_level})"
+                    )
+                print(f"  芝: {info.turf.condition.value}{cushion}")
+            if info.dirt:
+                print(f"  ダート: {info.dirt.condition.value}")
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with RaceService() as service:
@@ -206,6 +238,15 @@ def main():
     venues_parser = subparsers.add_parser("venues", help="開催競馬場を取得")
     venues_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     venues_parser.set_defaults(func=cmd_venues)
+
+    track_parser = subparsers.add_parser("track", help="馬場情報を取得")
+    track_parser.add_argument("--venue", "-V", help="競馬場名 (例: 中山)")
+    track_parser.add_argument("--date", help="日付 YYYYMMDD (netkeiba)")
+    track_parser.add_argument(
+        "--merge", action="store_true", help="JRAとnetkeibaのデータを統合する"
+    )
+    track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    track_parser.set_defaults(func=cmd_track)
 
     args = parser.parse_args()
 
