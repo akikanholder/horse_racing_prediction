@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "horse-racing-prediction"
 version = "1.0.0"
 description = "JRA競馬のレース情報、競走馬情報、コース情報、馬場情報を提供するバックエンドシステム"
-readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
@@ -33,9 +32,15 @@ dev = [
     "ruff>=0.2.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["backend*"]
+[tool.setuptools]
+packages = [
+    "backend",
+    "backend.models",
+    "backend.scrapers",
+    "backend.services",
+    "backend.utils",
+]
+package-dir = { backend = "src" }
 
 [tool.ruff]
 line-length = 100
@@ -72,7 +77,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["../tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
