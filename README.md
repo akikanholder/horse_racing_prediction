@@ -172,6 +172,7 @@ backend/
 ## テスト
 
 ```bash
+cd backend
 pytest
 pytest -m "not integration"
 pytest -m "integration"

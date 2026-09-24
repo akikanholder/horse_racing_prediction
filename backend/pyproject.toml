@@ -74,14 +74,3 @@ disallow_untyped_defs = true
 [[tool.mypy.overrides]]
 module = ["bs4.*", "lxml.*"]
 ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["../tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-markers = [
-    "integration: marks tests as integration tests (may require network access)",
-]
-addopts = "-v --tb=short"
