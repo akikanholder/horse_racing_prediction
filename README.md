@@ -142,6 +142,12 @@ with TrackInfoService() as service:
 backend/
 ├── pyproject.toml       # パッケージ定義
 ├── requirements.txt     # 依存パッケージ
+├── pytest.ini           # pytest 設定
+├── examples/            # 使用例
+│   └── demo_scraper.py
+├── tests/               # テスト
+│   ├── __init__.py
+│   └── test_scrapers.py
 └── src/                 # backend パッケージのソース
     ├── __init__.py
     ├── main.py          # FastAPI アプリケーション
@@ -172,6 +178,7 @@ backend/
 ## テスト
 
 ```bash
+cd backend
 pytest
 pytest -m "not integration"
 pytest -m "integration"
