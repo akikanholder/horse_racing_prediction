@@ -83,6 +83,60 @@ class NetkeibaScraper(BaseScraper):
             fetched_at=datetime.now(),
         )
 
+    def get_races_by_date(self, target_date: date) -> list[Race]:
+        """Get all races held on a specific date.
+
+        Args:
+            target_date: Race date to fetch
+
+        Returns:
+            Races found on the netkeiba race list for that date
+        """
+        date_str = target_date.strftime("%Y%m%d")
+        races: list[Race] = []
+
+        try:
+            soup = self.fetch_page(
+                f"{self.BASE_URL}/top/race_list.html",
+                params={"kaisai_date": date_str},
+            )
+            containers = soup.find_all(
+                ["div", "table", "section"],
+                class_=re.compile(r"RaceList|race_list|RaceData"),
+            )
+            search_roots: list[Tag] = containers or [soup]
+            seen_ids: set[str] = set()
+
+            for root in search_roots:
+                for link in root.find_all("a", href=re.compile(r"race_id=\d+")):
+                    if not isinstance(link, Tag):
+                        continue
+                    race_id = self._extract_race_id_from_url(str(link.get("href", "")))
+                    if not race_id or race_id in seen_ids:
+                        continue
+                    seen_ids.add(race_id)
+                    race = self._parse_race_link(link, race_id)
+                    if not race:
+                        continue
+                    venue_code, venue_name = self._resolve_venue(link, race_id)
+                    races.append(
+                        race.model_copy(
+                            update={
+                                "race_date": target_date,
+                                "venue": venue_name,
+                                "venue_code": venue_code,
+                            }
+                        )
+                    )
+        except Exception as e:
+            logger.error(f"Failed to fetch races for {target_date}: {e}")
+
+        unique_races = {race.race_id: race for race in races}
+        return sorted(
+            unique_races.values(),
+            key=lambda race: (race.venue, race.race_number, race.race_id),
+        )
+
     def get_race_card(self, race_id: str) -> RaceCard | None:
         """Get race card (shutuba-hyou) for a specific race.
 
@@ -754,6 +808,35 @@ class NetkeibaScraper(BaseScraper):
         if len(race_id) >= 10:
             return race_id[8:10]
         return "00"
+
+    def _resolve_venue(self, link: Tag, race_id: str) -> tuple[str, str]:
+        """Resolve venue code and name from link text or race ID.
+
+        Netkeiba race IDs are YYYY + venue + kai + day + race.
+        IDs generated in this project are YYYYMMDD + venue + race.
+        """
+        text = self.clean_text(link.get_text())
+        for code, name in self.VENUE_CODES.items():
+            if name in text:
+                return code, name
+
+        if len(race_id) >= 12 and race_id.isdigit():
+            netkeiba_venue = race_id[4:6]
+            kai = int(race_id[6:8])
+            day_number = int(race_id[8:10])
+            if (
+                netkeiba_venue in self.VENUE_CODES
+                and 1 <= kai <= 6
+                and 1 <= day_number <= 12
+            ):
+                return netkeiba_venue, self.VENUE_CODES[netkeiba_venue]
+
+            project_venue = race_id[8:10]
+            if project_venue in self.VENUE_CODES:
+                return project_venue, self.VENUE_CODES[project_venue]
+
+        code = self._extract_venue_code_from_race_id(race_id)
+        return code, self.VENUE_CODES.get(code, "不明")
 
     def _extract_race_name(self, text: str) -> str | None:
         """Extract race name from text."""

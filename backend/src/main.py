@@ -2,14 +2,18 @@
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import date
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
+from backend.models.export import DailyRaceCsvExport
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.race import Race, RaceCard, RaceSchedule, RaceWithResults
 from backend.models.track import TrackInfo
+from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -71,6 +75,7 @@ async def root():
             "course_detail": "/api/courses/{venue}",
             "venues": "/api/venues",
             "tracks": "/api/tracks",
+            "race_csv_export": "/api/races/export?date=YYYY-MM-DD",
         },
     }
 
@@ -189,6 +194,44 @@ async def get_race_horses(race_id: str):
     except Exception as e:
         logger.error(f"Failed to get horses for race {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/races/export", response_model=DailyRaceCsvExport, tags=["Races"])
+async def export_races_csv(
+    race_date: Annotated[
+        date, Query(alias="date", description="対象日 (YYYY-MM-DD)")
+    ],
+    include_horse_details: Annotated[
+        bool, Query(description="出走馬の血統など詳細情報も取得する")
+    ] = False,
+):
+    """指定日の全レース情報を日付・競馬場ごとのCSVに出力する。
+
+    出力先は `backend/csv_output/{日付}/{競馬場}/` です。
+    レース、出馬表、レース結果、競走馬、コース、馬場をそれぞれ別のCSVに書き出します。
+
+    Args:
+        race_date: 対象日
+        include_horse_details: True のとき競走馬の詳細ページも取得する
+
+    Returns:
+        DailyRaceCsvExport: 出力したディレクトリとファイル
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    exporter = CsvExportService(
+        race_service,
+        track_info_service,
+        include_horse_details=include_horse_details,
+    )
+    try:
+        return exporter.export_date(race_date)
+    except NoRacesFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Failed to export races for {race_date}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/horses/{horse_id}", response_model=Horse, tags=["Horses"])
