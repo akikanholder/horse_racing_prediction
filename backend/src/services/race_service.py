@@ -1,13 +1,14 @@
 """Race service for aggregating data from multiple sources."""
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.race import (
     Race,
     RaceCard,
+    RaceResult,
     RaceSchedule,
     RaceWithResults,
 )
@@ -79,6 +80,48 @@ class RaceService:
             fetched_at=datetime.now(),
         )
 
+    def get_races_for_date(self, target_date: date) -> list[Race]:
+        """Get every race held on the given date.
+
+        Combines the weekly schedule (filtered to the date) with the
+        netkeiba race list for that date.
+
+        Args:
+            target_date: Date to collect races for
+
+        Returns:
+            Races sorted by venue and race number
+        """
+        all_races: dict[str, Race] = {}
+
+        try:
+            schedule = self.get_weekly_races()
+            for race in schedule.races:
+                if race.race_date == target_date:
+                    all_races[race.race_id] = race
+            logger.info(
+                "Found %s weekly races on %s",
+                sum(1 for race in schedule.races if race.race_date == target_date),
+                target_date,
+            )
+        except Exception as e:
+            logger.error(f"Failed to filter weekly races for {target_date}: {e}")
+
+        try:
+            dated_races = self.netkeiba_scraper.get_races_by_date(target_date)
+            for race in dated_races:
+                if race.race_id in all_races:
+                    all_races[race.race_id] = self._merge_race_info(
+                        all_races[race.race_id], race
+                    )
+                else:
+                    all_races[race.race_id] = race
+            logger.info(f"Fetched {len(dated_races)} races for {target_date} from netkeiba")
+        except Exception as e:
+            logger.error(f"Failed to fetch races for {target_date}: {e}")
+
+        return sorted(all_races.values(), key=lambda race: (race.venue, race.race_number))
+
     def get_race_card(self, race_id: str) -> RaceCard | None:
         """Get race card with all entries.
 
@@ -93,6 +136,27 @@ class RaceService:
         except Exception as e:
             logger.error(f"Failed to get race card for {race_id}: {e}")
             return None
+
+    def get_race_export_bundle(
+        self, race_id: str
+    ) -> tuple[RaceCard | None, list[RaceResult]]:
+        """Load a race card and its results without fetching the card twice.
+
+        Args:
+            race_id: Race ID
+
+        Returns:
+            Race card (if available) and result rows
+        """
+        race_card = self.get_race_card(race_id)
+        results: list[RaceResult] = []
+        try:
+            fetched = self.netkeiba_scraper.get_race_result(race_id)
+            if fetched:
+                results = fetched
+        except Exception as e:
+            logger.error(f"Failed to get race result for {race_id}: {e}")
+        return race_card, results
 
     def get_race_result(self, race_id: str) -> RaceWithResults | None:
         """Get race with results.

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated race CSV exports (date/venue directories and CSV files)
+*.csv
+backend/csv_output/
