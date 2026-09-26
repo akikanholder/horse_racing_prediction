@@ -71,7 +71,7 @@ async def root():
             "race_detail": "/api/races/{race_id}",
             "race_card": "/api/races/{race_id}/card",
             "race_result": "/api/races/{race_id}/result",
-            "race_odds": "/api/races/{race_id}/odds?bet_types=win&prefer=live",
+            "race_odds": "/api/races/{race_id}/odds?bet_types=win,wide&prefer=live",
             "horses": "/api/horses/{horse_id}",
             "courses": "/api/courses",
             "course_detail": "/api/courses/{venue}",
@@ -181,27 +181,41 @@ async def get_race_result(race_id: str):
 async def get_race_odds(
     race_id: str,
     bet_types: Annotated[
-        str, Query(description="カンマ区切り。現在は win（単勝）のみ")
+        str,
+        Query(
+            description=(
+                "カンマ区切り。win（単勝）と wide（ワイド）。"
+                "prefer=live が unavailable でも yoso へは自動で切り替えない"
+            )
+        ),
     ] = "win",
     prefer: Annotated[
         Literal["live", "yoso"],
-        Query(description="live を優先。yoso が返るときは kind=yoso のまま"),
+        Query(
+            description=(
+                "希望する種別。kind は書き換えない。"
+                "live が取れないときに予想が必要なら prefer=yoso を明示する"
+            )
+        ),
     ] = "live",
 ):
-    """レースの単勝オッズを取得する。
+    """レースの単勝・ワイドオッズを取得する。
 
     期待値計算はここで返す OddsQuote を使う。RaceEntry.odds は使わない。
     発売後の市場オッズは source=netkeiba_live / kind=live。
     発売前のAI予想オッズが API に載っているときだけ source=netkeiba_yoso / kind=yoso。
-    数値が無いときは quotes が空で status=unavailable。
+    prefer は kind を書き換えない。prefer=live で市場オッズが無いとき、
+    予想オッズへは自動で切り替えない。予想が必要なら prefer=yoso を明示する。
+    数値が無いときは quotes が空で status=unavailable。価格は作らない。
+    ワイドの組み合わせは ``3-7``（馬番の小さい順）で、価格は odds_min と odds_max。
 
     Args:
         race_id: レースID
-        bet_types: 馬券種。win のみ対応
+        bet_types: 馬券種。win と wide。カンマ区切りで同時に取得できる
         prefer: live または yoso。kind は書き換えない
 
     Returns:
-        RaceOdds: 単勝オッズ
+        RaceOdds: 単勝・ワイドのオッズ
     """
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")

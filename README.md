@@ -84,6 +84,7 @@ API ドキュメント: http://localhost:8000/docs
 | `GET /api/races/{race_id}/card` | 出馬表を取得 |
 | `GET /api/races/{race_id}/result` | レース結果を取得 |
 | `GET /api/races/{race_id}/horses` | 出走馬の詳細情報を取得 |
+| `GET /api/races/{race_id}/odds` | 単勝・ワイドのオッズを取得 |
 | `GET /api/horses/{horse_id}` | 競走馬の詳細情報を取得 |
 | `GET /api/courses` | 全競馬場のコース情報を取得 |
 | `GET /api/courses/{venue}` | 特定競馬場のコース情報を取得 |
@@ -114,6 +115,10 @@ python -m backend.cli venues
 python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
 
+# オッズを取得（単勝が既定。ワイドは --bet-types wide）
+python -m backend.cli odds <race_id> --bet-types wide --prefer live
+python -m backend.cli odds <race_id> --bet-types win,wide --json
+
 # JSON形式で出力
 python -m backend.cli races --json
 
@@ -138,6 +143,20 @@ with TrackInfoService() as service:
     if merged and merged.turf:
         print(f"芝: {merged.turf.condition.value}")
 ```
+
+## オッズ
+
+`GET /api/races/{race_id}/odds?bet_types=wide&prefer=live`
+
+期待値は `RaceEntry.odds` ではなく、ここで返す `OddsQuote` を使う。
+
+- `bet_types` は `win`（単勝）と `wide`（ワイド）。カンマ区切りで両方取れる。既定は `win`。
+- 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。
+- `source` は `netkeiba_live` / `netkeiba_yoso` / `jradb`。`kind` は `live` または `yoso`。
+- `fetched_at` は必須。市場の更新時刻があるときだけ `market_updated_at` を入れる。
+- `prefer` は呼び出し側の希望であり、`kind` を書き換えない。`status=yoso` のペイロードは `prefer=live` でも `kind=yoso` のまま。
+- `prefer=live` で市場オッズが取れないとき（`quotes=[]` / `status=unavailable`）、予想オッズへは自動で切り替えない。予想が必要ならクライアントが `prefer=yoso` を明示して取りにいく。
+- 数値が無いレスポンスは `quotes=[]` と API の `reason`（例: `result odds empty`）。
 
 ## プロジェクト構成
 
