@@ -34,6 +34,7 @@ class HTTPClient:
         backoff_factor: float = 0.5,
         min_request_interval: float = 1.0,
         timeout: float = 30.0,
+        headers: dict[str, str] | None = None,
     ):
         """Initialize HTTP client.
 
@@ -42,11 +43,13 @@ class HTTPClient:
             backoff_factor: Backoff factor for retries
             min_request_interval: Minimum seconds between requests
             timeout: Request timeout in seconds
+            headers: Extra headers stored on the Session and sent with every request
         """
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.min_request_interval = min_request_interval
         self.timeout = timeout
+        self._extra_headers = dict(headers or {})
         self._last_request_time: float = 0
         self._session: requests.Session | None = None
 
@@ -64,7 +67,17 @@ class HTTPClient:
             self._session.mount("http://", adapter)
             self._session.mount("https://", adapter)
             self._session.headers.update(self.DEFAULT_HEADERS)
+            self._session.headers.update(self._extra_headers)
         return self._session
+
+    def _headers_for(self, headers: dict | None) -> dict[str, str]:
+        """Merge default, session, and per-request headers and keep them on the Session."""
+        merged = {**self.DEFAULT_HEADERS, **self._extra_headers}
+        if headers:
+            merged.update(headers)
+        session = self._get_session()
+        session.headers.update(merged)
+        return merged
 
     def _wait_for_rate_limit(self) -> None:
         """Wait to respect rate limiting."""
@@ -94,9 +107,7 @@ class HTTPClient:
         self._wait_for_rate_limit()
 
         session = self._get_session()
-        request_headers = {**self.DEFAULT_HEADERS}
-        if headers:
-            request_headers.update(headers)
+        request_headers = self._headers_for(headers)
 
         try:
             logger.debug(f"Requesting: {url}")
@@ -141,9 +152,7 @@ class HTTPClient:
         self._wait_for_rate_limit()
 
         session = self._get_session()
-        request_headers = {**self.DEFAULT_HEADERS}
-        if headers:
-            request_headers.update(headers)
+        request_headers = self._headers_for(headers)
 
         try:
             logger.debug(f"Posting: {url}")

@@ -191,6 +191,35 @@ def cmd_track(args):
                 print(f"  ダート: {info.dirt.condition.value}")
 
 
+def cmd_odds(args):
+    """Get win odds quotes."""
+    with RaceService() as service:
+        snapshot = service.get_race_odds(
+            args.race_id,
+            bet_types=args.bet_types,
+            prefer=args.prefer,
+        )
+
+    if args.json:
+        print_json(snapshot)
+        return
+
+    print(f"\n=== 単勝オッズ: {snapshot.race_id} ===")
+    print(f"状態: {snapshot.status}")
+    if snapshot.reason:
+        print(f"理由: {snapshot.reason}")
+    print(f"取得時刻: {snapshot.fetched_at}")
+    if not snapshot.quotes:
+        return
+
+    updated = snapshot.quotes[0].market_updated_at
+    if updated:
+        print(f"オッズ更新: {updated}")
+    print()
+    for quote in snapshot.quotes:
+        print(f"{quote.combination}番 {quote.odds} [{quote.source} / {quote.kind}]")
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with RaceService() as service:
@@ -247,6 +276,22 @@ def main():
     )
     track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     track_parser.set_defaults(func=cmd_track)
+
+    odds_parser = subparsers.add_parser("odds", help="単勝オッズを取得")
+    odds_parser.add_argument("race_id", help="レースID")
+    odds_parser.add_argument(
+        "--bet-types",
+        default="win",
+        help="馬券種（カンマ区切り。現在は win のみ）",
+    )
+    odds_parser.add_argument(
+        "--prefer",
+        default="live",
+        choices=["live", "yoso"],
+        help="優先する種別。yoso の kind は書き換えない",
+    )
+    odds_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    odds_parser.set_defaults(func=cmd_odds)
 
     args = parser.parse_args()
 

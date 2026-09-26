@@ -5,6 +5,7 @@ from datetime import date, datetime
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
+from backend.models.odds import OddsPrefer, RaceOdds
 from backend.models.race import (
     Race,
     RaceCard,
@@ -14,6 +15,7 @@ from backend.models.race import (
     RaceWithResults,
 )
 from backend.scrapers.jra_scraper import JRAScraper
+from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,7 @@ class RaceService:
         """Initialize race service."""
         self._jra_scraper: JRAScraper | None = None
         self._netkeiba_scraper: NetkeibaScraper | None = None
+        self._odds_scraper: NetkeibaOddsScraper | None = None
 
     @property
     def jra_scraper(self) -> JRAScraper:
@@ -40,6 +43,13 @@ class RaceService:
         if self._netkeiba_scraper is None:
             self._netkeiba_scraper = NetkeibaScraper()
         return self._netkeiba_scraper
+
+    @property
+    def odds_scraper(self) -> NetkeibaOddsScraper:
+        """Get or create the netkeiba win-odds client."""
+        if self._odds_scraper is None:
+            self._odds_scraper = NetkeibaOddsScraper()
+        return self._odds_scraper
 
     def get_weekly_races(self) -> RaceSchedule:
         """Get this week's race schedule from all sources.
@@ -128,6 +138,8 @@ class RaceService:
 
         Combines the netkeiba shutuba page with the JRA accessD card.
         A source that fails is ignored when the other source returns a card.
+        accessD HTTP 403 from datacenter egress is that kind of failure: the
+        netkeiba card is kept. jradb may need a residential browser later.
 
         Args:
             race_id: Race ID
@@ -146,7 +158,11 @@ class RaceService:
         try:
             jra_card = self.jra_scraper.get_race_card(race_id)
         except Exception as e:
-            logger.error(f"Failed to get JRA race card for {race_id}: {e}")
+            logger.warning(
+                "JRA accessD card unavailable for %s (%s); keeping the netkeiba card",
+                race_id,
+                e,
+            )
 
         return self._merge_race_cards(netkeiba_card, jra_card)
 
@@ -193,6 +209,56 @@ class RaceService:
         except Exception as e:
             logger.error(f"Failed to get race result for {race_id}: {e}")
             return None
+
+    def get_race_odds(
+        self,
+        race_id: str,
+        bet_types: str | list[str] | None = "win",
+        prefer: str = "live",
+    ) -> RaceOdds:
+        """Get win odds quotes for EV.
+
+        Quotes stay on this object. RaceEntry.odds is not updated and is not
+        the source of truth. prefer does not rewrite kind: a yoso payload is
+        returned as kind=yoso even when the caller prefers live.
+
+        Args:
+            race_id: Race ID
+            bet_types: Requested bet types. Only win is fetched.
+            prefer: live or yoso. Stored on the snapshot, not used to relabel.
+
+        Returns:
+            RaceOdds. quotes is empty when the market has no numbers.
+        """
+        fetched_at = datetime.now()
+        requested = _normalize_bet_types(bet_types)
+        preference: OddsPrefer = "yoso" if prefer == "yoso" else "live"
+        if "win" not in requested:
+            return RaceOdds(
+                race_id=race_id,
+                bet_types=[],
+                prefer=preference,
+                status="unavailable",
+                reason="win odds were not requested",
+                quotes=[],
+                fetched_at=fetched_at,
+            )
+
+        try:
+            snapshot = self.odds_scraper.get_win_odds(race_id, fetched_at=fetched_at)
+        except Exception as e:
+            logger.error("Failed to get win odds for %s: %s", race_id, e)
+            return RaceOdds(
+                race_id=race_id,
+                bet_types=["win"],
+                prefer=preference,
+                status="unavailable",
+                reason="fetch failed",
+                quotes=[],
+                fetched_at=fetched_at,
+            )
+
+        return snapshot.model_copy(update={"prefer": preference, "bet_types": ["win"]})
 
     def get_horse_info(self, horse_id: str) -> Horse | None:
         """Get detailed horse information.
@@ -414,6 +480,9 @@ class RaceService:
         if self._netkeiba_scraper:
             self._netkeiba_scraper.close()
             self._netkeiba_scraper = None
+        if self._odds_scraper:
+            self._odds_scraper.close()
+            self._odds_scraper = None
 
     def __enter__(self):
         """Context manager entry."""
@@ -423,3 +492,17 @@ class RaceService:
         """Context manager exit."""
         self.close()
         return False
+
+
+def _normalize_bet_types(bet_types: str | list[str] | None) -> list[str]:
+    """Split comma-separated bet types. Default is win."""
+    if bet_types is None:
+        return ["win"]
+    raw_items = [bet_types] if isinstance(bet_types, str) else list(bet_types)
+    names: list[str] = []
+    for item in raw_items:
+        for part in str(item).split(","):
+            name = part.strip().lower()
+            if name and name not in names:
+                names.append(name)
+    return names or ["win"]
