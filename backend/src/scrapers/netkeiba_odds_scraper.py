@@ -1,4 +1,4 @@
-"""Netkeiba win and wide odds client.
+"""Netkeiba win, wide, and umaren odds client.
 
 単勝は次の JSON を使う。
 
@@ -7,6 +7,11 @@
 ワイドは同じ API の type=5。Referer はオッズページの type=b5。
 
     GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=5&action=init&compress=0
+
+馬連は同じ API の type=4。Referer はオッズページの type=b4
+（ナビ ``odds_navi_b4`` が馬連）。
+
+    GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=4&action=init&compress=0
 
 ``action=init`` はブラウザの初回取得と同じ。これを付けない発売中レースは
 ``data`` が空文字になりやすい。ヘッダをブラウザ相当にしても、空のときは空のまま。
@@ -19,6 +24,10 @@
 ワイドは ``data.odds["5"]``。キーは ``0307`` のような馬番2桁の連結で、
 値は ``[下限, 上限, 人気]``。組み合わせは ``3-7``（小さい順）。
 下限または上限が無い行は捨てる。片方の数値から範囲は作らない。
+馬連は ``data.odds["4"]``。キーはワイドと同じ馬番2桁の連結で、
+値は単勝と同じ ``[オッズ, 変動, 人気]``。組み合わせは ``3-7``（小さい順）。
+変動は範囲ではないので ``odds_min`` / ``odds_max`` には入れない。
+価格が無い行は捨てる。
 ``status == "yoso"`` のときだけ kind=yoso / source=netkeiba_yoso。
 ``middle`` / ``result`` で数値があるときは kind=live。
 """
@@ -43,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 WIN_ODDS_KEY = "1"
 WIDE_ODDS_KEY = "5"
+UMAREN_ODDS_KEY = "4"
 _LIVE_STATUSES = frozenset({"result", "middle"})
 _PLACEHOLDERS = frozenset({"", "-", "--", "---", "---.-", "**", "*", "----"})
 _MARKET_UPDATED_FORMATS = (
@@ -54,11 +64,12 @@ _MARKET_UPDATED_FORMATS = (
 _ODDS_REQUESTS: dict[BetType, tuple[str, str, str]] = {
     "win": ("1", "b1", WIN_ODDS_KEY),
     "wide": ("5", "b5", WIDE_ODDS_KEY),
+    "umaren": ("4", "b4", UMAREN_ODDS_KEY),
 }
 
 
 class NetkeibaOddsScraper(BaseScraper):
-    """Fetch JRA win and wide odds published by netkeiba."""
+    """Fetch JRA win, wide, and umaren odds published by netkeiba."""
 
     BASE_URL = "https://race.netkeiba.com"
     ENCODING = "utf-8"
@@ -104,6 +115,18 @@ class NetkeibaOddsScraper(BaseScraper):
         """
         return self._get_odds(race_id, "wide", fetched_at=fetched_at)
 
+    def get_umaren_odds(self, race_id: str, *, fetched_at: datetime | None = None) -> RaceOdds:
+        """Fetch umaren (quinella) odds for one race.
+
+        Args:
+            race_id: netkeiba race id
+            fetched_at: Timestamp stored on every quote. Defaults to now.
+
+        Returns:
+            Live quotes, yoso quotes, or an empty unavailable snapshot
+        """
+        return self._get_odds(race_id, "umaren", fetched_at=fetched_at)
+
     def _get_odds(
         self,
         race_id: str,
@@ -140,6 +163,8 @@ class NetkeibaOddsScraper(BaseScraper):
 
         if bet_type == "wide":
             return parse_netkeiba_wide_odds(payload, race_id, fetched_at=fetched)
+        if bet_type == "umaren":
+            return parse_netkeiba_umaren_odds(payload, race_id, fetched_at=fetched)
         return parse_netkeiba_win_odds(payload, race_id, fetched_at=fetched)
 
 
@@ -223,6 +248,51 @@ def parse_netkeiba_wide_odds(
     return RaceOdds(
         race_id=race_id,
         bet_types=["wide"],
+        prefer="live",
+        status=snapshot_status,
+        reason=None,
+        quotes=quotes,
+        fetched_at=fetched_at,
+    )
+
+
+def parse_netkeiba_umaren_odds(
+    payload: object,
+    race_id: str,
+    *,
+    fetched_at: datetime,
+) -> RaceOdds:
+    """Turn an api_get_jra_odds type=4 response into umaren quotes.
+
+    Each pair is stored as ``lower-higher``. The published price is the first
+    field of ``[odds, change, popularity]``, the same shape as win. The change
+    field is not a range, so ``odds_min`` and ``odds_max`` stay empty.
+    A missing or placeholder price drops that pair.
+    """
+    opened = _read_market(
+        payload,
+        race_id,
+        fetched_at,
+        odds_key=UMAREN_ODDS_KEY,
+        bet_type="umaren",
+    )
+    if isinstance(opened, RaceOdds):
+        return opened
+    umaren_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    quotes = _quotes_from_umaren_map(
+        umaren_map,
+        race_id=race_id,
+        source=source,
+        kind=kind,
+        fetched_at=fetched_at,
+        market_updated_at=market_updated_at,
+    )
+    if not quotes:
+        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "umaren")
+
+    return RaceOdds(
+        race_id=race_id,
+        bet_types=["umaren"],
         prefer="live",
         status=snapshot_status,
         reason=None,
@@ -349,6 +419,46 @@ def _quotes_from_wide_map(
                 combination=combination,
                 odds_min=odds_min,
                 odds_max=odds_max,
+                source=source,
+                kind=kind,
+                fetched_at=fetched_at,
+                market_updated_at=market_updated_at,
+            )
+        )
+    return quotes
+
+
+def _quotes_from_umaren_map(
+    umaren_map: dict[Any, Any],
+    *,
+    race_id: str,
+    source: OddsSource,
+    kind: OddsKind,
+    fetched_at: datetime,
+    market_updated_at: datetime | None,
+) -> list[OddsQuote]:
+    """Build one quote per unordered pair. Price is a single odds value."""
+    candidates: list[tuple[tuple[int, int, int, str], str, float]] = []
+    for key, raw in umaren_map.items():
+        pair = _wide_pair(key)
+        odds_value = _positive_odds(raw)
+        if pair is None or odds_value is None or not isinstance(key, str):
+            continue
+        combination = f"{pair[0]}-{pair[1]}"
+        candidates.append((_pair_sort(key, pair), combination, odds_value))
+
+    quotes: list[OddsQuote] = []
+    seen: set[str] = set()
+    for _sort, combination, odds_value in sorted(candidates):
+        if combination in seen:
+            continue
+        seen.add(combination)
+        quotes.append(
+            OddsQuote(
+                race_id=race_id,
+                bet_type="umaren",
+                combination=combination,
+                odds=odds_value,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,

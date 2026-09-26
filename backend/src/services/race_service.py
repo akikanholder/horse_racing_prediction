@@ -216,7 +216,7 @@ class RaceService:
         bet_types: str | list[str] | None = "win",
         prefer: str = "live",
     ) -> RaceOdds:
-        """Get win and wide odds quotes for EV.
+        """Get win, wide, and umaren odds quotes for EV.
 
         Quotes stay on this object. RaceEntry.odds is not updated and is not
         the source of truth. prefer does not rewrite kind: a yoso payload is
@@ -227,7 +227,7 @@ class RaceService:
 
         Args:
             race_id: Race ID
-            bet_types: Requested bet types. win and wide are fetched.
+            bet_types: Requested bet types. win, wide, and umaren are fetched.
             prefer: live or yoso. Stored on the snapshot, not used to relabel.
 
         Returns:
@@ -266,8 +266,10 @@ class RaceService:
         """Fetch one bet type. Does not retry with the other kind."""
         if bet_type == "win":
             fetch = self.odds_scraper.get_win_odds
-        else:
+        elif bet_type == "wide":
             fetch = self.odds_scraper.get_wide_odds
+        else:
+            fetch = self.odds_scraper.get_umaren_odds
         try:
             snapshot = fetch(race_id, fetched_at=fetched_at)
         except Exception as e:
@@ -518,10 +520,10 @@ class RaceService:
 
 
 def _supported_bet_types(requested: list[str]) -> list[BetType]:
-    """Keep win and wide in the caller's order."""
+    """Keep win, wide, and umaren in the caller's order."""
     selected: list[BetType] = []
     for name in requested:
-        if name == "win" or name == "wide":
+        if name == "win" or name == "wide" or name == "umaren":
             selected.append(name)
     return selected
 
