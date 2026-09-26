@@ -5,8 +5,10 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Sequence
 from datetime import date
 
+from backend.models.odds import OddsQuote
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -192,7 +194,7 @@ def cmd_track(args):
 
 
 def cmd_odds(args):
-    """Get win odds quotes."""
+    """Get win and wide odds quotes."""
     with RaceService() as service:
         snapshot = service.get_race_odds(
             args.race_id,
@@ -204,7 +206,7 @@ def cmd_odds(args):
         print_json(snapshot)
         return
 
-    print(f"\n=== 単勝オッズ: {snapshot.race_id} ===")
+    print(f"\n=== {_odds_title(snapshot.bet_types)}: {snapshot.race_id} ===")
     print(f"状態: {snapshot.status}")
     if snapshot.reason:
         print(f"理由: {snapshot.reason}")
@@ -217,7 +219,22 @@ def cmd_odds(args):
         print(f"オッズ更新: {updated}")
     print()
     for quote in snapshot.quotes:
-        print(f"{quote.combination}番 {quote.odds} [{quote.source} / {quote.kind}]")
+        print(_format_odds_quote(quote))
+
+
+def _odds_title(bet_types: Sequence[str]) -> str:
+    if bet_types == ["wide"]:
+        return "ワイドオッズ"
+    if bet_types == ["win"]:
+        return "単勝オッズ"
+    return "オッズ"
+
+
+def _format_odds_quote(quote: OddsQuote) -> str:
+    tag = f"[{quote.source} / {quote.kind}]"
+    if quote.bet_type == "wide":
+        return f"ワイド {quote.combination} {quote.odds_min}-{quote.odds_max} {tag}"
+    return f"{quote.combination}番 {quote.odds} {tag}"
 
 
 def cmd_venues(args):
@@ -277,18 +294,20 @@ def main():
     track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     track_parser.set_defaults(func=cmd_track)
 
-    odds_parser = subparsers.add_parser("odds", help="単勝オッズを取得")
+    odds_parser = subparsers.add_parser("odds", help="単勝・ワイドのオッズを取得")
     odds_parser.add_argument("race_id", help="レースID")
     odds_parser.add_argument(
         "--bet-types",
         default="win",
-        help="馬券種（カンマ区切り。現在は win のみ）",
+        help=(
+            "馬券種（カンマ区切り。win と wide）。prefer=live で取れないとき yoso へは切り替えない"
+        ),
     )
     odds_parser.add_argument(
         "--prefer",
         default="live",
         choices=["live", "yoso"],
-        help="優先する種別。yoso の kind は書き換えない",
+        help="優先する種別。kind は書き換えない。live が無いとき yoso は明示して取る",
     )
     odds_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     odds_parser.set_defaults(func=cmd_odds)

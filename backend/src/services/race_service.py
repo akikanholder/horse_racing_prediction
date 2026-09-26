@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
-from backend.models.odds import OddsPrefer, RaceOdds
+from backend.models.odds import BetType, OddsPrefer, OddsStatus, RaceOdds
 from backend.models.race import (
     Race,
     RaceCard,
@@ -46,7 +46,7 @@ class RaceService:
 
     @property
     def odds_scraper(self) -> NetkeibaOddsScraper:
-        """Get or create the netkeiba win-odds client."""
+        """Get or create the netkeiba odds client."""
         if self._odds_scraper is None:
             self._odds_scraper = NetkeibaOddsScraper()
         return self._odds_scraper
@@ -216,15 +216,18 @@ class RaceService:
         bet_types: str | list[str] | None = "win",
         prefer: str = "live",
     ) -> RaceOdds:
-        """Get win odds quotes for EV.
+        """Get win and wide odds quotes for EV.
 
         Quotes stay on this object. RaceEntry.odds is not updated and is not
         the source of truth. prefer does not rewrite kind: a yoso payload is
         returned as kind=yoso even when the caller prefers live.
 
+        prefer=live does not fall back to yoso when the market is unavailable.
+        Callers that want predicted odds pass prefer=yoso themselves.
+
         Args:
             race_id: Race ID
-            bet_types: Requested bet types. Only win is fetched.
+            bet_types: Requested bet types. win and wide are fetched.
             prefer: live or yoso. Stored on the snapshot, not used to relabel.
 
         Returns:
@@ -233,7 +236,8 @@ class RaceService:
         fetched_at = datetime.now()
         requested = _normalize_bet_types(bet_types)
         preference: OddsPrefer = "yoso" if prefer == "yoso" else "live"
-        if "win" not in requested:
+        selected = _supported_bet_types(requested)
+        if not selected:
             return RaceOdds(
                 race_id=race_id,
                 bet_types=[],
@@ -244,21 +248,40 @@ class RaceService:
                 fetched_at=fetched_at,
             )
 
+        snapshots = [
+            self._fetch_bet_odds(race_id, bet_type, fetched_at, preference)
+            for bet_type in selected
+        ]
+        if len(snapshots) == 1:
+            return snapshots[0].model_copy(update={"prefer": preference, "bet_types": selected})
+        return _merge_odds_snapshots(race_id, selected, preference, fetched_at, snapshots)
+
+    def _fetch_bet_odds(
+        self,
+        race_id: str,
+        bet_type: BetType,
+        fetched_at: datetime,
+        preference: OddsPrefer,
+    ) -> RaceOdds:
+        """Fetch one bet type. Does not retry with the other kind."""
+        if bet_type == "win":
+            fetch = self.odds_scraper.get_win_odds
+        else:
+            fetch = self.odds_scraper.get_wide_odds
         try:
-            snapshot = self.odds_scraper.get_win_odds(race_id, fetched_at=fetched_at)
+            snapshot = fetch(race_id, fetched_at=fetched_at)
         except Exception as e:
-            logger.error("Failed to get win odds for %s: %s", race_id, e)
+            logger.error("Failed to get %s odds for %s: %s", bet_type, race_id, e)
             return RaceOdds(
                 race_id=race_id,
-                bet_types=["win"],
+                bet_types=[bet_type],
                 prefer=preference,
                 status="unavailable",
                 reason="fetch failed",
                 quotes=[],
                 fetched_at=fetched_at,
             )
-
-        return snapshot.model_copy(update={"prefer": preference, "bet_types": ["win"]})
+        return snapshot.model_copy(update={"prefer": preference, "bet_types": [bet_type]})
 
     def get_horse_info(self, horse_id: str) -> Horse | None:
         """Get detailed horse information.
@@ -492,6 +515,58 @@ class RaceService:
         """Context manager exit."""
         self.close()
         return False
+
+
+def _supported_bet_types(requested: list[str]) -> list[BetType]:
+    """Keep win and wide in the caller's order."""
+    selected: list[BetType] = []
+    for name in requested:
+        if name == "win" or name == "wide":
+            selected.append(name)
+    return selected
+
+
+def _merge_odds_snapshots(
+    race_id: str,
+    bet_types: list[BetType],
+    preference: OddsPrefer,
+    fetched_at: datetime,
+    snapshots: list[RaceOdds],
+) -> RaceOdds:
+    """Combine bet types. An empty type adds no prices and does not relabel the rest."""
+    quotes = [quote for snapshot in snapshots for quote in snapshot.quotes]
+    if not quotes:
+        return RaceOdds(
+            race_id=race_id,
+            bet_types=bet_types,
+            prefer=preference,
+            status="unavailable",
+            reason=_combined_reason(bet_types, snapshots),
+            quotes=[],
+            fetched_at=fetched_at,
+        )
+    status: OddsStatus = "yoso" if all(quote.kind == "yoso" for quote in quotes) else "live"
+    return RaceOdds(
+        race_id=race_id,
+        bet_types=bet_types,
+        prefer=preference,
+        status=status,
+        reason=None,
+        quotes=quotes,
+        fetched_at=fetched_at,
+    )
+
+
+def _combined_reason(bet_types: list[BetType], snapshots: list[RaceOdds]) -> str:
+    """Join empty-market reasons. A single snapshot keeps the API reason."""
+    if len(snapshots) == 1:
+        return snapshots[0].reason or "odds unavailable"
+    parts: list[str] = []
+    for bet_type, snapshot in zip(bet_types, snapshots, strict=True):
+        if snapshot.quotes:
+            continue
+        parts.append(f"{bet_type}: {snapshot.reason or 'odds unavailable'}")
+    return "; ".join(parts) or "odds unavailable"
 
 
 def _normalize_bet_types(bet_types: str | list[str] | None) -> list[str]:
