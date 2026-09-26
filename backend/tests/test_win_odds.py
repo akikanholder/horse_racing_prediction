@@ -74,6 +74,26 @@ class TestParseWinOdds:
         assert snapshot.quotes == []
         assert snapshot.reason == "result odds empty"
 
+    def test_middle_with_numbers_is_live_despite_empty_reason(self):
+        """In-progress markets still say reason=result odds empty."""
+        snapshot = parse_netkeiba_win_odds(
+            _load("netkeiba_jra_odds_middle.json"),
+            "202606040901",
+            fetched_at=FETCHED_AT,
+        )
+        assert snapshot.status == "live"
+        assert snapshot.reason is None
+        assert len(snapshot.quotes) == 16
+        first = snapshot.quotes[0]
+        assert first.combination == "1"
+        assert first.odds == 30.5
+        assert first.source == "netkeiba_live"
+        assert first.kind == "live"
+        assert first.fetched_at == FETCHED_AT
+        assert first.market_updated_at == datetime(2026, 9, 27, 0, 55, 5)
+        assert all(quote.kind == "live" for quote in snapshot.quotes)
+        assert all(quote.source == "netkeiba_live" for quote in snapshot.quotes)
+
     def test_yoso_status_is_not_relabeled_as_live(self):
         payload = _live_payload()
         payload["status"] = "yoso"
@@ -134,7 +154,12 @@ class TestNetkeibaOddsScraper:
         assert http.calls == [
             {
                 "url": "https://race.netkeiba.com/api/api_get_jra_odds.html",
-                "params": {"race_id": RACE_ID, "type": "1", "compress": "0"},
+                "params": {
+                    "race_id": RACE_ID,
+                    "type": "1",
+                    "action": "init",
+                    "compress": "0",
+                },
                 "encoding": "utf-8",
             }
         ]

@@ -2,12 +2,14 @@
 
 単勝は次の JSON を使う。
 
-    GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=1&compress=0
+    GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=1&action=init&compress=0
 
+``action=init`` はブラウザの初回取得と同じ。これを付けない発売中レースは
+``data`` が空文字で ``reason=result odds empty`` になる。Referer や
+クッキーウォームアップではその空応答は変わらなかった。
 単勝の馬ごとオッズは ``data.odds["1"]``。各馬は ``[オッズ, 変動, 人気]``。
-出馬表の予想オッズも同じ API で、``status == "yoso"`` のときだけ載る。
-その場合は kind=yoso / source=netkeiba_yoso のまま返し、live にはしない。
-数値が無い、または ``---.-`` などのプレースホルダは捨てる。数値は作らない。
+``status == "yoso"`` のときだけ kind=yoso / source=netkeiba_yoso。
+``middle`` / ``result`` で数値があるときは kind=live。数値は作らない。
 """
 
 import json
@@ -49,7 +51,8 @@ class NetkeibaOddsScraper(BaseScraper):
         """
         fetched = fetched_at or datetime.now()
         url = self.build_url(self.ODDS_PATH)
-        params = {"race_id": race_id, "type": "1", "compress": "0"}
+        # action=init がないと発売中の単勝は data が空になる。
+        params = {"race_id": race_id, "type": "1", "action": "init", "compress": "0"}
         try:
             # compress=0 で JSON。HTML 用の euc-jp は使わない。
             body = self.http_client.get(url, params=params, encoding=self.ENCODING)
