@@ -58,7 +58,7 @@ class HTTPClient:
                 total=self.max_retries,
                 backoff_factor=self.backoff_factor,
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "HEAD", "OPTIONS"],
+                allowed_methods=["GET", "HEAD", "OPTIONS", "POST"],
             )
             adapter = HTTPAdapter(max_retries=retry_strategy)
             self._session.mount("http://", adapter)
@@ -103,6 +103,53 @@ class HTTPClient:
             response = session.get(
                 url,
                 params=params,
+                headers=request_headers,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+
+            if encoding:
+                response.encoding = encoding
+            elif response.encoding is None:
+                response.encoding = "utf-8"
+
+            self._last_request_time = time.time()
+            return response.text
+
+        except requests.RequestException as e:
+            logger.error(f"Request failed for {url}: {e}")
+            raise
+
+    def post(
+        self,
+        url: str,
+        data: dict | None = None,
+        headers: dict | None = None,
+        encoding: str | None = None,
+    ) -> str:
+        """Make POST request and return response text.
+
+        Args:
+            url: URL to request
+            data: Form body. JRA accessD expects ``cname``.
+            headers: Additional headers
+            encoding: Response encoding (auto-detected if not specified)
+
+        Returns:
+            Response text content
+        """
+        self._wait_for_rate_limit()
+
+        session = self._get_session()
+        request_headers = {**self.DEFAULT_HEADERS}
+        if headers:
+            request_headers.update(headers)
+
+        try:
+            logger.debug(f"Posting: {url}")
+            response = session.post(
+                url,
+                data=data,
                 headers=request_headers,
                 timeout=self.timeout,
             )

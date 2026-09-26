@@ -8,6 +8,7 @@ from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.race import (
     Race,
     RaceCard,
+    RaceEntry,
     RaceResult,
     RaceSchedule,
     RaceWithResults,
@@ -125,17 +126,29 @@ class RaceService:
     def get_race_card(self, race_id: str) -> RaceCard | None:
         """Get race card with all entries.
 
+        Combines the netkeiba shutuba page with the JRA accessD card.
+        A source that fails is ignored when the other source returns a card.
+
         Args:
             race_id: Race ID
 
         Returns:
             RaceCard with entries or None
         """
+        netkeiba_card: RaceCard | None = None
+        jra_card: RaceCard | None = None
+
         try:
-            return self.netkeiba_scraper.get_race_card(race_id)
+            netkeiba_card = self.netkeiba_scraper.get_race_card(race_id)
         except Exception as e:
-            logger.error(f"Failed to get race card for {race_id}: {e}")
-            return None
+            logger.error(f"Failed to get netkeiba race card for {race_id}: {e}")
+
+        try:
+            jra_card = self.jra_scraper.get_race_card(race_id)
+        except Exception as e:
+            logger.error(f"Failed to get JRA race card for {race_id}: {e}")
+
+        return self._merge_race_cards(netkeiba_card, jra_card)
 
     def get_race_export_bundle(
         self, race_id: str
@@ -168,7 +181,7 @@ class RaceService:
             RaceWithResults or None
         """
         try:
-            race_card = self.netkeiba_scraper.get_race_card(race_id)
+            race_card = self.get_race_card(race_id)
             if not race_card:
                 return None
 
@@ -286,6 +299,72 @@ class RaceService:
             if course:
                 courses.append(course)
         return courses
+
+    def _merge_race_cards(
+        self, netkeiba_card: RaceCard | None, jra_card: RaceCard | None
+    ) -> RaceCard | None:
+        """Merge shutuba cards, keeping netkeiba ids when both sources have them.
+
+        Args:
+            netkeiba_card: Card from netkeiba
+            jra_card: Card from JRA accessD
+
+        Returns:
+            Merged card, the only available card, or None
+        """
+        if netkeiba_card is None and jra_card is None:
+            return None
+        if netkeiba_card is None:
+            return jra_card
+        if jra_card is None:
+            return netkeiba_card
+
+        race = self._merge_race_info(jra_card.race, netkeiba_card.race)
+        entries = self._merge_entries(netkeiba_card.entries, jra_card.entries)
+        if race.entry_count is None and entries:
+            race = race.model_copy(update={"entry_count": len(entries)})
+        return RaceCard(race=race, entries=entries)
+
+    def _merge_entries(
+        self, primary: list[RaceEntry], secondary: list[RaceEntry]
+    ) -> list[RaceEntry]:
+        """Fill blank starter fields from the secondary card, keyed by horse number.
+
+        Identifier fields already present on the primary (netkeiba) entry are kept.
+        """
+        secondary_by_number = {entry.horse_number: entry for entry in secondary}
+        merged: list[RaceEntry] = []
+        seen: set[int] = set()
+
+        for entry in primary:
+            seen.add(entry.horse_number)
+            other = secondary_by_number.get(entry.horse_number)
+            merged.append(self._fill_entry(entry, other) if other else entry)
+
+        for entry in secondary:
+            if entry.horse_number not in seen:
+                merged.append(entry)
+
+        return sorted(merged, key=lambda entry: entry.horse_number)
+
+    def _fill_entry(self, primary: RaceEntry, secondary: RaceEntry) -> RaceEntry:
+        """Copy empty primary fields from the secondary entry."""
+        updates: dict[str, object] = {}
+        id_fields = {"horse_id", "jockey_id", "trainer_id"}
+        for field_name in RaceEntry.model_fields:
+            if field_name in {"bracket_number", "horse_number"}:
+                continue
+            current = getattr(primary, field_name)
+            incoming = getattr(secondary, field_name)
+            if field_name in id_fields:
+                if not current and incoming:
+                    updates[field_name] = incoming
+                continue
+            if current is None and incoming is not None:
+                updates[field_name] = incoming
+            elif current == "" and incoming:
+                updates[field_name] = incoming
+        return primary.model_copy(update=updates)
 
     def _merge_race_info(self, race1: Race, race2: Race) -> Race:
         """Merge race information from two sources.

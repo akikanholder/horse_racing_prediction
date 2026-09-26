@@ -37,6 +37,29 @@ class BaseScraper(ABC):
         html = self.http_client.get(url, params=params, encoding=self.ENCODING)
         return BeautifulSoup(html, "lxml")
 
+    def fetch_post(
+        self,
+        url: str,
+        data: dict | None = None,
+        encoding: str | None = None,
+    ) -> BeautifulSoup:
+        """POST a form and return parsed BeautifulSoup object.
+
+        Args:
+            url: URL to request
+            data: Form body
+            encoding: Response encoding (scraper default if omitted)
+
+        Returns:
+            Parsed BeautifulSoup object
+        """
+        html = self.http_client.post(
+            url,
+            data=data,
+            encoding=encoding or self.ENCODING,
+        )
+        return BeautifulSoup(html, "lxml")
+
     def build_url(self, path: str) -> str:
         """Build full URL from path.
 
