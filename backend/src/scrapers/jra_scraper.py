@@ -513,7 +513,11 @@ class JRAScraper(BaseScraper):
                 (year + venue + kai + day + race)
 
         Returns:
-            RaceCard or None when the race is not on the current menu
+            RaceCard or None when the race is not on the current menu.
+
+        Datacenter egress often receives Akamai HTTP 403 from accessD. That is
+        an IP block, not a missing User-Agent. Callers keep the netkeiba card.
+        A residential or real-browser environment may be needed later for jradb.
         """
         lookup = self._lookup_from_race_id(race_id)
         if lookup is None:
@@ -528,7 +532,15 @@ class JRAScraper(BaseScraper):
             html = self._fetch_access_d(cname.cname)
             return self._parse_race_card(html, race_id, cname)
         except Exception as e:
-            logger.error(f"Failed to fetch JRA race card for {race_id}: {e}")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                logger.warning(
+                    "JRA accessD returned 403 for %s. Datacenter egress is often "
+                    "blocked by Akamai; card merge keeps the netkeiba shutuba.",
+                    race_id,
+                )
+            else:
+                logger.error("Failed to fetch JRA race card for %s: %s", race_id, e)
             return None
 
     def _fetch_access_d(self, cname: str) -> str:

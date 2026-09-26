@@ -138,6 +138,8 @@ class RaceService:
 
         Combines the netkeiba shutuba page with the JRA accessD card.
         A source that fails is ignored when the other source returns a card.
+        accessD HTTP 403 from datacenter egress is that kind of failure: the
+        netkeiba card is kept. jradb may need a residential browser later.
 
         Args:
             race_id: Race ID
@@ -156,7 +158,11 @@ class RaceService:
         try:
             jra_card = self.jra_scraper.get_race_card(race_id)
         except Exception as e:
-            logger.error(f"Failed to get JRA race card for {race_id}: {e}")
+            logger.warning(
+                "JRA accessD card unavailable for %s (%s); keeping the netkeiba card",
+                race_id,
+                e,
+            )
 
         return self._merge_race_cards(netkeiba_card, jra_card)
 

@@ -5,11 +5,15 @@
     GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=1&action=init&compress=0
 
 ``action=init`` はブラウザの初回取得と同じ。これを付けない発売中レースは
-``data`` が空文字で ``reason=result odds empty`` になる。Referer や
-クッキーウォームアップではその空応答は変わらなかった。
+``data`` が空文字になりやすい。ヘッダをブラウザ相当にしても、空のときは空のまま。
+その場合は quotes を空にし、API の reason（例: ``result odds empty``）をそのまま返す。
+数値は作らない。
+
+リクエスト Session にはブラウザ相当の UA / Accept / X-Requested-With と、
+オッズページへの Referer を載せる。
 単勝の馬ごとオッズは ``data.odds["1"]``。各馬は ``[オッズ, 変動, 人気]``。
 ``status == "yoso"`` のときだけ kind=yoso / source=netkeiba_yoso。
-``middle`` / ``result`` で数値があるときは kind=live。数値は作らない。
+``middle`` / ``result`` で数値があるときは kind=live。
 """
 
 import json
@@ -19,6 +23,7 @@ from typing import Any
 
 from backend.models.odds import OddsKind, OddsQuote, OddsSource, OddsStatus, RaceOdds
 from backend.scrapers.base_scraper import BaseScraper
+from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,22 @@ class NetkeibaOddsScraper(BaseScraper):
     BASE_URL = "https://race.netkeiba.com"
     ENCODING = "utf-8"
     ODDS_PATH = "/api/api_get_jra_odds.html"
+    BROWSER_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    def __init__(self, http_client: HTTPClient | None = None):
+        """Use a Session that already carries browser-like odds headers."""
+        if http_client is None:
+            http_client = HTTPClient(headers=self.BROWSER_HEADERS)
+        super().__init__(http_client)
 
     def get_win_odds(self, race_id: str, *, fetched_at: datetime | None = None) -> RaceOdds:
         """Fetch win odds for one race.
@@ -51,11 +72,20 @@ class NetkeibaOddsScraper(BaseScraper):
         """
         fetched = fetched_at or datetime.now()
         url = self.build_url(self.ODDS_PATH)
-        # action=init がないと発売中の単勝は data が空になる。
+        # action=init はブラウザの初回取得。無いと発売中は data が空になりやすい。
         params = {"race_id": race_id, "type": "1", "action": "init", "compress": "0"}
+        headers = {
+            **self.BROWSER_HEADERS,
+            "Referer": f"{self.BASE_URL}/odds/index.html?type=b1&race_id={race_id}",
+        }
         try:
             # compress=0 で JSON。HTML 用の euc-jp は使わない。
-            body = self.http_client.get(url, params=params, encoding=self.ENCODING)
+            body = self.http_client.get(
+                url,
+                params=params,
+                headers=headers,
+                encoding=self.ENCODING,
+            )
             payload = json.loads(body)
         except Exception as e:
             logger.error("Failed to fetch win odds for %s: %s", race_id, e)
@@ -73,8 +103,8 @@ def parse_netkeiba_win_odds(
     """Turn an api_get_jra_odds response into win quotes.
 
     ``status == "yoso"`` stays yoso. ``result`` and ``middle`` with numbers
-    are live market odds. Anything else, including an empty ``data`` string,
-    is an empty list.
+    are live market odds. An empty ``data`` string becomes an empty quote
+    list and keeps the API reason, such as ``result odds empty``.
     """
     if not isinstance(payload, dict):
         return _unavailable(race_id, fetched_at, "invalid odds payload")

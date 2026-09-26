@@ -16,6 +16,7 @@ from backend.scrapers.netkeiba_odds_scraper import (
     parse_netkeiba_win_odds,
 )
 from backend.services.race_service import RaceService
+from backend.utils.http_client import HTTPClient
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FETCHED_AT = datetime(2026, 9, 26, 16, 0, 0)
@@ -136,7 +137,9 @@ class _FakeHTTP:
         self.calls: list[dict] = []
 
     def get(self, url, params=None, headers=None, encoding=None):
-        self.calls.append({"url": url, "params": params, "encoding": encoding})
+        self.calls.append(
+            {"url": url, "params": params, "headers": headers, "encoding": encoding}
+        )
         return self.body
 
     def close(self):
@@ -160,9 +163,47 @@ class TestNetkeibaOddsScraper:
                     "action": "init",
                     "compress": "0",
                 },
+                "headers": {
+                    **NetkeibaOddsScraper.BROWSER_HEADERS,
+                    "Referer": (
+                        "https://race.netkeiba.com/odds/index.html"
+                        f"?type=b1&race_id={RACE_ID}"
+                    ),
+                },
                 "encoding": "utf-8",
             }
         ]
+        sent = http.calls[0]["headers"]
+        assert "Chrome/" in sent["User-Agent"]
+        assert sent["Accept"].startswith("application/json")
+        assert sent["X-Requested-With"] == "XMLHttpRequest"
+
+    def test_empty_free_odds_keep_the_api_reason(self):
+        body = (FIXTURES / "netkeiba_jra_odds_empty.json").read_text(encoding="utf-8")
+        scraper = NetkeibaOddsScraper(http_client=_FakeHTTP(body))
+        snapshot = scraper.get_win_odds("202606040901", fetched_at=FETCHED_AT)
+
+        assert snapshot.status == "unavailable"
+        assert snapshot.quotes == []
+        assert snapshot.reason == "result odds empty"
+
+
+class TestOddsSessionHeaders:
+    def test_browser_headers_stay_on_the_session(self):
+        client = HTTPClient(headers=NetkeibaOddsScraper.BROWSER_HEADERS, min_request_interval=0)
+        referer = "https://race.netkeiba.com/odds/index.html?type=b1&race_id=202606040901"
+        try:
+            merged = client._headers_for({"Referer": referer})
+            session_headers = client._get_session().headers
+        finally:
+            client.close()
+
+        assert merged["X-Requested-With"] == "XMLHttpRequest"
+        assert merged["Referer"] == referer
+        assert "Chrome/" in merged["User-Agent"]
+        assert session_headers["Referer"] == referer
+        assert session_headers["X-Requested-With"] == "XMLHttpRequest"
+        assert session_headers["Accept"].startswith("application/json")
 
     def test_invalid_json_is_unavailable(self):
         scraper = NetkeibaOddsScraper(http_client=_FakeHTTP("not-json"))
