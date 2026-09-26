@@ -13,6 +13,9 @@ JRA（日本中央競馬会）の競馬データをスクレイピングして�
   - 今週のレーススケジュール
   - 競馬場スケジュール
   - コース情報
+- **JRA出馬表** (https://www.jra.go.jp/JRADB/accessD.html)
+  - レース詳細（レース条件、発走時刻、本賞金）
+  - 出走馬（枠番、馬番、騎手、調教師、馬体重、単勝オッズ）
 - **JRA馬場情報** (https://www.jra.go.jp/keiba/baba/index.html)
   - 馬場状態（芝/ダート）
   - クッション値
@@ -161,7 +164,7 @@ backend/
     ├── scrapers/        # スクレイパー
     │   ├── __init__.py
     │   ├── base_scraper.py # 基底クラス
-    │   ├── jra_scraper.py  # JRA レース・コース
+    │   ├── jra_scraper.py  # JRA レース・コース・出馬表
     │   ├── netkeiba_scraper.py
     │   ├── jra_track_scraper.py      # JRA 馬場情報
     │   └── netkeiba_track_scraper.py
