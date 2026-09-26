@@ -2,6 +2,7 @@
 
 from backend.models.course import Course, CourseCondition
 from backend.models.horse import Horse, HorsePerformance
+from backend.models.odds import OddsQuote, RaceOdds
 from backend.models.race import Race, RaceCard, RaceResult
 from backend.models.track import (
     CourseInfo,
@@ -25,8 +26,10 @@ __all__ = [
     "Horse",
     "HorsePerformance",
     "MoistureContent",
+    "OddsQuote",
     "Race",
     "RaceCard",
+    "RaceOdds",
     "RaceResult",
     "TrackCondition",
     "TrackInfo",

@@ -3,7 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.export import DailyRaceCsvExport
 from backend.models.horse import Horse, HorseBasicInfo
+from backend.models.odds import RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, RaceWithResults
 from backend.models.track import TrackInfo
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
@@ -70,6 +71,7 @@ async def root():
             "race_detail": "/api/races/{race_id}",
             "race_card": "/api/races/{race_id}/card",
             "race_result": "/api/races/{race_id}/result",
+            "race_odds": "/api/races/{race_id}/odds?bet_types=win&prefer=live",
             "horses": "/api/horses/{horse_id}",
             "courses": "/api/courses",
             "course_detail": "/api/courses/{venue}",
@@ -173,6 +175,42 @@ async def get_race_result(race_id: str):
     except Exception as e:
         logger.error(f"Failed to get race result for {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/races/{race_id}/odds", response_model=RaceOdds, tags=["Races"])
+async def get_race_odds(
+    race_id: str,
+    bet_types: Annotated[
+        str, Query(description="カンマ区切り。現在は win（単勝）のみ")
+    ] = "win",
+    prefer: Annotated[
+        Literal["live", "yoso"],
+        Query(description="live を優先。yoso が返るときは kind=yoso のまま"),
+    ] = "live",
+):
+    """レースの単勝オッズを取得する。
+
+    期待値計算はここで返す OddsQuote を使う。RaceEntry.odds は使わない。
+    発売後の市場オッズは source=netkeiba_live / kind=live。
+    発売前のAI予想オッズが API に載っているときだけ source=netkeiba_yoso / kind=yoso。
+    数値が無いときは quotes が空で status=unavailable。
+
+    Args:
+        race_id: レースID
+        bet_types: 馬券種。win のみ対応
+        prefer: live または yoso。kind は書き換えない
+
+    Returns:
+        RaceOdds: 単勝オッズ
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        return race_service.get_race_odds(race_id, bet_types=bet_types, prefer=prefer)
+    except Exception as e:
+        logger.error(f"Failed to get odds for {race_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/races/{race_id}/horses", response_model=list[HorseBasicInfo], tags=["Races"])
