@@ -71,7 +71,9 @@ async def root():
             "race_detail": "/api/races/{race_id}",
             "race_card": "/api/races/{race_id}/card",
             "race_result": "/api/races/{race_id}/result",
-            "race_odds": "/api/races/{race_id}/odds?bet_types=win,wide,umaren&prefer=live",
+            "race_odds": (
+                "/api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live"
+            ),
             "horses": "/api/horses/{horse_id}",
             "courses": "/api/courses",
             "course_detail": "/api/courses/{venue}",
@@ -184,7 +186,8 @@ async def get_race_odds(
         str,
         Query(
             description=(
-                "カンマ区切り。win（単勝）、wide（ワイド）、umaren（馬連）。"
+                "カンマ区切り。win（単勝）、wide（ワイド）、umaren（馬連）、"
+                "sanrenpuku（三連複）。"
                 "prefer=live が unavailable でも yoso へは自動で切り替えない"
             )
         ),
@@ -199,7 +202,7 @@ async def get_race_odds(
         ),
     ] = "live",
 ):
-    """レースの単勝・ワイド・馬連オッズを取得する。
+    """レースの単勝・ワイド・馬連・三連複オッズを取得する。
 
     期待値計算はここで返す OddsQuote を使う。RaceEntry.odds は使わない。
     発売後の市場オッズは source=netkeiba_live / kind=live。
@@ -210,14 +213,16 @@ async def get_race_odds(
     ワイドの組み合わせは ``3-7``（馬番の小さい順）で、価格は odds_min と odds_max。
     馬連の組み合わせも ``3-7``（馬番の小さい順）で、価格は単一の odds。
     馬連の変動値は範囲ではないので odds_min / odds_max は空のまま。
+    三連複の組み合わせは ``1-2-5``（馬番3つの小さい順）で、価格は単一の odds。
+    三連複の変動値も範囲ではないので odds_min / odds_max は空のまま。
 
     Args:
         race_id: レースID
-        bet_types: 馬券種。win、wide、umaren。カンマ区切りで同時に取得できる
+        bet_types: 馬券種。win、wide、umaren、sanrenpuku。カンマ区切りで同時に取得できる
         prefer: live または yoso。kind は書き換えない
 
     Returns:
-        RaceOdds: 単勝・ワイド・馬連のオッズ
+        RaceOdds: 単勝・ワイド・馬連・三連複のオッズ
     """
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")

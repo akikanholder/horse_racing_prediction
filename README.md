@@ -115,10 +115,11 @@ python -m backend.cli venues
 python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
 
-# オッズを取得（単勝が既定。ワイド・馬連は --bet-types）
+# オッズを取得（単勝が既定。ワイド・馬連・三連複は --bet-types）
 python -m backend.cli odds <race_id> --bet-types wide --prefer live
 python -m backend.cli odds <race_id> --bet-types umaren --prefer live
-python -m backend.cli odds <race_id> --bet-types win,wide,umaren --json
+python -m backend.cli odds <race_id> --bet-types sanrenpuku --prefer live
+python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --json
 
 # JSON形式で出力
 python -m backend.cli races --json
@@ -147,17 +148,18 @@ with TrackInfoService() as service:
 
 ## オッズ
 
-`GET /api/races/{race_id}/odds?bet_types=umaren&prefer=live`
+`GET /api/races/{race_id}/odds?bet_types=sanrenpuku&prefer=live`
 
 期待値は `RaceEntry.odds` ではなく、ここで返す `OddsQuote` を使う。
 
-- `bet_types` は `win`（単勝）、`wide`（ワイド）、`umaren`（馬連）。カンマ区切りで同時に取れる。既定は `win`。
+- `bet_types` は `win`（単勝）、`wide`（ワイド）、`umaren`（馬連）、`sanrenpuku`（三連複）。カンマ区切りで同時に取れる。既定は `win`。
 - 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。
 - 馬連の組み合わせも `3-7`（馬番の小さい順）。価格は単勝と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。
-- `source` は `netkeiba_live` / `netkeiba_yoso` / `jradb`。`kind` は `live` または `yoso`。
+- 三連複の組み合わせは `1-2-5`（馬番3つの小さい順）。価格は馬連と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。
+- `source` は `netkeiba_live` / `netkeiba_yoso` / `jradb`。`kind` は `live` または `yoso`。CLI を `source` には入れない。
 - `fetched_at` は必須。市場の更新時刻があるときだけ `market_updated_at` を入れる。
 - `prefer` は呼び出し側の希望であり、`kind` を書き換えない。`status=yoso` のペイロードは `prefer=live` でも `kind=yoso` のまま。
-- `prefer=live` で市場オッズが取れないとき（`quotes=[]` / `status=unavailable`）、予想オッズへは自動で切り替えない。予想が必要ならクライアントが `prefer=yoso` を明示して取りにいく。
+- `prefer=live` で市場オッズが取れないとき（`quotes=[]` / `status=unavailable`）、予想オッズへは自動で切り替えない。予想が必要ならクライアントが `prefer=yoso` を明示して取りにいく。単勝・ワイド・馬連・三連複とも同じ。
 - 数値が無いレスポンスは `quotes=[]` と API の `reason`（例: `result odds empty`）。
 
 ## プロジェクト構成

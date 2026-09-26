@@ -1,7 +1,7 @@
 """Odds quotes for EV sheets.
 
 能力指標とは別物。期待値は RaceEntry.odds ではなく、この OddsQuote を読む。
-単勝と馬連は odds（単一価格）。ワイドは odds_min と odds_max（範囲の片側から価格は作らない）。
+単勝、馬連、三連複は odds（単一価格）。ワイドは odds_min と odds_max（範囲の片側から価格は作らない）。
 """
 
 import re
@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 
 OddsSource = Literal["netkeiba_yoso", "netkeiba_live", "jradb"]
 OddsKind = Literal["yoso", "live"]
-BetType = Literal["win", "wide", "umaren"]
+BetType = Literal["win", "wide", "umaren", "sanrenpuku"]
 OddsStatus = Literal["live", "yoso", "unavailable"]
 OddsPrefer = Literal["live", "yoso"]
 
@@ -30,15 +30,15 @@ class OddsQuote(BaseModel):
     race_id: str = Field(..., description="レースID")
     bet_type: BetType = Field(
         "win",
-        description="馬券種。win（単勝）、wide（ワイド）、umaren（馬連）",
+        description="馬券種。win（単勝）、wide（ワイド）、umaren（馬連）、sanrenpuku（三連複）",
     )
     combination: str = Field(
         ...,
-        description="単勝は馬番。ワイドと馬連は 3-7 のように馬番の小さい順",
+        description="単勝は馬番。ワイドと馬連は 3-7、三連複は 1-2-5 のように馬番の小さい順",
     )
-    odds: float | None = Field(None, description="単勝・馬連のオッズ。ワイドでは空", gt=0)
-    odds_min: float | None = Field(None, description="ワイドの下限オッズ。馬連では空", gt=0)
-    odds_max: float | None = Field(None, description="ワイドの上限オッズ。馬連では空", gt=0)
+    odds: float | None = Field(None, description="単勝・馬連・三連複のオッズ。ワイドでは空", gt=0)
+    odds_min: float | None = Field(None, description="ワイドの下限オッズ。馬連・三連複では空", gt=0)
+    odds_max: float | None = Field(None, description="ワイドの上限オッズ。馬連・三連複では空", gt=0)
     source: OddsSource = Field(..., description="取得元")
     kind: OddsKind = Field(..., description="yoso=発売前の予想、live=発売後の市場")
     fetched_at: datetime = Field(..., description="取得日時")
@@ -55,8 +55,10 @@ class OddsQuote(BaseModel):
             self._check_win()
         elif self.bet_type == "wide":
             self._check_wide()
-        else:
+        elif self.bet_type == "umaren":
             self._check_umaren()
+        else:
+            self._check_sanrenpuku()
         return self
 
     def _check_win(self) -> None:
@@ -96,6 +98,18 @@ class OddsQuote(BaseModel):
             raise ValueError("umaren requires odds")
         if self.odds_min is not None or self.odds_max is not None:
             raise ValueError("umaren odds are a single price")
+
+    def _check_sanrenpuku(self) -> None:
+        parts = self.combination.split("-")
+        if len(parts) != 3 or any(_HORSE_NUMBER.fullmatch(part) is None for part in parts):
+            raise ValueError("sanrenpuku combination must be three horse numbers, such as 1-2-5")
+        numbers = [int(part) for part in parts]
+        if numbers != sorted(numbers) or len(set(numbers)) != 3:
+            raise ValueError("sanrenpuku combination must be ascending, such as 1-2-5")
+        if self.odds is None:
+            raise ValueError("sanrenpuku requires odds")
+        if self.odds_min is not None or self.odds_max is not None:
+            raise ValueError("sanrenpuku odds are a single price")
 
 
 class RaceOdds(BaseModel):
