@@ -194,7 +194,7 @@ def cmd_track(args):
 
 
 def cmd_odds(args):
-    """Get win, wide, and umaren odds quotes."""
+    """Get win, wide, umaren, and sanrenpuku odds quotes."""
     with RaceService() as service:
         snapshot = service.get_race_odds(
             args.race_id,
@@ -227,6 +227,8 @@ def _odds_title(bet_types: Sequence[str]) -> str:
         return "ワイドオッズ"
     if bet_types == ["umaren"]:
         return "馬連オッズ"
+    if bet_types == ["sanrenpuku"]:
+        return "三連複オッズ"
     if bet_types == ["win"]:
         return "単勝オッズ"
     return "オッズ"
@@ -238,6 +240,8 @@ def _format_odds_quote(quote: OddsQuote) -> str:
         return f"ワイド {quote.combination} {quote.odds_min}-{quote.odds_max} {tag}"
     if quote.bet_type == "umaren":
         return f"馬連 {quote.combination} {quote.odds} {tag}"
+    if quote.bet_type == "sanrenpuku":
+        return f"三連複 {quote.combination} {quote.odds} {tag}"
     return f"{quote.combination}番 {quote.odds} {tag}"
 
 
@@ -298,13 +302,13 @@ def main():
     track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     track_parser.set_defaults(func=cmd_track)
 
-    odds_parser = subparsers.add_parser("odds", help="単勝・ワイド・馬連のオッズを取得")
+    odds_parser = subparsers.add_parser("odds", help="単勝・ワイド・馬連・三連複のオッズを取得")
     odds_parser.add_argument("race_id", help="レースID")
     odds_parser.add_argument(
         "--bet-types",
         default="win",
         help=(
-            "馬券種（カンマ区切り。win、wide、umaren）。"
+            "馬券種（カンマ区切り。win、wide、umaren、sanrenpuku）。"
             "prefer=live で取れないとき yoso へは切り替えない"
         ),
     )

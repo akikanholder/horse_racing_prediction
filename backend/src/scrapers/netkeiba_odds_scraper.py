@@ -1,4 +1,4 @@
-"""Netkeiba win, wide, and umaren odds client.
+"""Netkeiba win, wide, umaren, and sanrenpuku odds client.
 
 単勝は次の JSON を使う。
 
@@ -28,6 +28,15 @@
 値は単勝と同じ ``[オッズ, 変動, 人気]``。組み合わせは ``3-7``（小さい順）。
 変動は範囲ではないので ``odds_min`` / ``odds_max`` には入れない。
 価格が無い行は捨てる。
+三連複は同じ API の type=7。Referer はオッズページの type=b7
+（ナビ ``odds_navi_b7`` が 3連複）。
+
+    GET https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={id}&type=7&action=init&compress=0
+
+三連複は ``data.odds["7"]``。キーは ``010205`` のような馬番2桁×3の連結で、
+値は単勝・馬連と同じ ``[オッズ, 変動, 人気]``。組み合わせは ``1-2-5``（小さい順）。
+変動は範囲ではないので ``odds_min`` / ``odds_max`` には入れない。
+価格が無い行は捨てる。
 ``status == "yoso"`` のときだけ kind=yoso / source=netkeiba_yoso。
 ``middle`` / ``result`` で数値があるときは kind=live。
 """
@@ -53,6 +62,7 @@ logger = logging.getLogger(__name__)
 WIN_ODDS_KEY = "1"
 WIDE_ODDS_KEY = "5"
 UMAREN_ODDS_KEY = "4"
+SANRENPUKU_ODDS_KEY = "7"
 _LIVE_STATUSES = frozenset({"result", "middle"})
 _PLACEHOLDERS = frozenset({"", "-", "--", "---", "---.-", "**", "*", "----"})
 _MARKET_UPDATED_FORMATS = (
@@ -65,11 +75,12 @@ _ODDS_REQUESTS: dict[BetType, tuple[str, str, str]] = {
     "win": ("1", "b1", WIN_ODDS_KEY),
     "wide": ("5", "b5", WIDE_ODDS_KEY),
     "umaren": ("4", "b4", UMAREN_ODDS_KEY),
+    "sanrenpuku": ("7", "b7", SANRENPUKU_ODDS_KEY),
 }
 
 
 class NetkeibaOddsScraper(BaseScraper):
-    """Fetch JRA win, wide, and umaren odds published by netkeiba."""
+    """Fetch JRA win, wide, umaren, and sanrenpuku odds published by netkeiba."""
 
     BASE_URL = "https://race.netkeiba.com"
     ENCODING = "utf-8"
@@ -127,6 +138,18 @@ class NetkeibaOddsScraper(BaseScraper):
         """
         return self._get_odds(race_id, "umaren", fetched_at=fetched_at)
 
+    def get_sanrenpuku_odds(self, race_id: str, *, fetched_at: datetime | None = None) -> RaceOdds:
+        """Fetch sanrenpuku (trio) odds for one race.
+
+        Args:
+            race_id: netkeiba race id
+            fetched_at: Timestamp stored on every quote. Defaults to now.
+
+        Returns:
+            Live quotes, yoso quotes, or an empty unavailable snapshot
+        """
+        return self._get_odds(race_id, "sanrenpuku", fetched_at=fetched_at)
+
     def _get_odds(
         self,
         race_id: str,
@@ -165,6 +188,8 @@ class NetkeibaOddsScraper(BaseScraper):
             return parse_netkeiba_wide_odds(payload, race_id, fetched_at=fetched)
         if bet_type == "umaren":
             return parse_netkeiba_umaren_odds(payload, race_id, fetched_at=fetched)
+        if bet_type == "sanrenpuku":
+            return parse_netkeiba_sanrenpuku_odds(payload, race_id, fetched_at=fetched)
         return parse_netkeiba_win_odds(payload, race_id, fetched_at=fetched)
 
 
@@ -293,6 +318,51 @@ def parse_netkeiba_umaren_odds(
     return RaceOdds(
         race_id=race_id,
         bet_types=["umaren"],
+        prefer="live",
+        status=snapshot_status,
+        reason=None,
+        quotes=quotes,
+        fetched_at=fetched_at,
+    )
+
+
+def parse_netkeiba_sanrenpuku_odds(
+    payload: object,
+    race_id: str,
+    *,
+    fetched_at: datetime,
+) -> RaceOdds:
+    """Turn an api_get_jra_odds type=7 response into sanrenpuku quotes.
+
+    Each trio is stored as ``low-mid-high``, such as ``1-2-5``. The published
+    price is the first field of ``[odds, change, popularity]``, the same shape
+    as umaren. The change field is not a range, so ``odds_min`` and
+    ``odds_max`` stay empty. A missing or placeholder price drops that trio.
+    """
+    opened = _read_market(
+        payload,
+        race_id,
+        fetched_at,
+        odds_key=SANRENPUKU_ODDS_KEY,
+        bet_type="sanrenpuku",
+    )
+    if isinstance(opened, RaceOdds):
+        return opened
+    trio_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    quotes = _quotes_from_sanrenpuku_map(
+        trio_map,
+        race_id=race_id,
+        source=source,
+        kind=kind,
+        fetched_at=fetched_at,
+        market_updated_at=market_updated_at,
+    )
+    if not quotes:
+        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "sanrenpuku")
+
+    return RaceOdds(
+        race_id=race_id,
+        bet_types=["sanrenpuku"],
         prefer="live",
         status=snapshot_status,
         reason=None,
@@ -468,6 +538,46 @@ def _quotes_from_umaren_map(
     return quotes
 
 
+def _quotes_from_sanrenpuku_map(
+    trio_map: dict[Any, Any],
+    *,
+    race_id: str,
+    source: OddsSource,
+    kind: OddsKind,
+    fetched_at: datetime,
+    market_updated_at: datetime | None,
+) -> list[OddsQuote]:
+    """Build one quote per unordered trio. Price is a single odds value."""
+    candidates: list[tuple[tuple[int, int, int, int, str], str, float]] = []
+    for key, raw in trio_map.items():
+        trio = _trio(key)
+        odds_value = _positive_odds(raw)
+        if trio is None or odds_value is None or not isinstance(key, str):
+            continue
+        combination = f"{trio[0]}-{trio[1]}-{trio[2]}"
+        candidates.append((_trio_sort(key, trio), combination, odds_value))
+
+    quotes: list[OddsQuote] = []
+    seen: set[str] = set()
+    for _sort, combination, odds_value in sorted(candidates):
+        if combination in seen:
+            continue
+        seen.add(combination)
+        quotes.append(
+            OddsQuote(
+                race_id=race_id,
+                bet_type="sanrenpuku",
+                combination=combination,
+                odds=odds_value,
+                source=source,
+                kind=kind,
+                fetched_at=fetched_at,
+                market_updated_at=market_updated_at,
+            )
+        )
+    return quotes
+
+
 def _unavailable(
     race_id: str,
     fetched_at: datetime,
@@ -551,6 +661,35 @@ def _wide_pair(key: object) -> tuple[int, int] | None:
     if not (1 <= left <= 18 and 1 <= right <= 18):
         return None
     return left, right
+
+
+def _trio(key: object) -> tuple[int, int, int] | None:
+    """Read an unordered horse trio from ``010205`` or ``1-2-5``."""
+    if not isinstance(key, str):
+        return None
+    text = key.strip()
+    if len(text) == 6 and text.isdigit():
+        numbers = [int(text[0:2]), int(text[2:4]), int(text[4:6])]
+    else:
+        parts = text.split("-")
+        if len(parts) != 3 or any(not part.strip().isdigit() for part in parts):
+            return None
+        numbers = [int(part) for part in parts]
+    if len(set(numbers)) != 3:
+        return None
+    if any(not 1 <= number <= 18 for number in numbers):
+        return None
+    low, mid, high = sorted(numbers)
+    return low, mid, high
+
+
+def _trio_sort(key: str, trio: tuple[int, int, int]) -> tuple[int, int, int, int, str]:
+    """Sort by horses. An already ascending key wins over a permutation."""
+    text = key.strip()
+    canonical_digits = f"{trio[0]:02d}{trio[1]:02d}{trio[2]:02d}"
+    canonical_dashed = f"{trio[0]}-{trio[1]}-{trio[2]}"
+    ordered = 0 if text in {canonical_digits, canonical_dashed} else 1
+    return (trio[0], trio[1], trio[2], ordered, text)
 
 
 def _pair_sort(key: str, pair: tuple[int, int]) -> tuple[int, int, int, str]:
