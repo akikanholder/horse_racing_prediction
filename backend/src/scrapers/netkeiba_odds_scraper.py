@@ -39,6 +39,10 @@
 価格が無い行は捨てる。
 ``status == "yoso"`` のときだけ kind=yoso / source=netkeiba_yoso。
 ``middle`` / ``result`` で数値があるときは kind=live。
+文字コードは ``encoding=utf-8``。馬成績ページの EUC-JP では読まない。
+``race_phase`` は API の status から決める。``yoso`` と ``middle`` は ``pre``
+（レース前）、``result`` は ``post``（レース後の確定）。
+HTTP 400 や空の確定オッズは quotes を空にし、reason を返す。価格は作らない。
 """
 
 import json
@@ -46,13 +50,17 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import requests
+
 from backend.models.odds import (
+    ODDS_ENCODING,
     BetType,
     OddsKind,
     OddsQuote,
     OddsSource,
     OddsStatus,
     RaceOdds,
+    RacePhase,
 )
 from backend.scrapers.base_scraper import BaseScraper
 from backend.utils.http_client import HTTPClient
@@ -83,7 +91,7 @@ class NetkeibaOddsScraper(BaseScraper):
     """Fetch JRA win, wide, umaren, and sanrenpuku odds published by netkeiba."""
 
     BASE_URL = "https://race.netkeiba.com"
-    ENCODING = "utf-8"
+    ENCODING = ODDS_ENCODING
     ODDS_PATH = "/api/api_get_jra_odds.html"
     BROWSER_HEADERS = {
         "User-Agent": (
@@ -180,6 +188,13 @@ class NetkeibaOddsScraper(BaseScraper):
                 encoding=self.ENCODING,
             )
             payload = json.loads(body)
+        except requests.HTTPError as e:
+            # 400 の本文に数値が混ざっていても価格にはしない。
+            logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
+            return _unavailable_from_http_error(e, race_id, fetched, bet_type)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
+            return _unavailable(race_id, fetched, "malformed odds payload", bet_type)
         except Exception as e:
             logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
             return _unavailable(race_id, fetched, "fetch failed", bet_type)
@@ -214,7 +229,7 @@ def parse_netkeiba_win_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    win_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    win_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
     quotes = _quotes_from_win_map(
         win_map,
         race_id=race_id,
@@ -224,7 +239,9 @@ def parse_netkeiba_win_odds(
         market_updated_at=market_updated_at,
     )
     if not quotes:
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "win")
+        return _unavailable(
+            race_id, fetched_at, reason or "odds unavailable", "win", race_phase=race_phase
+        )
 
     return RaceOdds(
         race_id=race_id,
@@ -232,6 +249,8 @@ def parse_netkeiba_win_odds(
         prefer="live",
         status=snapshot_status,
         reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=quotes,
         fetched_at=fetched_at,
     )
@@ -258,7 +277,7 @@ def parse_netkeiba_wide_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    wide_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    wide_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
     quotes = _quotes_from_wide_map(
         wide_map,
         race_id=race_id,
@@ -268,7 +287,9 @@ def parse_netkeiba_wide_odds(
         market_updated_at=market_updated_at,
     )
     if not quotes:
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "wide")
+        return _unavailable(
+            race_id, fetched_at, reason or "odds unavailable", "wide", race_phase=race_phase
+        )
 
     return RaceOdds(
         race_id=race_id,
@@ -276,6 +297,8 @@ def parse_netkeiba_wide_odds(
         prefer="live",
         status=snapshot_status,
         reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=quotes,
         fetched_at=fetched_at,
     )
@@ -303,7 +326,7 @@ def parse_netkeiba_umaren_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    umaren_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    umaren_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
     quotes = _quotes_from_umaren_map(
         umaren_map,
         race_id=race_id,
@@ -313,7 +336,9 @@ def parse_netkeiba_umaren_odds(
         market_updated_at=market_updated_at,
     )
     if not quotes:
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "umaren")
+        return _unavailable(
+            race_id, fetched_at, reason or "odds unavailable", "umaren", race_phase=race_phase
+        )
 
     return RaceOdds(
         race_id=race_id,
@@ -321,6 +346,8 @@ def parse_netkeiba_umaren_odds(
         prefer="live",
         status=snapshot_status,
         reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=quotes,
         fetched_at=fetched_at,
     )
@@ -348,7 +375,7 @@ def parse_netkeiba_sanrenpuku_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    trio_map, kind, source, snapshot_status, market_updated_at, reason = opened
+    trio_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
     quotes = _quotes_from_sanrenpuku_map(
         trio_map,
         race_id=race_id,
@@ -358,7 +385,13 @@ def parse_netkeiba_sanrenpuku_odds(
         market_updated_at=market_updated_at,
     )
     if not quotes:
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", "sanrenpuku")
+        return _unavailable(
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            "sanrenpuku",
+            race_phase=race_phase,
+        )
 
     return RaceOdds(
         race_id=race_id,
@@ -366,6 +399,8 @@ def parse_netkeiba_sanrenpuku_odds(
         prefer="live",
         status=snapshot_status,
         reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=quotes,
         fetched_at=fetched_at,
     )
@@ -379,7 +414,16 @@ def _read_market(
     odds_key: str,
     bet_type: BetType,
 ) -> (
-    tuple[dict[Any, Any], OddsKind, OddsSource, OddsStatus, datetime | None, str | None] | RaceOdds
+    tuple[
+        dict[Any, Any],
+        OddsKind,
+        OddsSource,
+        OddsStatus,
+        datetime | None,
+        str | None,
+        RacePhase | None,
+    ]
+    | RaceOdds
 ):
     """Open the odds map, or return an empty snapshot. Does not invent prices."""
     if not isinstance(payload, dict):
@@ -388,14 +432,27 @@ def _read_market(
     reason = _clean_reason(payload.get("reason"))
     raw_status = payload.get("status")
     status_name = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+    race_phase = _phase_from_status(status_name)
     data = payload.get("data")
     if not isinstance(data, dict):
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", bet_type)
+        return _unavailable(
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            bet_type,
+            race_phase=race_phase,
+        )
 
     odds_root = data.get("odds")
     odds_map = odds_root.get(odds_key) if isinstance(odds_root, dict) else None
     if not isinstance(odds_map, dict) or not odds_map:
-        return _unavailable(race_id, fetched_at, reason or "odds unavailable", bet_type)
+        return _unavailable(
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            bet_type,
+            race_phase=race_phase,
+        )
 
     kind, source, snapshot_status = _classify(status_name)
     if kind is None or source is None or snapshot_status is None:
@@ -404,10 +461,11 @@ def _read_market(
             fetched_at,
             reason or f"unsupported odds status: {status_name}",
             bet_type,
+            race_phase=race_phase,
         )
 
     market_updated_at = _parse_market_updated_at(data.get("official_datetime"))
-    return odds_map, kind, source, snapshot_status, market_updated_at, reason
+    return odds_map, kind, source, snapshot_status, market_updated_at, reason, race_phase
 
 
 def _classify(
@@ -419,6 +477,19 @@ def _classify(
     if status_name in _LIVE_STATUSES:
         return "live", "netkeiba_live", "live"
     return None, None, None
+
+
+def _phase_from_status(status_name: str) -> RacePhase | None:
+    """Map netkeiba status onto race-before (pre) or race-after (post).
+
+    ``yoso`` and ``middle`` are before the race is settled.
+    ``result`` is the final market after the race.
+    """
+    if status_name in {"yoso", "middle"}:
+        return "pre"
+    if status_name == "result":
+        return "post"
+    return None
 
 
 def _quotes_from_win_map(
@@ -583,6 +654,8 @@ def _unavailable(
     fetched_at: datetime,
     reason: str | None,
     bet_type: BetType = "win",
+    *,
+    race_phase: RacePhase | None = None,
 ) -> RaceOdds:
     """Empty snapshot. No placeholder odds."""
     return RaceOdds(
@@ -591,9 +664,46 @@ def _unavailable(
         prefer="live",
         status="unavailable",
         reason=reason,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=[],
         fetched_at=fetched_at,
     )
+
+
+def _unavailable_from_http_error(
+    exc: requests.HTTPError,
+    race_id: str,
+    fetched_at: datetime,
+    bet_type: BetType,
+) -> RaceOdds:
+    """HTTP failures stay empty. Numbers in a 400 body are not quotes."""
+    response = exc.response
+    code = response.status_code if response is not None else None
+    reason = f"http {code}" if isinstance(code, int) else "fetch failed"
+    race_phase: RacePhase | None = None
+    if response is not None:
+        payload = _json_object_from_response(response)
+        if payload is not None:
+            api_reason = _clean_reason(payload.get("reason"))
+            if api_reason and isinstance(code, int):
+                reason = f"http {code}: {api_reason}"
+            raw_status = payload.get("status")
+            status_name = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+            race_phase = _phase_from_status(status_name)
+    return _unavailable(race_id, fetched_at, reason, bet_type, race_phase=race_phase)
+
+
+def _json_object_from_response(response: requests.Response) -> dict[Any, Any] | None:
+    """Read an error body as UTF-8 JSON. Odds inside it are ignored by the caller."""
+    response.encoding = ODDS_ENCODING
+    try:
+        payload = json.loads(response.text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
 
 
 def _clean_reason(value: object) -> str | None:

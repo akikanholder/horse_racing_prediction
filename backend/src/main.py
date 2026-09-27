@@ -188,6 +188,7 @@ async def get_race_odds(
             description=(
                 "カンマ区切り。win（単勝）、wide（ワイド）、umaren（馬連）、"
                 "sanrenpuku（三連複）。"
+                "応答の encoding は utf-8、race_phase は pre（レース前）か post（レース後）。"
                 "prefer=live が unavailable でも yoso へは自動で切り替えない"
             )
         ),
@@ -209,7 +210,12 @@ async def get_race_odds(
     発売前のAI予想オッズが API に載っているときだけ source=netkeiba_yoso / kind=yoso。
     prefer は kind を書き換えない。prefer=live で市場オッズが無いとき、
     予想オッズへは自動で切り替えない。予想が必要なら prefer=yoso を明示する。
-    数値が無いときは quotes が空で status=unavailable。価格は作らない。
+    数値が無いとき、HTTP 400、壊れた JSON のときは quotes が空で status=unavailable。
+    失敗理由は reason（着順の warning に相当）。価格は作らない。
+    encoding は常に utf-8。組み合わせは ASCII の馬番で、馬成績ページの EUC-JP では読まない。
+    race_phase は pre（API status の yoso と middle。レース前）か
+    post（API status の result。レース後の確定）。判別できない失敗は null。
+    レース後のオッズが HTTP 400 や空でも quotes は空のまま。
     ワイドの組み合わせは ``3-7``（馬番の小さい順）で、価格は odds_min と odds_max。
     馬連の組み合わせも ``3-7``（馬番の小さい順）で、価格は単一の odds。
     馬連の変動値は範囲ではないので odds_min / odds_max は空のまま。

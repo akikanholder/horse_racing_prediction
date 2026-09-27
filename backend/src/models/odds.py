@@ -15,6 +15,11 @@ OddsKind = Literal["yoso", "live"]
 BetType = Literal["win", "wide", "umaren", "sanrenpuku"]
 OddsStatus = Literal["live", "yoso", "unavailable"]
 OddsPrefer = Literal["live", "yoso"]
+# オッズAPIの JSON を読む文字コード。馬成績ページの EUC-JP ではない。
+OddsEncoding = Literal["utf-8"]
+# pre: API status の yoso / middle。post: API status の result（レース後の確定）。
+RacePhase = Literal["pre", "post"]
+ODDS_ENCODING: OddsEncoding = "utf-8"
 
 _HORSE_NUMBER = re.compile(r"^(?:[1-9]|1[0-8])$")
 
@@ -119,6 +124,8 @@ class RaceOdds(BaseModel):
     prefer は呼び出し側の希望であり、kind の書き換えには使わない。
     prefer=live で市場オッズが取れないとき、yoso へは自動で切り替えない。
     予想オッズが必要なら呼び出し側が prefer=yoso を指定する。
+    encoding は utf-8。race_phase は pre（レース前）か post（レース後）。
+    失敗理由は reason。着順の warning とは別名にしない。
     """
 
     race_id: str = Field(..., description="レースID")
@@ -128,6 +135,28 @@ class RaceOdds(BaseModel):
         description="優先する種別。live が unavailable でも yoso へは切り替えない",
     )
     status: OddsStatus = Field(..., description="live / yoso / unavailable")
-    reason: str | None = Field(None, description="取得できない理由")
+    reason: str | None = Field(
+        None,
+        description=(
+            "取得できない理由。着順の warning に相当し、別名は置かない。"
+            "空のときは quotes も空で、価格は作らない"
+        ),
+    )
+    encoding: OddsEncoding = Field(
+        ODDS_ENCODING,
+        description=(
+            "組み合わせとオッズ本文の文字コード。常に utf-8。"
+            "combination は ASCII の馬番（1、3-7、1-2-5）。"
+            "馬成績ページの EUC-JP では読まない"
+        ),
+    )
+    race_phase: RacePhase | None = Field(
+        None,
+        description=(
+            "pre=レース前（API の yoso と middle）。"
+            "post=レース後の確定（API の result）。"
+            "判別できない失敗は null。HTTP 400 や空の確定オッズから価格は作らない"
+        ),
+    )
     quotes: list[OddsQuote] = Field(default_factory=list, description="オッズ引用")
     fetched_at: datetime = Field(..., description="取得日時")

@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
-from backend.models.odds import BetType, OddsPrefer, OddsStatus, RaceOdds
+from backend.models.odds import ODDS_ENCODING, BetType, OddsPrefer, OddsStatus, RaceOdds, RacePhase
 from backend.models.race import (
     Race,
     RaceCard,
@@ -240,6 +240,8 @@ class RaceService:
 
         prefer=live does not fall back to yoso when the market is unavailable.
         Callers that want predicted odds pass prefer=yoso themselves.
+        encoding is utf-8. race_phase is pre or post when the API status says so.
+        A miss returns quotes=[] and reason. Prices are not invented.
 
         Args:
             race_id: Race ID
@@ -260,6 +262,8 @@ class RaceService:
                 prefer=preference,
                 status="unavailable",
                 reason="win odds were not requested",
+                encoding=ODDS_ENCODING,
+                race_phase=None,
                 quotes=[],
                 fetched_at=fetched_at,
             )
@@ -298,6 +302,8 @@ class RaceService:
                 prefer=preference,
                 status="unavailable",
                 reason="fetch failed",
+                encoding=ODDS_ENCODING,
+                race_phase=None,
                 quotes=[],
                 fetched_at=fetched_at,
             )
@@ -560,6 +566,7 @@ def _merge_odds_snapshots(
 ) -> RaceOdds:
     """Combine bet types. An empty type adds no prices and does not relabel the rest."""
     quotes = [quote for snapshot in snapshots for quote in snapshot.quotes]
+    race_phase = _shared_race_phase(snapshots)
     if not quotes:
         return RaceOdds(
             race_id=race_id,
@@ -567,6 +574,8 @@ def _merge_odds_snapshots(
             prefer=preference,
             status="unavailable",
             reason=_combined_reason(bet_types, snapshots),
+            encoding=ODDS_ENCODING,
+            race_phase=race_phase,
             quotes=[],
             fetched_at=fetched_at,
         )
@@ -577,9 +586,19 @@ def _merge_odds_snapshots(
         prefer=preference,
         status=status,
         reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
         quotes=quotes,
         fetched_at=fetched_at,
     )
+
+
+def _shared_race_phase(snapshots: list[RaceOdds]) -> RacePhase | None:
+    """Use the phase when every known snapshot agrees. Do not pick a side."""
+    phases = {snapshot.race_phase for snapshot in snapshots if snapshot.race_phase is not None}
+    if len(phases) == 1:
+        return next(iter(phases))
+    return None
 
 
 def _combined_reason(bet_types: list[BetType], snapshots: list[RaceOdds]) -> str:

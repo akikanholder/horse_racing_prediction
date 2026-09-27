@@ -42,6 +42,8 @@ class TestParseWinOdds:
         snapshot = _parse_live()
 
         assert snapshot.status == "live"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "post"
         assert snapshot.quotes
         assert len(snapshot.quotes) == 11
         first = snapshot.quotes[0]
@@ -73,6 +75,8 @@ class TestParseWinOdds:
         )
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "pre"
         assert snapshot.reason == "result odds empty"
 
     def test_middle_with_numbers_is_live_despite_empty_reason(self):
@@ -84,6 +88,8 @@ class TestParseWinOdds:
         )
         assert snapshot.status == "live"
         assert snapshot.reason is None
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "pre"
         assert len(snapshot.quotes) == 16
         first = snapshot.quotes[0]
         assert first.combination == "1"
@@ -101,6 +107,8 @@ class TestParseWinOdds:
         snapshot = parse_netkeiba_win_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
 
         assert snapshot.status == "yoso"
+        assert snapshot.race_phase == "pre"
+        assert snapshot.encoding == "utf-8"
         assert snapshot.quotes
         assert {quote.kind for quote in snapshot.quotes} == {"yoso"}
         assert {quote.source for quote in snapshot.quotes} == {"netkeiba_yoso"}
@@ -122,6 +130,8 @@ class TestParseWinOdds:
         snapshot = parse_netkeiba_win_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase is None
 
     def test_missing_update_time_leaves_market_updated_at_empty(self):
         payload = _live_payload()
@@ -185,6 +195,8 @@ class TestNetkeibaOddsScraper:
 
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "pre"
         assert snapshot.reason == "result odds empty"
 
 
@@ -210,7 +222,9 @@ class TestOddsSessionHeaders:
         snapshot = scraper.get_win_odds(RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
-        assert snapshot.reason == "fetch failed"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase is None
+        assert snapshot.reason == "malformed odds payload"
 
 
 class _FakeOddsScraper:
@@ -257,6 +271,8 @@ class TestRaceServiceOdds:
 
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase is None
         assert snapshot.reason == "win odds were not requested"
         assert odds.calls == []
 
@@ -291,6 +307,8 @@ class TestOddsApiAndCli:
         body = response.json()
         quote = body["quotes"][0]
         assert body["status"] == "live"
+        assert body["encoding"] == "utf-8"
+        assert body["race_phase"] == "post"
         assert quote["bet_type"] == "win"
         assert quote["combination"] == "1"
         assert quote["odds"] == 1.4
@@ -328,6 +346,8 @@ class TestOddsApiAndCli:
         cli_main()
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "live"
+        assert payload["encoding"] == "utf-8"
+        assert payload["race_phase"] == "post"
         assert payload["quotes"][0]["source"] == "netkeiba_live"
         assert payload["quotes"][0]["kind"] == "live"
         assert payload["quotes"][0]["fetched_at"].startswith("2026-09-26T16:00:00")
@@ -352,6 +372,8 @@ def test_fetch_live_win_odds_from_netkeiba():
         snapshot = scraper.get_win_odds("202609040711")
 
     assert snapshot.status == "live"
+    assert snapshot.encoding == "utf-8"
+    assert snapshot.race_phase == "post"
     by_horse = {quote.combination: quote for quote in snapshot.quotes}
     quote = by_horse["1"]
     assert quote.odds == 1.4
