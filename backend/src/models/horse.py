@@ -1,19 +1,26 @@
-"""Horse data models."""
+"""Horse data models.
 
-from datetime import date
+``Horse.performances`` は netkeiba の馬成績ページにある過去走。
+今走の確定結果ではない。近走の能力評価にだけ使う。
+"""
+
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
 
 class HorsePerformance(BaseModel):
-    """A single race performance record for a horse."""
+    """A single past-race performance from the horse result page.
+
+    セルが無い、``**``、``取``、``計不`` のときは数値を作らず null。
+    """
 
     race_date: date = Field(..., description="レース日")
     race_id: str | None = Field(None, description="レースID")
     race_name: str = Field(..., description="レース名")
     venue: str = Field(..., description="開催場所")
-    distance: int = Field(..., description="距離")
-    track_type: str = Field(..., description="コース種別")
+    distance: int | None = Field(None, description="距離")
+    track_type: str | None = Field(None, description="コース種別 (芝/ダート/障害)")
     track_condition: str | None = Field(None, description="馬場状態")
     weather: str | None = Field(None, description="天候")
     entry_count: int | None = Field(None, description="出走頭数")
@@ -29,11 +36,15 @@ class HorsePerformance(BaseModel):
     margin: str | None = Field(None, description="着差")
     passing_order: str | None = Field(None, description="通過順位")
     last_3f: float | None = Field(None, description="上がり3F")
-    prize_money: int | None = Field(None, description="賞金 (万円)")
+    prize_money: float | None = Field(None, description="賞金 (万円)")
 
 
 class Horse(BaseModel):
-    """Horse information."""
+    """競走馬情報。
+
+    performances は ``/horse/result/{horse_id}/`` の過去走であり、
+    今走のレース結果ではない。近走の能力評価にだけ使う。
+    """
 
     horse_id: str = Field(..., description="馬ID")
     horse_name: str = Field(..., description="馬名")
@@ -58,7 +69,17 @@ class Horse(BaseModel):
     total_wins: int | None = Field(None, description="勝利数")
     total_earnings: int | None = Field(None, description="総獲得賞金 (万円)")
     performances: list[HorsePerformance] = Field(
-        default_factory=list, description="過去成績"
+        default_factory=list,
+        description="過去成績。馬成績ページの近走履歴であり、今走の確定結果ではない",
+    )
+    fetched_at: datetime = Field(..., description="取得日時")
+    warning: str | None = Field(
+        None,
+        description=(
+            "成績を取れなかった理由。"
+            "horse result fetch failed / horse result table not found / "
+            "horse result table malformed / no performances on horse result page"
+        ),
     )
 
 
@@ -74,5 +95,6 @@ class HorseBasicInfo(BaseModel):
     trainer_name: str | None = Field(None, description="調教師名")
     training_center: str | None = Field(None, description="所属")
     recent_performances: list[HorsePerformance] = Field(
-        default_factory=list, description="近走成績"
+        default_factory=list,
+        description="近走成績。馬成績ページの過去走であり、当該レースの確定結果ではない",
     )

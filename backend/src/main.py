@@ -238,6 +238,8 @@ async def get_race_odds(
 async def get_race_horses(race_id: str):
     """レースに出走する競走馬の情報を取得する。
 
+    ``recent_performances`` は各馬の成績ページにある過去走で、このレースの確定結果ではない。
+
     Args:
         race_id: レースID
 
@@ -295,13 +297,17 @@ async def export_races_csv(
 
 @app.get("/api/horses/{horse_id}", response_model=Horse, tags=["Horses"])
 async def get_horse(horse_id: str):
-    """競走馬の詳細情報を取得する。
+    """競走馬の近走履歴を取得する。
+
+    ``performances`` は ``/horse/result/{horse_id}/`` の過去走であり、
+    今走の確定結果ではない。着順の精算には使わず、近走の能力評価にだけ使う。
+    成績を取れないときは ``performances`` は空で、``warning`` に理由が入る。
 
     Args:
         horse_id: 馬ID
 
     Returns:
-        Horse: 競走馬の詳細情報（血統、成績など）
+        Horse: 馬名、通算成績、過去走。今走のレース結果は含まない
     """
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")

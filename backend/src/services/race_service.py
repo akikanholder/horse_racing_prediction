@@ -288,7 +288,10 @@ class RaceService:
         return snapshot.model_copy(update={"prefer": preference, "bet_types": [bet_type]})
 
     def get_horse_info(self, horse_id: str) -> Horse | None:
-        """Get detailed horse information.
+        """Get horse identity and near-run history.
+
+        ``performances`` are past runs from the horse result page. They are not
+        the result of a race being predicted.
 
         Args:
             horse_id: Horse ID
@@ -303,7 +306,9 @@ class RaceService:
             return None
 
     def get_horses_for_race(self, race_id: str) -> list[HorseBasicInfo]:
-        """Get all horses entered in a race with basic info.
+        """Get entrants with near-run history from each horse result page.
+
+        ``recent_performances`` is that horse's past runs, not this race's result.
 
         Args:
             race_id: Race ID

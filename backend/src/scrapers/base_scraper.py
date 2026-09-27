@@ -24,17 +24,28 @@ class BaseScraper(ABC):
         """
         self.http_client = http_client or HTTPClient()
 
-    def fetch_page(self, url: str, params: dict | None = None) -> BeautifulSoup:
+    def fetch_page(
+        self,
+        url: str,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ) -> BeautifulSoup:
         """Fetch page and return parsed BeautifulSoup object.
 
         Args:
             url: URL to fetch
             params: Optional query parameters
+            headers: Optional per-request headers merged onto the Session
 
         Returns:
             Parsed BeautifulSoup object
         """
-        html = self.http_client.get(url, params=params, encoding=self.ENCODING)
+        html = self.http_client.get(
+            url,
+            params=params,
+            headers=headers,
+            encoding=self.ENCODING,
+        )
         return BeautifulSoup(html, "lxml")
 
     def fetch_post(
