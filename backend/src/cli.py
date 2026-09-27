@@ -10,6 +10,7 @@ from datetime import date
 
 from backend.models.horse import HorsePerformance
 from backend.models.odds import OddsQuote
+from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -268,6 +269,77 @@ def _format_odds_quote(quote: OddsQuote) -> str:
     return f"{quote.combination}番 {quote.odds} {tag}"
 
 
+def cmd_result(args):
+    """Get the settled result of one race.
+
+    This is post-race settlement for mark × finish logs.
+    ``cli horse`` is that horse's past runs and is not this command.
+    """
+    with RaceService() as service:
+        settled = service.get_settled_race_result(args.race_id)
+
+    if args.json:
+        print_json(settled)
+        return
+
+    _print_settled_result(settled)
+
+
+def _print_settled_result(settled: SettledRaceResult) -> None:
+    """Text view. Says this is settlement, not near-run history."""
+    name = settled.race_name or settled.race_id
+    print(f"\n=== 確定結果（このレースの精算。馬の近走ではない）: {name} ===")
+    print(f"レースID: {settled.race_id}")
+    print(f"開催日: {settled.race_date or '不明'}")
+    course = _settled_course(settled)
+    print(f"条件: {settled.venue or '不明'} {course}".rstrip())
+    print(f"取得時刻: {settled.fetched_at}")
+    if settled.warning:
+        print(f"警告: {settled.warning}")
+    print("\n--- 着順 ---")
+    if not settled.results:
+        print("なし")
+    for finisher in settled.results:
+        print(_format_finisher(finisher))
+    print("\n--- 払戻 ---")
+    if not settled.payouts:
+        print("なし")
+    for payout in settled.payouts:
+        print(_format_payout(payout))
+    if settled.payout_note:
+        print(f"注記: {settled.payout_note}")
+
+
+def _settled_course(settled: SettledRaceResult) -> str:
+    if settled.track_type and settled.distance is not None:
+        course = f"{settled.track_type}{settled.distance}m"
+    elif settled.distance is not None:
+        course = f"{settled.distance}m"
+    else:
+        course = settled.track_type or ""
+    if settled.track_condition:
+        course = f"{course} 馬場:{settled.track_condition}".strip()
+    if settled.weather:
+        course = f"{course} 天候:{settled.weather}".strip()
+    return course
+
+
+def _format_finisher(finisher: SettledFinisher) -> str:
+    rank = f"{finisher.rank}着" if finisher.rank is not None else "---"
+    number = f"{finisher.horse_number}番" if finisher.horse_number is not None else "?番"
+    name = finisher.horse_name or ""
+    jockey = finisher.jockey_name or ""
+    time = finisher.finish_time or ""
+    margin = finisher.margin or ""
+    odds = "" if finisher.odds is None else str(finisher.odds)
+    return f"{rank} {number} {name} [{jockey}] {time} {margin} {odds}".rstrip()
+
+
+def _format_payout(payout: RacePayout) -> str:
+    popularity = "" if payout.popularity is None else f" {payout.popularity}人気"
+    return f"{payout.bet_type} {payout.combination} {payout.payout}円{popularity}"
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with RaceService() as service:
@@ -302,7 +374,14 @@ def main():
     card_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     card_parser.set_defaults(func=cmd_race_card)
 
-    horse_parser = subparsers.add_parser("horse", help="競走馬情報を取得")
+    horse_parser = subparsers.add_parser(
+        "horse",
+        help="競走馬の近走成績を取得（確定したレース結果ではない）",
+        description=(
+            "競走馬の近走成績。過去走であり、確定したレース結果ではない。"
+            "着順と払戻の精算は result を使う。"
+        ),
+    )
     horse_parser.add_argument("horse_id", help="馬ID")
     horse_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     horse_parser.set_defaults(func=cmd_horse)
@@ -324,6 +403,18 @@ def main():
     )
     track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     track_parser.set_defaults(func=cmd_track)
+
+    result_parser = subparsers.add_parser(
+        "result",
+        help="確定した1レースの着順と払戻を取得（馬の近走成績ではない）",
+        description=(
+            "確定した1レースの着順と払戻。マーク×着順の事後ログ用。"
+            "cli horse の近走成績ではなく、レース前の期待値の入力に混ぜない。"
+        ),
+    )
+    result_parser.add_argument("race_id", help="レースID")
+    result_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    result_parser.set_defaults(func=cmd_result)
 
     odds_parser = subparsers.add_parser("odds", help="単勝・ワイド・馬連・三連複のオッズを取得")
     odds_parser.add_argument("race_id", help="レースID")

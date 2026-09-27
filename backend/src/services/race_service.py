@@ -13,6 +13,7 @@ from backend.models.race import (
     RaceResult,
     RaceSchedule,
     RaceWithResults,
+    SettledRaceResult,
 )
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
@@ -209,6 +210,21 @@ class RaceService:
         except Exception as e:
             logger.error(f"Failed to get race result for {race_id}: {e}")
             return None
+
+    def get_settled_race_result(self, race_id: str) -> SettledRaceResult:
+        """Settled finish order and payouts for one race.
+
+        This is the post-race settlement used for mark × finish logs.
+        It is not the horse near-run history from ``cli horse``.
+        Do not feed it into pre-race EV. A miss returns empty rows and warning.
+
+        Args:
+            race_id: Race ID
+
+        Returns:
+            Settled race result from the netkeiba result page
+        """
+        return self.netkeiba_scraper.get_settled_race_result(race_id)
 
     def get_race_odds(
         self,

@@ -9,7 +9,16 @@ from bs4 import BeautifulSoup, Tag
 
 from backend.models.course import CourseCondition
 from backend.models.horse import Horse, HorsePerformance
-from backend.models.race import Race, RaceCard, RaceEntry, RaceResult, RaceSchedule
+from backend.models.race import (
+    Race,
+    RaceCard,
+    RaceEntry,
+    RacePayout,
+    RaceResult,
+    RaceSchedule,
+    SettledFinisher,
+    SettledRaceResult,
+)
 from backend.scrapers.base_scraper import BaseScraper
 from backend.utils.date_utils import (
     get_current_week_dates,
@@ -22,6 +31,15 @@ HORSE_RESULT_FETCH_FAILED = "horse result fetch failed"
 HORSE_RESULT_TABLE_NOT_FOUND = "horse result table not found"
 HORSE_RESULT_TABLE_MALFORMED = "horse result table malformed"
 HORSE_RESULT_EMPTY = "no performances on horse result page"
+RACE_RESULT_FETCH_FAILED = "race result fetch failed"
+RACE_RESULT_NOT_FOUND = "race result not found"
+RACE_RESULT_NOT_SETTLED = "race not yet settled"
+RACE_RESULT_TABLE_MALFORMED = "race result table malformed"
+RACE_RESULT_EMPTY = "no finishers on race result page"
+RACE_RESULT_PAYOUT_MISSING = "払戻に無い馬券種は空のまま"
+RACE_RESULT_PAYOUT_UNPAIRED = "払戻の対応が取れない馬券種は空のまま"
+RACE_RESULT_PAYOUT_BLANK = "価格が無い払戻行は空のまま"
+RACE_RESULT_PAYOUT_ABSENT = "払戻が結果ページに無い"
 
 _PLACEHOLDERS = frozenset({"", "-", "--", "---", "**", "*", "----", "---.-"})
 _RESULT_HEADERS = {
@@ -46,6 +64,25 @@ _RESULT_HEADERS = {
     "馬体重": "horse_weight",
     "賞金": "prize_money",
 }
+_SETTLED_HEADERS = {
+    "着順": "rank",
+    "枠": "bracket_number",
+    "馬番": "horse_number",
+    "馬名": "horse_name",
+    "斤量": "weight",
+    "騎手": "jockey_name",
+    "タイム": "finish_time",
+    "着差": "margin",
+    "人気": "popularity",
+    "単勝オッズ": "odds",
+    "後3F": "last_3f",
+    "上がり": "last_3f",
+    "上り": "last_3f",
+    "コーナー通過順": "passing_order",
+}
+_PAYOUT_BET_TYPES = ("単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単")
+_PAYOUT_ALIASES = {"三連複": "3連複", "三連単": "3連単"}
+_WEATHER = ("小雨", "晴", "曇", "雨", "雪")
 _COAT_COLORS = (
     "黒鹿毛",
     "青鹿毛",
@@ -264,6 +301,104 @@ def _race_id_from_cell(cell: Tag | None) -> str | None:
     return None
 
 
+def _canonical_payout(label: str) -> str:
+    return _PAYOUT_ALIASES.get(label, label)
+
+
+def _number_token(text: str) -> str | None:
+    compact = _compact(text)
+    if re.fullmatch(r"\d{1,2}", compact):
+        return str(int(compact))
+    return None
+
+
+def _parse_yen(text: str) -> int | None:
+    compact = _compact(text).replace(",", "").replace("，", "")
+    match = re.fullmatch(r"(\d+)円", compact)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    if value <= 0:
+        return None
+    return value
+
+
+def _parse_popularity_label(text: str) -> int | None:
+    match = re.fullmatch(r"(\d+)人気", _compact(text))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _payout_combinations(cell: Tag) -> list[str]:
+    """Group horse or bracket numbers the way the 払戻 cell groups them."""
+    groups = cell.find_all("ul")
+    if groups:
+        combinations: list[str] = []
+        for group in groups:
+            numbers = [
+                token
+                for token in (_number_token(item.get_text()) for item in group.find_all("li"))
+                if token
+            ]
+            if numbers:
+                combinations.append("-".join(numbers))
+        return combinations
+    return [
+        token
+        for token in (_number_token(span.get_text()) for span in cell.find_all("span"))
+        if token
+    ]
+
+
+def _yen_amounts(cell: Tag) -> list[int | None]:
+    chunks: list[str] = []
+    spans = cell.find_all("span")
+    nodes: list[Tag] = spans or [cell]
+    for node in nodes:
+        for br in node.find_all("br"):
+            br.replace_with("\n")
+        chunks.extend(line.strip() for line in node.get_text("\n").splitlines() if line.strip())
+    return [_parse_yen(chunk) for chunk in chunks]
+
+
+def _payout_popularities(cell: Tag) -> list[int | None]:
+    spans = cell.find_all("span")
+    if not spans:
+        return [_parse_popularity_label(cell.get_text())]
+    return [_parse_popularity_label(span.get_text()) for span in spans if _compact(span.get_text())]
+
+
+def _dated_on_page(text: str) -> date | None:
+    """Read a full Japanese date. A month-day without a year is not filled in."""
+    match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if match is None:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _join_note(prefix: str, labels: list[str]) -> str | None:
+    if not labels:
+        return None
+    return f"{prefix}: " + "、".join(labels)
+
+
+@dataclass
+class _SettledHeader:
+    """Race header read from the result page. Missing pieces stay null."""
+
+    race_name: str | None = None
+    race_date: date | None = None
+    venue: str | None = None
+    distance: int | None = None
+    track_type: str | None = None
+    track_condition: str | None = None
+    weather: str | None = None
+
+
 class NetkeibaScraper(BaseScraper):
     """Scraper for netkeiba website (https://race.netkeiba.com)."""
 
@@ -419,7 +554,10 @@ class NetkeibaScraper(BaseScraper):
             return None
 
     def get_race_result(self, race_id: str) -> list[RaceResult] | None:
-        """Get race results for a specific race.
+        """Get race result rows for CSV export.
+
+        Settlement for ``cli result`` is ``get_settled_race_result``.
+        This older reader is not the post-race payout payload.
 
         Args:
             race_id: Race ID
@@ -436,6 +574,318 @@ class NetkeibaScraper(BaseScraper):
         except Exception as e:
             logger.error(f"Failed to fetch race result for {race_id}: {e}")
             return None
+
+    def get_settled_race_result(
+        self, race_id: str, *, fetched_at: datetime | None = None
+    ) -> SettledRaceResult:
+        """Settled finish and payouts for one race.
+
+        Source is ``https://race.netkeiba.com/race/result.html?race_id=``.
+        That page is UTF-8. The horse DB pages stay EUC-JP.
+        The Session uses the same Chrome UA as odds and horse fetches.
+        This is the settlement of this race, not ``/horse/result/{horse_id}/``.
+        A failed fetch, a missing race, or a race that has no finish table
+        returns empty finishers and payouts with ``warning``. Prices are not made up.
+
+        Args:
+            race_id: Race ID
+            fetched_at: Timestamp stored on the payload. Defaults to now.
+
+        Returns:
+            Settled race result. ``warning`` is set when it is not usable.
+        """
+        fetched = fetched_at or datetime.now()
+        try:
+            soup = self._fetch_race_result_page(race_id)
+        except Exception as e:
+            logger.error("Failed to fetch settled race result for %s: %s", race_id, e)
+            return self._empty_settled_result(race_id, fetched, RACE_RESULT_FETCH_FAILED)
+        return self._parse_settled_race_result(soup, race_id, fetched)
+
+    def _fetch_race_result_page(self, race_id: str) -> BeautifulSoup:
+        """Fetch the race result page with the browser UA and UTF-8."""
+        headers = {**self.BROWSER_HEADERS, "Referer": f"{self.BASE_URL}/top/"}
+        html = self.http_client.get(
+            f"{self.BASE_URL}/race/result.html",
+            params={"race_id": race_id},
+            headers=headers,
+            encoding="utf-8",
+        )
+        return BeautifulSoup(html, "lxml")
+
+    def _empty_settled_result(
+        self,
+        race_id: str,
+        fetched_at: datetime,
+        warning: str,
+        header: _SettledHeader | None = None,
+    ) -> SettledRaceResult:
+        identity = header or _SettledHeader()
+        return SettledRaceResult(
+            race_id=race_id,
+            race_name=identity.race_name,
+            race_date=identity.race_date,
+            venue=identity.venue,
+            distance=identity.distance,
+            track_type=identity.track_type,
+            track_condition=identity.track_condition,
+            weather=identity.weather,
+            fetched_at=fetched_at,
+            results=[],
+            payouts=[],
+            payout_note=None,
+            warning=warning,
+        )
+
+    def _parse_settled_race_result(
+        self, soup: BeautifulSoup, race_id: str, fetched_at: datetime
+    ) -> SettledRaceResult:
+        """Read one result page. Do not fill blanks from the race id."""
+        header = self._settled_header(soup)
+        table = soup.find("table", summary="全着順")
+        if not isinstance(table, Tag):
+            if header.race_name is None and header.race_date is None and header.venue is None:
+                return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_NOT_FOUND)
+            return self._empty_settled_result(
+                race_id, fetched_at, RACE_RESULT_NOT_SETTLED, header
+            )
+
+        columns = self._settled_columns(table)
+        if any(name not in columns for name in ("rank", "horse_number", "horse_name")):
+            return self._empty_settled_result(
+                race_id, fetched_at, RACE_RESULT_TABLE_MALFORMED, header
+            )
+
+        results = self._settled_finishers(table, columns)
+        if not results:
+            return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_EMPTY, header)
+
+        payouts, payout_note = self._settled_payouts(soup)
+        return SettledRaceResult(
+            race_id=race_id,
+            race_name=header.race_name,
+            race_date=header.race_date,
+            venue=header.venue,
+            distance=header.distance,
+            track_type=header.track_type,
+            track_condition=header.track_condition,
+            weather=header.weather,
+            fetched_at=fetched_at,
+            results=results,
+            payouts=payouts,
+            payout_note=payout_note,
+            warning=None,
+        )
+
+    def _settled_header(self, soup: BeautifulSoup) -> _SettledHeader:
+        """Name, date, venue, course, and going as printed on the result page."""
+        header = _SettledHeader(race_name=self._settled_race_name(soup))
+        header.race_date = self._settled_race_date(soup)
+        data02 = soup.select_one(".RaceData02")
+        if isinstance(data02, Tag):
+            venues = set(self.VENUE_CODES.values())
+            for span in data02.find_all("span"):
+                venue = _clean(span.get_text())
+                if venue in venues:
+                    header.venue = venue
+                    break
+        data01 = soup.select_one(".RaceData01")
+        if isinstance(data01, Tag):
+            header.distance, header.track_type = self._settled_surface(data01)
+            data_text = data01.get_text(" ", strip=True)
+            weather_match = re.search(r"天候[:：]\s*(\S+)", data_text)
+            if weather_match and weather_match.group(1) in _WEATHER:
+                header.weather = weather_match.group(1)
+            going_match = re.search(r"馬場[:：]\s*(\S+)", data_text)
+            if going_match:
+                header.track_condition = _parse_going(going_match.group(1))
+        return header
+
+    def _settled_race_name(self, soup: BeautifulSoup) -> str | None:
+        node = soup.select_one("h1.RaceName")
+        if not isinstance(node, Tag):
+            return None
+        for icon in node.select(".Icon_GradeType"):
+            icon.extract()
+        return _optional_text(node.get_text())
+
+    def _settled_race_date(self, soup: BeautifulSoup) -> date | None:
+        """Prefer the kaisai_date link. Never decode the date from race_id."""
+        active = soup.select_one("#RaceList_DateList dd.Active a")
+        if isinstance(active, Tag):
+            match = re.search(r"kaisai_date=(\d{4})(\d{2})(\d{2})", str(active.get("href", "")))
+            if match:
+                try:
+                    return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                except ValueError:
+                    pass
+        texts = []
+        if soup.title is not None:
+            texts.append(soup.title.get_text())
+        description = soup.find("meta", attrs={"name": "description"})
+        if isinstance(description, Tag):
+            content = description.get("content", "")
+            texts.append(content if isinstance(content, str) else "")
+        for text in texts:
+            found = _dated_on_page(text)
+            if found is not None:
+                return found
+        return None
+
+    def _settled_surface(self, data01: Tag) -> tuple[int | None, str | None]:
+        for span in data01.find_all("span"):
+            distance, track_type = _parse_distance_cell(span.get_text())
+            if distance is not None:
+                return distance, track_type
+        return _parse_distance_cell(data01.get_text())
+
+    def _settled_columns(self, table: Tag) -> dict[str, int]:
+        header_row = table.find("tr")
+        columns: dict[str, int] = {}
+        if not isinstance(header_row, Tag):
+            return columns
+        cells = [
+            cell
+            for cell in header_row.find_all(["th", "td"], recursive=False)
+            if isinstance(cell, Tag)
+        ]
+        for index, cell in enumerate(cells):
+            field_name = _SETTLED_HEADERS.get(_header_label(cell.get_text()))
+            if field_name is not None and field_name not in columns:
+                columns[field_name] = index
+        return columns
+
+    def _settled_finishers(
+        self, table: Tag, columns: dict[str, int]
+    ) -> list[SettledFinisher]:
+        finishers: list[SettledFinisher] = []
+        for row in table.find_all("tr")[1:]:
+            if not isinstance(row, Tag):
+                continue
+            cols = [
+                cell
+                for cell in row.find_all("td", recursive=False)
+                if isinstance(cell, Tag)
+            ]
+            if not cols:
+                continue
+            finisher = self._settled_finisher(cols, columns)
+            if finisher is not None:
+                finishers.append(finisher)
+        return finishers
+
+    def _settled_finisher(
+        self, cols: list[Tag], columns: dict[str, int]
+    ) -> SettledFinisher | None:
+        horse_cell = _cell(cols, columns, "horse_name")
+        horse_name = _optional_text(horse_cell.get_text()) if horse_cell is not None else None
+        horse_number = _optional_int(_cell_text(cols, columns, "horse_number"))
+        if horse_name is None and horse_number is None:
+            return None
+        horse_id = None
+        if horse_cell is not None:
+            for link in horse_cell.find_all("a", href=True):
+                match = re.search(r"horse/(\d+)", str(link.get("href", "")))
+                if match:
+                    horse_id = match.group(1)
+                    break
+        rank_text = _compact(_cell_text(cols, columns, "rank"))
+        rank = int(rank_text) if re.fullmatch(r"\d+", rank_text) else None
+        return SettledFinisher(
+            rank=rank,
+            bracket_number=_optional_int(_cell_text(cols, columns, "bracket_number")),
+            horse_number=horse_number,
+            horse_name=horse_name,
+            horse_id=horse_id,
+            weight=_parse_impost(_cell_text(cols, columns, "weight")),
+            jockey_name=_optional_text(_cell_text(cols, columns, "jockey_name")),
+            finish_time=_parse_finish_time(_cell_text(cols, columns, "finish_time")),
+            margin=_optional_text(_cell_text(cols, columns, "margin")),
+            last_3f=_optional_float(_cell_text(cols, columns, "last_3f")),
+            popularity=_optional_int(_cell_text(cols, columns, "popularity")),
+            odds=_optional_float(_cell_text(cols, columns, "odds")),
+            passing_order=_optional_text(_cell_text(cols, columns, "passing_order")),
+        )
+
+    def _settled_payouts(self, soup: BeautifulSoup) -> tuple[list[RacePayout], str | None]:
+        """Read 払戻 rows. A missing or unpaired price is omitted, not invented."""
+        tables = soup.select("table.Payout_Detail_Table")
+        if not tables:
+            return [], RACE_RESULT_PAYOUT_ABSENT
+
+        payouts: list[RacePayout] = []
+        seen: set[str] = set()
+        unpaired: list[str] = []
+        blank: list[str] = []
+        for table in tables:
+            for row in table.find_all("tr"):
+                if not isinstance(row, Tag):
+                    continue
+                label_cell = row.find("th")
+                if not isinstance(label_cell, Tag):
+                    continue
+                label = _clean(label_cell.get_text())
+                if not label:
+                    continue
+                result_cell = row.find("td", class_="Result")
+                payout_cell = row.find("td", class_="Payout")
+                if not isinstance(result_cell, Tag) or not isinstance(payout_cell, Tag):
+                    unpaired.append(label)
+                    continue
+                combinations = _payout_combinations(result_cell)
+                amounts = _yen_amounts(payout_cell)
+                if not combinations or len(combinations) != len(amounts):
+                    unpaired.append(label)
+                    continue
+                popularity_cell = row.find("td", class_="Ninki")
+                popularities = (
+                    _payout_popularities(popularity_cell)
+                    if isinstance(popularity_cell, Tag)
+                    else []
+                )
+                popularity_ok = len(popularities) == len(combinations)
+                tickets: list[RacePayout] = []
+                dropped_price = False
+                for index, (combination, amount) in enumerate(
+                    zip(combinations, amounts, strict=True)
+                ):
+                    if amount is None:
+                        dropped_price = True
+                        continue
+                    popularity = popularities[index] if popularity_ok else None
+                    tickets.append(
+                        RacePayout(
+                            bet_type=label,
+                            combination=combination,
+                            payout=amount,
+                            popularity=popularity,
+                        )
+                    )
+                if not tickets:
+                    unpaired.append(label)
+                    continue
+                payouts.extend(tickets)
+                seen.add(_canonical_payout(label))
+                if dropped_price:
+                    blank.append(label)
+
+        unpaired_keys = {_canonical_payout(label) for label in unpaired}
+        blank_keys = {_canonical_payout(label) for label in blank}
+        missing = [
+            name
+            for name in _PAYOUT_BET_TYPES
+            if name not in seen and name not in unpaired_keys and name not in blank_keys
+        ]
+        notes = [
+            note
+            for note in (
+                _join_note(RACE_RESULT_PAYOUT_MISSING, missing),
+                _join_note(RACE_RESULT_PAYOUT_UNPAIRED, unpaired),
+                _join_note(RACE_RESULT_PAYOUT_BLANK, blank),
+            )
+            if note
+        ]
+        return payouts, " ".join(notes) or None
 
     def get_horse_info(
         self, horse_id: str, *, fetched_at: datetime | None = None

@@ -83,6 +83,78 @@ class RaceWithResults(BaseModel):
     results: list[RaceResult] = Field(default_factory=list, description="レース結果")
 
 
+class SettledFinisher(BaseModel):
+    """One row on the settled race result page.
+
+    着順が ``取消`` などのときは ``rank`` は null。空欄からタイムやオッズは作らない。
+    """
+
+    rank: int | None = Field(None, description="着順。取消・除外・中止・失格は null")
+    bracket_number: int | None = Field(None, description="枠番")
+    horse_number: int | None = Field(None, description="馬番")
+    horse_name: str | None = Field(None, description="馬名")
+    horse_id: str | None = Field(None, description="馬ID")
+    weight: float | None = Field(None, description="斤量")
+    jockey_name: str | None = Field(None, description="騎手名")
+    finish_time: str | None = Field(None, description="タイム")
+    margin: str | None = Field(None, description="着差")
+    last_3f: float | None = Field(None, description="上がり3F（結果ページの後3F）")
+    popularity: int | None = Field(None, description="単勝人気")
+    odds: float | None = Field(None, description="単勝オッズ")
+    passing_order: str | None = Field(None, description="コーナー通過順")
+
+
+class RacePayout(BaseModel):
+    """One ticket on the result page 払戻 table.
+
+    ページに金額が無い馬券種は作らない。
+    """
+
+    bet_type: str = Field(..., description="馬券種。ページの表記（単勝、複勝、馬連、ワイド、3連複など）")
+    combination: str = Field(..., description="馬番または枠番。ページの並び。馬単・3連単は着順どおり")
+    payout: int = Field(..., description="払戻金（円）", gt=0)
+    popularity: int | None = Field(None, description="人気。ページに無いときは null")
+
+
+class SettledRaceResult(BaseModel):
+    """確定した1レースの着順と払戻。
+
+    ``cli horse`` の近走成績ではない。レース前の期待値の入力に混ぜない。
+    取得できない、または未確定のときは着順と払戻は空で、``warning`` に理由が入る。
+    """
+
+    race_id: str = Field(..., description="レースID")
+    race_name: str | None = Field(None, description="レース名")
+    race_date: date | None = Field(None, description="開催日")
+    venue: str | None = Field(None, description="競馬場")
+    distance: int | None = Field(None, description="距離 (m)")
+    track_type: str | None = Field(None, description="コース種別 (芝/ダート/障害)")
+    track_condition: str | None = Field(None, description="馬場状態 (良/稍重/重/不良)")
+    weather: str | None = Field(None, description="天候")
+    fetched_at: datetime = Field(..., description="取得日時")
+    results: list[SettledFinisher] = Field(
+        default_factory=list,
+        description="このレースの確定着順。結果ページの並び。馬の近走成績ではない",
+    )
+    payouts: list[RacePayout] = Field(
+        default_factory=list,
+        description="結果ページの払戻。金額が無い馬券種は入れない",
+    )
+    payout_note: str | None = Field(
+        None,
+        description="払戻が無い、または対応が取れない馬券種があるときの注記。金額は作らない",
+    )
+    warning: str | None = Field(
+        None,
+        description=(
+            "確定結果を取れなかった理由。"
+            "race result fetch failed / race result not found / "
+            "race not yet settled / race result table malformed / "
+            "no finishers on race result page"
+        ),
+    )
+
+
 class RaceSchedule(BaseModel):
     """Weekly race schedule."""
 

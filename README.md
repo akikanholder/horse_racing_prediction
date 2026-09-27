@@ -82,7 +82,7 @@ API ドキュメント: http://localhost:8000/docs
 | `GET /api/races` | 今週のレース一覧を取得 |
 | `GET /api/races/{race_id}` | 特定のレース情報を取得 |
 | `GET /api/races/{race_id}/card` | 出馬表を取得 |
-| `GET /api/races/{race_id}/result` | レース結果を取得 |
+| `GET /api/races/{race_id}/result` | 確定した1レースの着順と払戻（近走ではない） |
 | `GET /api/races/{race_id}/horses` | 出走馬の詳細情報を取得 |
 | `GET /api/races/{race_id}/odds` | 単勝・ワイド・馬連のオッズを取得 |
 | `GET /api/horses/{horse_id}` | 競走馬の近走履歴を取得（今走の結果ではない） |
@@ -101,8 +101,12 @@ python -m backend.cli races
 # 出馬表を取得
 python -m backend.cli card <race_id>
 
-# 競走馬情報を取得
+# 競走馬の近走成績を取得（確定したレース結果ではない）
 python -m backend.cli horse <horse_id>
+
+# 確定した1レースの着順と払戻（馬の近走成績ではない。予測入力に混ぜない）
+python -m backend.cli result <race_id>
+python -m backend.cli result <race_id> --json
 
 # コース情報を取得
 python -m backend.cli courses
@@ -157,6 +161,20 @@ with TrackInfoService() as service:
 - 取れないときは `performances: []` と `warning`。値は `horse result fetch failed`、`horse result table not found`、`horse result table malformed`、`no performances on horse result page`。
 - `fetched_at` は取得時刻。フィールド名は従来どおり。追加は `fetched_at` と `warning`。`prize_money` は万円の小数を残すため数値（例: `50298.2`）。
 - `GET /api/races/{race_id}/horses` の `recent_performances` も同じ成績ページの過去走であり、そのレースの結果ではない。
+- 着順の精算は `cli result` / `GET /api/races/{race_id}/result`。近走の行を今走の結果として使わない。
+
+## 確定結果
+
+`GET /api/races/{race_id}/result` と `python -m backend.cli result <race_id>` は、確定した1レースの着順と払戻を返す。マーク×着順の事後ログ用。レース前の期待値の入力に混ぜない。
+
+- ページは `https://race.netkeiba.com/race/result.html?race_id={race_id}`。出馬表や `cli horse` の `/horse/result/{horse_id}/` ではない。
+- このページは UTF-8。馬の成績ページ（EUC-JP）とは別。UA はオッズ・馬ページと同じ Chrome。
+- `results` はこのレースの確定着順（結果表の並び）。`取消` などは `rank: null` のまま行に残す。タイム、着差、オッズ、払戻が空のセルから数値は作らない。
+- 開催日はページの `kaisai_date`（無ければタイトルの年月日）。レースIDの桁からは日付を作らない。
+- 競馬場、距離、芝/ダート、馬場、天候は結果ページに書いてあるときだけ入る。馬場の `稍` は馬成績と同じく `稍重`。
+- 払戻はページの単勝・複勝・枠連・馬連・ワイド・馬単・3連複・3連単。金額が無い馬券種は入れず、`payout_note` に残す。ページに無い価格は作らない。
+- 取れないときは `results: []`、`payouts: []` と `warning`。値は `race result fetch failed`、`race result not found`、`race not yet settled`、`race result table malformed`、`no finishers on race result page`。
+- `fetched_at` は取得時刻。
 
 ## オッズ
 
