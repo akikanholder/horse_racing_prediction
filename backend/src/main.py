@@ -12,7 +12,7 @@ from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.export import DailyRaceCsvExport
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import RaceOdds
-from backend.models.race import Race, RaceCard, RaceSchedule, RaceWithResults
+from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
 from backend.models.track import TrackInfo
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
 from backend.services.race_service import RaceService
@@ -154,29 +154,29 @@ async def get_race_card(race_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/races/{race_id}/result", response_model=RaceWithResults, tags=["Races"])
+@app.get("/api/races/{race_id}/result", response_model=SettledRaceResult, tags=["Races"])
 async def get_race_result(race_id: str):
-    """レース結果を取得する。
+    """確定した1レースの着順と払戻を取得する。
+
+    ``cli horse`` や ``/api/horses/{horse_id}`` の近走成績ではない。
+    レース前の期待値の入力に混ぜない。
+    未確定、取得失敗、表が読めないときは着順と払戻は空で ``warning`` が入る。
+    払戻の金額は結果ページにあるものだけ。無い馬券種は作らない。
 
     Args:
         race_id: レースID
 
     Returns:
-        RaceWithResults: レース結果
+        SettledRaceResult: このレースの確定結果
     """
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        result = race_service.get_race_result(race_id)
-        if not result:
-            raise HTTPException(status_code=404, detail=f"Result for {race_id} not found")
-        return result
-    except HTTPException:
-        raise
+        return race_service.get_settled_race_result(race_id)
     except Exception as e:
         logger.error(f"Failed to get race result for {race_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/races/{race_id}/odds", response_model=RaceOdds, tags=["Races"])

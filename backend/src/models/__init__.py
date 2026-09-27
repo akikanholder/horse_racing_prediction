@@ -3,7 +3,7 @@
 from backend.models.course import Course, CourseCondition
 from backend.models.horse import Horse, HorsePerformance
 from backend.models.odds import OddsQuote, RaceOdds
-from backend.models.race import Race, RaceCard, RaceResult
+from backend.models.race import Race, RaceCard, RacePayout, RaceResult, SettledRaceResult
 from backend.models.track import (
     CourseInfo,
     CourseType,
@@ -30,7 +30,9 @@ __all__ = [
     "Race",
     "RaceCard",
     "RaceOdds",
+    "RacePayout",
     "RaceResult",
+    "SettledRaceResult",
     "TrackCondition",
     "TrackInfo",
     "Weather",
