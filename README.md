@@ -85,7 +85,7 @@ API ドキュメント: http://localhost:8000/docs
 | `GET /api/races/{race_id}/result` | レース結果を取得 |
 | `GET /api/races/{race_id}/horses` | 出走馬の詳細情報を取得 |
 | `GET /api/races/{race_id}/odds` | 単勝・ワイド・馬連のオッズを取得 |
-| `GET /api/horses/{horse_id}` | 競走馬の詳細情報を取得 |
+| `GET /api/horses/{horse_id}` | 競走馬の近走履歴を取得（今走の結果ではない） |
 | `GET /api/courses` | 全競馬場のコース情報を取得 |
 | `GET /api/courses/{venue}` | 特定競馬場のコース情報を取得 |
 | `GET /api/courses/{venue}/conditions` | 馬場状態を取得 |
@@ -145,6 +145,18 @@ with TrackInfoService() as service:
     if merged and merged.turf:
         print(f"芝: {merged.turf.condition.value}")
 ```
+
+## 競走馬の近走
+
+`GET /api/horses/{horse_id}` と `python -m backend.cli horse <horse_id>` はその馬の過去走を返す。今走の確定結果ではない。着順の精算や `cli result` には使わず、近走の能力評価にだけ使う。
+
+- 成績の行は `https://db.netkeiba.com/horse/result/{horse_id}/` の表。列名で読む。水分量や馬場指数の列をタイムや上がりには使わない。
+- 馬名と通算成績は馬ページ `https://db.netkeiba.com/horse/{horse_id}/`。結果ページの見出しに名前があるときは、馬ページが取れなくても名前を埋める。
+- 通算成績はページの「通算成績」（`16戦8勝`）。走った行数から勝ち数は作らない。獲得賞金は中央と地方を万円で足す。
+- セルが空、`**`、`取`、`計不` のときは数値を作らず null。距離が読めない行も `distance: null`（0 にはしない）。
+- 取れないときは `performances: []` と `warning`。値は `horse result fetch failed`、`horse result table not found`、`horse result table malformed`、`no performances on horse result page`。
+- `fetched_at` は取得時刻。フィールド名は従来どおり。追加は `fetched_at` と `warning`。`prize_money` は万円の小数を残すため数値（例: `50298.2`）。
+- `GET /api/races/{race_id}/horses` の `recent_performances` も同じ成績ページの過去走であり、そのレースの結果ではない。
 
 ## オッズ
 

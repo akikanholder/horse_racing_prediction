@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 from datetime import date
 
+from backend.models.horse import HorsePerformance
 from backend.models.odds import OddsQuote
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
@@ -93,6 +94,7 @@ def cmd_horse(args):
         print(f"\n=== 競走馬情報: {horse.horse_name} ===")
         print(f"馬ID: {horse.horse_id}")
         print(f"性別: {horse.sex}")
+        print(f"取得時刻: {horse.fetched_at}")
         if horse.birth_year:
             print(f"生年: {horse.birth_year}年")
         if horse.sire_name:
@@ -105,18 +107,39 @@ def cmd_horse(args):
             print(f"調教師: {horse.trainer_name}")
         if horse.training_center:
             print(f"所属: {horse.training_center}")
-        print(f"通算成績: {horse.total_races}戦{horse.total_wins}勝")
+        if horse.total_races is None and horse.total_wins is None:
+            print("通算成績: 不明")
+        else:
+            races = "-" if horse.total_races is None else horse.total_races
+            wins = "-" if horse.total_wins is None else horse.total_wins
+            print(f"通算成績: {races}戦{wins}勝")
+        if horse.total_earnings is not None:
+            print(f"獲得賞金: {horse.total_earnings}万円")
+        if horse.warning:
+            print(f"警告: {horse.warning}")
 
         if args.json:
             print_json(horse)
         else:
-            print("\n--- 近走成績 ---")
+            print("\n--- 近走成績（過去走。今走の結果ではない） ---")
+            if not horse.performances:
+                print("なし")
             for perf in horse.performances[:5]:
                 result = f"{perf.rank}着" if perf.rank else "---"
-                print(
-                    f"{perf.race_date} {perf.venue} {perf.race_name} "
-                    f"({perf.track_type}{perf.distance}m) → {result}"
-                )
+                print(f"{_format_performance(perf)} → {result}")
+
+
+def _format_performance(perf: HorsePerformance) -> str:
+    """Format one past performance for the text view."""
+    if perf.track_type and perf.distance is not None:
+        course = f"{perf.track_type}{perf.distance}m"
+    elif perf.distance is not None:
+        course = f"{perf.distance}m"
+    else:
+        course = perf.track_type or ""
+    if perf.track_condition:
+        course = f"{course} {perf.track_condition}".strip()
+    return f"{perf.race_date} {perf.venue} {perf.race_name} ({course})"
 
 
 def cmd_courses(args):
