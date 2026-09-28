@@ -10,26 +10,48 @@ import pytest
 import requests
 
 from backend.models.training import (
+    SOURCE_KEIBABOOK_CRIREKI,
     SOURCE_KEIBABOOK_SMART,
     SOURCE_SPEEDKEIBA,
     TRAINING_FETCH_FAILED,
+    TRAINING_HISTORY_EMPTY,
+    TRAINING_HISTORY_REQUIRES_LOGIN,
     TRAINING_HORSE_UNAVAILABLE,
+    TRAINING_LOGIN_FAILED,
     TRAINING_NOT_ON_EITHER,
     TRAINING_NOT_ON_KEIBABOOK,
     TRAINING_TABLE_MALFORMED,
     TRAINING_TABLE_NOT_FOUND,
     TRAINING_THIN,
-)
-from backend.scrapers.training_scraper import (
-    KEIBABOOK_CYOKYO,
-    SPEEDKEIBA_INDEX,
-    TrainingScraper,
-    match_speedkeiba_article,
-    parse_keibabook_cyokyo,
-    parse_speedkeiba_article,
-    parse_speedkeiba_index,
+    TRAINING_UMACD_UNMAPPED,
+    unavailable_training,
 )
 from backend.scrapers.day_of_bias import not_loaded_publication
+from backend.scrapers.training_scraper import (
+    ENV_KEIBABOOK_COOKIE,
+    ENV_KEIBABOOK_LOGIN_ID,
+    ENV_KEIBABOOK_PASSWORD,
+    KEIBABOOK_CRIREKI,
+    KEIBABOOK_CYOKYO,
+    KEIBABOOK_HORSE_SEARCH,
+    KEIBABOOK_LOGIN,
+    KEIBABOOK_LOGINCHECK,
+    KEIBABOOK_SYUTUBA,
+    SPEEDKEIBA_INDEX,
+    KeibabookCredentials,
+    TrainingScraper,
+    UmacdCandidate,
+    credentials_from_env,
+    logincheck_authenticated,
+    match_speedkeiba_article,
+    parse_keibabook_crireki,
+    parse_keibabook_cyokyo,
+    parse_keibabook_horse_search,
+    parse_keibabook_syutuba,
+    parse_speedkeiba_article,
+    parse_speedkeiba_index,
+    select_umacd,
+)
 from backend.services.race_service import RaceService
 
 
@@ -38,6 +60,7 @@ class _OfflineBias:
 
     def publication_for(self, race):
         return not_loaded_publication()
+
 
 FIXTURES = Path(__file__).parent / "fixtures"
 RACE_ID = "202606050101"
@@ -414,6 +437,419 @@ def test_cli_help_mentions_training_and_login():
     )
     assert "調教" in completed.stdout
     assert "ログイン" in completed.stdout
+    assert "KEIBABOOK_LOGIN_ID" in completed.stdout
+    assert "KEIBABOOK_PASSWORD" in completed.stdout
+    assert "KEIBABOOK_COOKIE" in completed.stdout
+
+
+_MEMBER = KeibabookCredentials(login_id="member", password="secret")
+
+
+class _Web:
+    """GET and POST keyed separately. Unknown URLs fail the test."""
+
+    def __init__(self, pages: dict[tuple[str, str], str | Exception]):
+        self.pages = pages
+        self.calls: list[tuple[str, str]] = []
+        self.posted: list[tuple[str, dict | None]] = []
+        self.headers: dict[str, str] = {}
+
+    def get(self, url, params=None, headers=None, encoding=None):
+        self.calls.append(("GET", url))
+        return self._body(("GET", url))
+
+    def post(self, url, data=None, headers=None, encoding=None):
+        self.calls.append(("POST", url))
+        self.posted.append((url, data))
+        return self._body(("POST", url))
+
+    def update_headers(self, headers):
+        self.headers.update(headers)
+
+    def close(self) -> None:
+        return None
+
+    def _body(self, key: tuple[str, str]):
+        if key not in self.pages:
+            raise AssertionError(key)
+        page = self.pages[key]
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+
+def _member_pages(extra: dict[tuple[str, str], str | Exception]) -> dict:
+    pages: dict[tuple[str, str], str | Exception] = {
+        ("GET", KEIBABOOK_LOGIN): _load("keibabook_login_form.html"),
+        ("POST", KEIBABOOK_LOGIN): "<html>posted</html>",
+        ("POST", KEIBABOOK_LOGINCHECK): _load("keibabook_logincheck_in.html"),
+    }
+    pages.update(extra)
+    return pages
+
+
+def test_credentials_from_env_ignore_blanks():
+    assert credentials_from_env({}).configured is False
+    assert (
+        credentials_from_env(
+            {ENV_KEIBABOOK_LOGIN_ID: "  ", ENV_KEIBABOOK_PASSWORD: "secret"}
+        ).configured
+        is False
+    )
+    assert (
+        credentials_from_env(
+            {ENV_KEIBABOOK_LOGIN_ID: "member", ENV_KEIBABOOK_PASSWORD: "secret"}
+        ).password_login
+        is True
+    )
+    cookie_only = credentials_from_env({ENV_KEIBABOOK_COOKIE: "keibabook_session=abc"})
+    assert cookie_only.configured is True
+    assert cookie_only.password_login is False
+    assert "secret" not in repr(cookie_only)
+
+
+def test_logincheck_requires_a_logged_in_marker():
+    assert logincheck_authenticated(_load("keibabook_logincheck_in.html")) is True
+    assert logincheck_authenticated(_load("keibabook_logincheck_out.html")) is False
+    assert logincheck_authenticated("<html></html>") is False
+
+
+def test_syutuba_links_map_umacd_and_ignore_pedigree_links():
+    mapping = parse_keibabook_syutuba(_load("keibabook_syutuba.html"))
+    assert mapping == {"シー": "0000003", "ディー": "0000004"}
+    ambiguous = """
+    <a href="/db/uma/0000003" umacd="0000003">シー</a>
+    <a href="/db/uma/0000099" umacd="0000099">シー</a>
+    """
+    assert "シー" not in parse_keibabook_syutuba(ambiguous)
+
+
+def test_crireki_page_reads_full_dates_and_leaves_symbols_null():
+    training = parse_keibabook_crireki(_load("keibabook_crireki.html"))
+    assert training.source == SOURCE_KEIBABOOK_CRIREKI
+    assert training.data_sufficiency == "sufficient"
+    assert training.warning is None
+    symbol, flat, slope = training.workouts
+    assert symbol.date is None
+    assert symbol.date_label == "■"
+    assert flat.date == date(2026, 5, 29)
+    assert flat.distance == "5F"
+    assert flat.time == "67.4"
+    assert flat.rank_in_group == 3
+    assert slope.date == date(2026, 6, 1)
+    assert slope.course == "美坂"
+    assert slope.distance == "4F"
+    assert slope.time == "58.1"
+    assert slope.slope_reps == 1
+    assert slope.condition == "稍"
+    dumped = _dump(training)
+    assert "99.9" not in dumped
+    assert "人気" not in dumped
+    assert "キタサンブラック記念" not in dumped
+
+
+def test_locked_empty_and_malformed_crireki_do_not_invent_clocks():
+    locked = parse_keibabook_crireki(_load("keibabook_crireki_locked.html"))
+    assert locked.workouts == []
+    assert locked.warning == TRAINING_HISTORY_REQUIRES_LOGIN
+    empty = parse_keibabook_crireki(_load("keibabook_crireki_empty.html"))
+    assert empty.workouts == []
+    assert empty.warning == TRAINING_HISTORY_EMPTY
+    broken = parse_keibabook_crireki(_load("keibabook_crireki_malformed.html"))
+    assert broken.workouts == []
+    assert broken.warning == TRAINING_TABLE_MALFORMED
+    assert "67.4" not in _dump(broken)
+
+
+def test_search_keeps_only_the_row_whose_birth_year_and_sex_match():
+    candidates = parse_keibabook_horse_search(_load("keibabook_search_multi.html"))
+    assert [item.umacd for item in candidates] == ["0000003", "0000008", "0000009"]
+    assert select_umacd(candidates, "シー", date(2022, 3, 4), "牡") == "0000003"
+    assert select_umacd(candidates, "シー", date(2022, 3, 4), "牝") is None
+    assert select_umacd(candidates, "シー", None, "牡") is None
+
+    twins = [
+        UmacdCandidate(umacd="0000003", name="シー", birth_year=2022, sex="牡"),
+        UmacdCandidate(umacd="0000008", name="シー", birth_year=2022, sex="牡"),
+    ]
+    assert select_umacd(twins, "シー", date(2022, 3, 4), "牡") is None
+    assert "0000111" not in {item.umacd for item in candidates}
+    profile = parse_keibabook_horse_search(_load("keibabook_horse_profile.html"))
+    assert select_umacd(profile, "シー", date(2022, 3, 4), "牡") == "0000003"
+    assert select_umacd(profile, "シー", date(2022, 3, 5), "牡") is None
+
+
+def test_logged_in_crireki_fills_a_horse_missing_from_the_anonymous_page():
+    crireki = KEIBABOOK_CRIREKI.format(umacd="0000003")
+    client = _Web(
+        _member_pages(
+            {
+                ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load("keibabook_cyokyo.html"),
+                ("GET", KEIBABOOK_SYUTUBA.format(race_id=RACE_ID)): _load("keibabook_syutuba.html"),
+                ("GET", crireki): _load("keibabook_crireki.html"),
+                ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+                ("GET", "https://speedkeiba.com/week/sprinters"): _load("speedkeiba_article.html"),
+            }
+        )
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    chosen = scraper.training_for_race(
+        RACE_ID, "スプリンターズＳ", ["サルヴァトーレ", "シー", "ビー", "未知"]
+    )
+    assert chosen["サルヴァトーレ"].source == SOURCE_KEIBABOOK_SMART
+    assert chosen["サルヴァトーレ"].workouts[0].time == "66.6"
+    covered = chosen["シー"]
+    assert covered.source == SOURCE_KEIBABOOK_CRIREKI
+    assert covered.data_sufficiency == "sufficient"
+    assert covered.workouts[1].time == "67.4"
+    assert covered.summary is not None
+    assert covered.summary.comment == "動き良い"
+    dumped = _dump(covered)
+    assert "99.9" not in dumped
+    assert "人気" not in dumped
+    assert "secret" not in dumped
+    assert chosen["ビー"].source == SOURCE_SPEEDKEIBA
+    assert chosen["未知"].workouts == []
+    assert chosen["未知"].warning == TRAINING_NOT_ON_EITHER
+    urls = [url for _method, url in client.calls]
+    assert crireki in urls
+    assert KEIBABOOK_CRIREKI.format(umacd="0000004") not in urls
+    login_post = [data for url, data in client.posted if url == KEIBABOOK_LOGIN][0]
+    assert login_post is not None
+    assert login_post["login_id"] == "member"
+    assert login_post["pswd"] == "secret"
+
+
+def test_member_cyokyo_page_covers_the_horse_without_opening_crireki():
+    client = _Web(
+        _member_pages(
+            {
+                ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load("keibabook_crireki.html"),
+                ("GET", KEIBABOOK_SYUTUBA.format(race_id=RACE_ID)): _load("keibabook_syutuba.html"),
+                ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+            }
+        )
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    chosen = scraper.training_for_race(RACE_ID, "未勝利", ["シー"])
+    assert chosen["シー"].source == SOURCE_KEIBABOOK_SMART
+    assert chosen["シー"].workouts[1].time == "67.4"
+    assert all("/crireki" not in url for _method, url in client.calls)
+
+
+def test_failed_login_keeps_anonymous_clocks_and_skips_history():
+    pages = _member_pages(
+        {
+            ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load("keibabook_cyokyo.html"),
+            ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+            ("GET", "https://speedkeiba.com/week/sprinters"): _load("speedkeiba_article.html"),
+        }
+    )
+    pages[("POST", KEIBABOOK_LOGINCHECK)] = _load("keibabook_logincheck_out.html")
+    client = _Web(pages)
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    chosen = scraper.training_for_race(RACE_ID, "スプリンターズＳ", ["サルヴァトーレ", "シー"])
+    assert chosen["サルヴァトーレ"].source == SOURCE_KEIBABOOK_SMART
+    assert chosen["サルヴァトーレ"].workouts[0].time == "66.6"
+    missed = chosen["シー"]
+    assert missed.workouts == []
+    assert missed.warning == TRAINING_LOGIN_FAILED
+    assert missed.source is None
+    assert all("/crireki" not in url and "syutuba" not in url for _method, url in client.calls)
+
+
+def test_malformed_crireki_drops_the_row_and_locked_history_stays_empty():
+    crireki = KEIBABOOK_CRIREKI.format(umacd="0000003")
+    client = _Web(
+        _member_pages(
+            {
+                ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load(
+                    "keibabook_cyokyo_absent.html"
+                ),
+                ("GET", KEIBABOOK_SYUTUBA.format(race_id=RACE_ID)): _load("keibabook_syutuba.html"),
+                ("GET", crireki): _load("keibabook_crireki_malformed.html"),
+                ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+            }
+        )
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    broken = scraper.training_for_race(RACE_ID, "未勝利", ["シー"])["シー"]
+    assert broken.workouts == []
+    assert broken.warning == TRAINING_TABLE_MALFORMED
+    assert "67.4" not in _dump(broken)
+
+    client.pages[("GET", crireki)] = _load("keibabook_crireki_locked.html")
+    scraper._login_state = None
+    locked = scraper.training_for_race(RACE_ID, "未勝利", ["シー"])["シー"]
+    assert locked.workouts == []
+    assert locked.warning == TRAINING_HISTORY_REQUIRES_LOGIN
+
+    client.pages[("GET", crireki)] = _load("keibabook_crireki_empty.html")
+    scraper._login_state = None
+    empty = scraper.training_for_race(RACE_ID, "未勝利", ["シー"])["シー"]
+    assert empty.warning == TRAINING_HISTORY_EMPTY
+    assert empty.workouts == []
+
+
+def test_login_form_without_a_token_does_not_pretend_success():
+    client = _Web(
+        {
+            ("GET", KEIBABOOK_LOGIN): "<html><form></form></html>",
+            ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load("keibabook_cyokyo.html"),
+            ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+        }
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    chosen = scraper.training_for_race(RACE_ID, "未勝利", ["サルヴァトーレ", "シー"])
+    assert chosen["サルヴァトーレ"].source == SOURCE_KEIBABOOK_SMART
+    assert chosen["シー"].workouts == []
+    assert chosen["シー"].warning == TRAINING_LOGIN_FAILED
+    assert all(method != "POST" for method, _url in client.calls)
+
+
+def test_anonymous_race_does_not_call_login_or_crireki():
+    client = _Web(
+        {
+            ("GET", KEIBABOOK_CYOKYO.format(race_id=RACE_ID)): _load("keibabook_cyokyo.html"),
+            ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+        }
+    )
+    scraper = TrainingScraper(http_client=client)  # type: ignore[arg-type]
+    chosen = scraper.training_for_race(RACE_ID, "未勝利", ["サルヴァトーレ"])
+    assert chosen["サルヴァトーレ"].source == SOURCE_KEIBABOOK_SMART
+    assert [method for method, _url in client.calls] == ["GET", "GET"]
+    assert all("login" not in url and "crireki" not in url for _method, url in client.calls)
+
+
+def test_horse_history_follows_the_matching_search_link_only():
+    crireki = KEIBABOOK_CRIREKI.format(umacd="0000003")
+    client = _Web(
+        _member_pages(
+            {
+                ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+                ("GET", "https://speedkeiba.com/week/sprinters"): _load(
+                    "speedkeiba_article_absent.html"
+                ),
+                ("GET", "https://speedkeiba.com/week/sirius"): _load(
+                    "speedkeiba_article_absent.html"
+                ),
+                ("GET", KEIBABOOK_HORSE_SEARCH): _load("keibabook_search_form.html"),
+                ("POST", KEIBABOOK_HORSE_SEARCH): _load("keibabook_search_multi.html"),
+                ("GET", crireki): _load("keibabook_crireki.html"),
+            }
+        )
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    training = scraper.training_for_horse("シー", birth_date=date(2022, 3, 4), sex="牡")
+    assert training.source == SOURCE_KEIBABOOK_CRIREKI
+    assert training.workouts[1].time == "67.4"
+    assert "99.9" not in _dump(training)
+    assert "2019105283" not in " ".join(url for _method, url in client.calls)
+    search = [data for url, data in client.posted if url == KEIBABOOK_HORSE_SEARCH][0]
+    assert search is not None
+    assert search["bamei"] == "シー"
+    assert search["_token"] == "search-token"
+
+    missed = scraper.training_for_horse("シー", birth_date=date(2019, 1, 1), sex="牡")
+    assert missed.workouts == []
+    assert missed.warning == TRAINING_UMACD_UNMAPPED
+    assert missed.source is None
+    urls = [url for _method, url in client.calls]
+    assert urls.count(crireki) == 1
+
+
+def test_profile_redirect_maps_umacd_only_when_the_printed_birth_date_matches():
+    crireki = KEIBABOOK_CRIREKI.format(umacd="0000003")
+    client = _Web(
+        _member_pages(
+            {
+                ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+                ("GET", "https://speedkeiba.com/week/sprinters"): _load(
+                    "speedkeiba_article_absent.html"
+                ),
+                ("GET", "https://speedkeiba.com/week/sirius"): _load(
+                    "speedkeiba_article_absent.html"
+                ),
+                ("GET", KEIBABOOK_HORSE_SEARCH): _load("keibabook_search_form.html"),
+                ("POST", KEIBABOOK_HORSE_SEARCH): _load("keibabook_horse_profile.html"),
+                ("GET", crireki): _load("keibabook_crireki.html"),
+            }
+        )
+    )
+    scraper = TrainingScraper(http_client=client, credentials=_MEMBER)  # type: ignore[arg-type]
+    training = scraper.training_for_horse("シー", birth_date=date(2022, 3, 4), sex="牡")
+    assert training.source == SOURCE_KEIBABOOK_CRIREKI
+    assert training.summary is not None
+    assert training.summary.arrow == "↗"
+    mismatch = scraper.training_for_horse("シー", birth_date=date(2022, 3, 5), sex="牡")
+    assert mismatch.warning == TRAINING_UMACD_UNMAPPED
+    assert mismatch.workouts == []
+    assert "99.9" not in _dump(training)
+
+
+def test_cookie_session_is_not_treated_as_login_when_logincheck_is_logged_out():
+    client = _Web(
+        {
+            ("POST", KEIBABOOK_LOGINCHECK): _load("keibabook_logincheck_out.html"),
+            ("GET", SPEEDKEIBA_INDEX): _load("speedkeiba_index.html"),
+            ("GET", "https://speedkeiba.com/week/sprinters"): _load(
+                "speedkeiba_article_absent.html"
+            ),
+            ("GET", "https://speedkeiba.com/week/sirius"): _load("speedkeiba_article_absent.html"),
+        }
+    )
+    scraper = TrainingScraper(
+        http_client=client,  # type: ignore[arg-type]
+        credentials=KeibabookCredentials(cookie="keibabook_session=abc"),
+    )
+    training = scraper.training_for_horse("シー", birth_date=date(2022, 3, 4), sex="牡")
+    assert training.workouts == []
+    assert training.warning == TRAINING_LOGIN_FAILED
+    assert client.headers["Cookie"] == "keibabook_session=abc"
+    assert all(url != KEIBABOOK_LOGIN for _method, url in client.calls)
+    assert all("/crireki" not in url for _method, url in client.calls)
+
+
+def test_get_horse_info_passes_birth_date_into_training_lookup():
+    from datetime import datetime
+
+    from backend.models.horse import Horse
+
+    seen: dict = {}
+
+    class _Net:
+        def get_horse_info(self, horse_id: str):
+            assert horse_id == "2019105283"
+            return Horse(
+                horse_id=horse_id,
+                horse_name="シー",
+                sex="牡",
+                birth_date=date(2022, 3, 4),
+                fetched_at=datetime(2026, 9, 28, 1, 2, 3),
+            )
+
+        def close(self) -> None:
+            return None
+
+    class _Training:
+        def training_for_horse(self, horse_name: str, **kwargs):
+            seen["name"] = horse_name
+            seen["kwargs"] = kwargs
+            return unavailable_training(TRAINING_HORSE_UNAVAILABLE)
+
+        def close(self) -> None:
+            return None
+
+    service = RaceService()
+    service._netkeiba_scraper = _Net()  # type: ignore[assignment]
+    service._training_scraper = _Training()  # type: ignore[assignment]
+    horse = service.get_horse_info("2019105283")
+    assert horse is not None
+    assert seen["name"] == "シー"
+    assert seen["kwargs"] == {"birth_date": date(2022, 3, 4), "sex": "牡"}
+    assert horse.training is not None
+    assert horse.training.warning == TRAINING_HORSE_UNAVAILABLE
+    assert "2019105283" not in _dump(horse.training)
 
 
 @pytest.mark.integration
@@ -436,3 +872,33 @@ def test_live_keibabook_clocks_are_copied_from_the_page():
                 assert split.time in html
         dumped = _dump(training)
         assert not re.search(r"単勝|人気", dumped)
+
+
+@pytest.mark.integration
+def test_live_anonymous_history_stays_locked_and_shutuba_links_are_real():
+    """Network check. Anonymous crireki has no clocks. Shutuba links supply umacd."""
+    from backend.scrapers.training_scraper import name_key
+    from backend.utils.http_client import HTTPClient
+
+    client = HTTPClient(min_request_interval=0.2)
+    try:
+        check = client.post(KEIBABOOK_LOGINCHECK, data={"motourl": "/"}, encoding="utf-8")
+        assert "ログインしていない" in check
+        history = client.get(KEIBABOOK_CRIREKI.format(umacd="0952386"), encoding="utf-8")
+        parsed = parse_keibabook_crireki(history)
+        assert parsed.workouts == []
+        assert parsed.warning == TRAINING_HISTORY_REQUIRES_LOGIN
+        shutuba = client.get(KEIBABOOK_SYUTUBA.format(race_id="202604040211"), encoding="utf-8")
+        mapping = parse_keibabook_syutuba(shutuba)
+        assert mapping[name_key("アドマイヤクワッズ")] == "0952386"
+    finally:
+        client.close()
+
+    creds = credentials_from_env()
+    if not creds.configured:
+        return
+    scraper = TrainingScraper(credentials=creds)
+    try:
+        assert scraper._ensure_login() == "in"
+    finally:
+        scraper.close()

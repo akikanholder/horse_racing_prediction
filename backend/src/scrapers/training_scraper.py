@@ -6,7 +6,12 @@
 
 匿名の応答に載っている馬だけを埋める。載っていない馬は null と、
 ログインが要るという warning。馬個別の調教履歴 ``/db/uma/{umacd}/crireki`` は
-ログイン無しでは本文が空で、netkeiba の馬ID とは別の番号なので取りにいかない。
+ログインしたセッションでのみ読む。``umacd`` は出馬表の馬名リンク、または
+馬検索の結果行 / 馬ページに印刷された生年月日が netkeiba と一致するときの
+リンクから取る。netkeiba の馬IDからは作らない。
+
+環境変数が無いときはログインしない。ログインチェックが「ログインしていない」
+のままなら、匿名の結果を維持し、成功したことにはしない。
 
 speedkeiba は今週の重賞記事。時計の行と、ページが印刷した ``(平均)`` と
 ``今走`` のラップだけを使う。``好調`` と ``凡走`` はページ自身が
@@ -14,8 +19,10 @@ speedkeiba は今週の重賞記事。時計の行と、ページが印刷した
 """
 
 import logging
+import os
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from urllib.parse import urljoin
@@ -23,15 +30,20 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Comment, Tag
 
 from backend.models.training import (
+    SOURCE_KEIBABOOK_CRIREKI,
     SOURCE_KEIBABOOK_SMART,
     SOURCE_SPEEDKEIBA,
     TRAINING_AMBIGUOUS,
     TRAINING_FETCH_FAILED,
+    TRAINING_HISTORY_EMPTY,
+    TRAINING_HISTORY_REQUIRES_LOGIN,
     TRAINING_HORSE_UNAVAILABLE,
+    TRAINING_LOGIN_FAILED,
     TRAINING_NOT_ON_EITHER,
     TRAINING_NOT_ON_KEIBABOOK,
     TRAINING_TABLE_MALFORMED,
     TRAINING_TABLE_NOT_FOUND,
+    TRAINING_UMACD_UNMAPPED,
     PublishedAverage,
     Training,
     TrainingLap,
@@ -45,19 +57,33 @@ from backend.scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
+KEIBABOOK_ORIGIN = "https://p.keibabook.co.jp"
 KEIBABOOK_CYOKYO = "https://p.keibabook.co.jp/cyuou/cyokyo/0/0/{race_id}"
+KEIBABOOK_SYUTUBA = "https://p.keibabook.co.jp/cyuou/syutuba/{race_id}"
+KEIBABOOK_CRIREKI = "https://p.keibabook.co.jp/db/uma/{umacd}/crireki"
+KEIBABOOK_LOGIN = "https://p.keibabook.co.jp/login/login"
+KEIBABOOK_LOGINCHECK = "https://p.keibabook.co.jp/logincheck/logincheck"
+KEIBABOOK_HORSE_SEARCH = "https://p.keibabook.co.jp/db/search/horse"
+ENV_KEIBABOOK_LOGIN_ID = "KEIBABOOK_LOGIN_ID"
+ENV_KEIBABOOK_PASSWORD = "KEIBABOOK_PASSWORD"
+ENV_KEIBABOOK_COOKIE = "KEIBABOOK_COOKIE"
 SPEEDKEIBA_ORIGIN = "https://speedkeiba.com"
 SPEEDKEIBA_INDEX = "https://speedkeiba.com/%E4%BB%8A%E9%80%B1%E3%81%AE%E3%83%AC%E3%83%BC%E3%82%B9/"
 _MAX_ARTICLES = 12
+
+_UMA_HREF = re.compile(r"/db/uma/(\d{5,})/?")
+_PROFILE_UMACD = re.compile(r"/db/uma/(\d{5,})/(?:seiseki|crireki|cyukan|kettou)")
+_FULL_DATE = re.compile(r"^[*＊]?\s*(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})")
+_PROFILE_BIRTH = re.compile(r"((?:19|20)\d{2})[./](\d{1,2})[./](\d{1,2})")
+_BIRTH_YEAR = re.compile(r"^(?:19|20)\d{2}$")
+_SEX = re.compile(r"[牡牝セ騸]")
 
 _RACE_ID = re.compile(r"^\d{12}$")
 _RACE_DATE = re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日")
 _MONTH_DAY = re.compile(r"^[*＊]?\s*(\d{1,2})/(\d{1,2})")
 _REPS = re.compile(r"^(\d+)回$")
 _CLOCK = re.compile(r"^\d+(?:\.\d+)?$")
-_CLOCK_ROW = re.compile(
-    r"^(?:\d+(?:\.\d+)?)(?:\s*[–—\-]\s*(?:\d+(?:\.\d+)?))*$"
-)
+_CLOCK_ROW = re.compile(r"^(?:\d+(?:\.\d+)?)(?:\s*[–—\-]\s*(?:\d+(?:\.\d+)?))*$")
 _RANK = re.compile(r"^[［\[]\s*(\d+)\s*[］\]]$")
 _YEAR = re.compile(r"20\d{2}")
 _KAI = re.compile(r"^第\d+回")
@@ -79,10 +105,63 @@ class TrainingPage:
     page_warning: str | None = None
 
 
+@dataclass(frozen=True)
+class KeibabookCredentials:
+    """Optional keibabook login. Blank fields are not a session."""
+
+    login_id: str = ""
+    password: str = ""
+    cookie: str = ""
+
+    def __repr__(self) -> str:
+        return f"KeibabookCredentials(configured={self.configured})"
+
+    @property
+    def password_login(self) -> bool:
+        return bool(self.login_id.strip()) and bool(self.password.strip())
+
+    @property
+    def configured(self) -> bool:
+        return self.password_login or bool(self.cookie.strip())
+
+
+@dataclass(frozen=True)
+class UmacdCandidate:
+    """One horse a keibabook page actually linked."""
+
+    umacd: str
+    name: str
+    birth_date: date | None = None
+    birth_year: int | None = None
+    sex: str | None = None
+
+
+def credentials_from_env(environ: Mapping[str, str] | None = None) -> KeibabookCredentials:
+    """Read login fields. Missing variables are empty, not a successful login."""
+    env = os.environ if environ is None else environ
+    return KeibabookCredentials(
+        login_id=env.get(ENV_KEIBABOOK_LOGIN_ID, ""),
+        password=env.get(ENV_KEIBABOOK_PASSWORD, ""),
+        cookie=env.get(ENV_KEIBABOOK_COOKIE, ""),
+    )
+
+
 def name_key(name: str) -> str:
     """Match 馬名 without spaces. Do not strip a prefix or invent an alias."""
     text = unicodedata.normalize("NFKC", name)
     return re.sub(r"\s+", "", text).casefold()
+
+
+def _normalize_sex(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = _SEX.search(text)
+    if match is None:
+        return None
+    sex = match.group(0)
+    if sex == "騸":
+        return "セ"
+    return sex
 
 
 def parse_keibabook_cyokyo(html: str) -> TrainingPage:
@@ -103,6 +182,237 @@ def parse_keibabook_cyokyo(html: str) -> TrainingPage:
     if not by_name:
         return TrainingPage(page_warning=TRAINING_TABLE_MALFORMED)
     return TrainingPage(by_name=by_name)
+
+
+def parse_keibabook_crireki(html: str) -> Training:
+    """One horse's 調教履歴. No table means no clocks."""
+    if not _has_workout_table(html):
+        if "調教履歴データがありません" in html:
+            return unavailable_training(TRAINING_HISTORY_EMPTY)
+        if _crireki_is_locked(html):
+            return unavailable_training(TRAINING_HISTORY_REQUIRES_LOGIN)
+        return unavailable_training(TRAINING_TABLE_NOT_FOUND)
+    page = parse_keibabook_cyokyo(html)
+    if page.page_warning:
+        return unavailable_training(page.page_warning)
+    if len(page.by_name) != 1:
+        return unavailable_training(TRAINING_AMBIGUOUS)
+    training = next(iter(page.by_name.values()))
+    if training.source == SOURCE_KEIBABOOK_SMART:
+        return training.model_copy(update={"source": SOURCE_KEIBABOOK_CRIREKI})
+    return training
+
+
+def parse_keibabook_syutuba(html: str) -> dict[str, str]:
+    """``name_key -> umacd`` from horse links. Pedigree ``/sanku`` links are ignored.
+
+    Two different umacd for one name are dropped. The id is the href, not a guess.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    found: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        if not isinstance(anchor, Tag):
+            continue
+        href = str(anchor.get("href") or "")
+        match = _UMA_HREF.fullmatch(href)
+        if match is None:
+            continue
+        umacd = str(anchor.get("umacd") or match.group(1))
+        if umacd != match.group(1):
+            continue
+        name = anchor.get_text(" ", strip=True)
+        if not name:
+            continue
+        key = name_key(name)
+        if key in ambiguous:
+            continue
+        previous = found.get(key)
+        if previous is not None and previous != umacd:
+            ambiguous.add(key)
+            del found[key]
+            continue
+        found[key] = umacd
+    return found
+
+
+def parse_keibabook_form_token(html: str) -> str | None:
+    """CSRF ``_token`` from a keibabook form. Absent on a page that is not the form."""
+    soup = BeautifulSoup(html, "lxml")
+    for node in soup.find_all("input"):
+        if not isinstance(node, Tag):
+            continue
+        if node.get("name") == "_token" and node.get("value"):
+            return str(node.get("value"))
+    return None
+
+
+def logincheck_authenticated(html: str) -> bool:
+    """True only when the logincheck body shows a session, not the logged-out prompt."""
+    if "ログインしていない" in html or "ログインして下さい" in html:
+        return False
+    return "ログアウト" in html or "/mypage/" in html
+
+
+def parse_keibabook_horse_search(html: str) -> list[UmacdCandidate]:
+    """Search rows, or the single profile the site opened for one name."""
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table", class_="search")
+    if isinstance(table, Tag):
+        return _search_candidates(table)
+    profile = parse_keibabook_horse_profile(html)
+    if profile is None:
+        return []
+    return [profile]
+
+
+def parse_keibabook_horse_profile(html: str) -> UmacdCandidate | None:
+    """Identity printed on a keibabook horse page, plus the umacd in its own links."""
+    soup = BeautifulSoup(html, "lxml")
+    title = soup.select_one("dt.kanzendata_uma h2")
+    if not isinstance(title, Tag):
+        return None
+    name = title.get_text(" ", strip=True)
+    umacd = _profile_umacd(html)
+    if not name or umacd is None:
+        return None
+    birth: date | None = None
+    sex: str | None = None
+    for node in soup.select("dt.kanzendata_uma p.other"):
+        if not isinstance(node, Tag):
+            continue
+        text = node.get_text(" ", strip=True)
+        if "生" not in text:
+            continue
+        match = _PROFILE_BIRTH.search(text)
+        if match:
+            try:
+                birth = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                birth = None
+        sex = _normalize_sex(text)
+    year = birth.year if birth is not None else None
+    return UmacdCandidate(umacd=umacd, name=name, birth_date=birth, birth_year=year, sex=sex)
+
+
+def _search_candidates(table: Tag) -> list[UmacdCandidate]:
+    headers = _search_headers(table)
+    name_at = _header_index(headers, "馬名")
+    year_at = _header_index(headers, "生年")
+    sex_at = _header_index(headers, "性別")
+    if name_at is None or year_at is None:
+        return []
+    candidates: list[UmacdCandidate] = []
+    for row in table.find_all("tr"):
+        if not isinstance(row, Tag):
+            continue
+        cells = [cell for cell in row.find_all("td") if isinstance(cell, Tag)]
+        if not cells or name_at >= len(cells) or year_at >= len(cells):
+            continue
+        anchor = cells[name_at].find("a", href=True)
+        if not isinstance(anchor, Tag):
+            continue
+        match = _UMA_HREF.fullmatch(str(anchor.get("href") or ""))
+        if match is None:
+            continue
+        umacd = str(anchor.get("umacd") or match.group(1))
+        if umacd != match.group(1):
+            continue
+        name = anchor.get_text(" ", strip=True)
+        year_text = cells[year_at].get_text(" ", strip=True)
+        if not name or _BIRTH_YEAR.fullmatch(year_text) is None:
+            continue
+        sex = None
+        if sex_at is not None and sex_at < len(cells):
+            sex = _normalize_sex(cells[sex_at].get_text(" ", strip=True))
+        candidates.append(
+            UmacdCandidate(
+                umacd=umacd,
+                name=name,
+                birth_date=None,
+                birth_year=int(year_text),
+                sex=sex,
+            )
+        )
+    return candidates
+
+
+def _search_headers(table: Tag) -> list[str]:
+    thead = table.find("thead")
+    if isinstance(thead, Tag):
+        cells = [cell for cell in thead.find_all("th") if isinstance(cell, Tag)]
+        if cells:
+            return [re.sub(r"\s+", "", cell.get_text()) for cell in cells]
+    return []
+
+
+def _header_index(headers: list[str], label: str) -> int | None:
+    for index, header in enumerate(headers):
+        if header == label:
+            return index
+    return None
+
+
+def _profile_umacd(html: str) -> str | None:
+    found = list(dict.fromkeys(_PROFILE_UMACD.findall(html)))
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def _has_workout_table(html: str) -> bool:
+    return "cyokyodata" in html
+
+
+def _crireki_is_locked(html: str) -> bool:
+    return (
+        "ログインしていない" in html
+        or "ログインして下さい" in html
+        or 'id="web_web"' in html
+        or "調教履歴" in html
+    )
+
+
+def select_umacd(
+    candidates: list[UmacdCandidate],
+    horse_name: str,
+    birth_date: date | None,
+    sex: str | None,
+) -> str | None:
+    """One umacd when the page's name and birth match. Otherwise none."""
+    caller_year = birth_date.year if birth_date is not None else None
+    caller_sex = _normalize_sex(sex)
+    if caller_sex == "不明":
+        caller_sex = None
+    if birth_date is None and caller_year is None:
+        return None
+    matches: list[str] = []
+    for candidate in candidates:
+        if name_key(candidate.name) != name_key(horse_name):
+            continue
+        if not _birth_matches(candidate, birth_date, caller_year):
+            continue
+        candidate_sex = _normalize_sex(candidate.sex)
+        if caller_sex and candidate_sex and caller_sex != candidate_sex:
+            continue
+        matches.append(candidate.umacd)
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0]
+    return None
+
+
+def _birth_matches(
+    candidate: UmacdCandidate, birth_date: date | None, caller_year: int | None
+) -> bool:
+    if candidate.birth_date is not None and birth_date is not None:
+        return candidate.birth_date == birth_date
+    year = candidate.birth_year
+    if year is None and candidate.birth_date is not None:
+        year = candidate.birth_date.year
+    if year is None or caller_year is None:
+        return False
+    return year == caller_year
 
 
 def parse_speedkeiba_article(html: str) -> TrainingPage:
@@ -166,14 +476,99 @@ class TrainingScraper(BaseScraper):
 
     ENCODING = "utf-8"
 
-    def training_for_horse(self, horse_name: str) -> Training:
-        """speedkeiba weekly articles, matched on the h4 horse name.
+    def __init__(
+        self,
+        http_client=None,
+        credentials: KeibabookCredentials | None = None,
+    ):
+        """Initialize the scraper.
 
-        競馬ブックの馬個別履歴はログインが要り、馬IDも netkeiba と違う。
-        記事が無ければその旨の warning。時計は作らない。
+        Args:
+            http_client: HTTP client. A new one is created when omitted.
+            credentials: Keibabook login. Omitted means anonymous, even if env vars exist.
+                RaceService passes ``credentials_from_env()``.
+        """
+        super().__init__(http_client)
+        self.credentials = credentials or KeibabookCredentials()
+        self._login_state: str | None = None
+
+    def training_for_horse(
+        self,
+        horse_name: str,
+        *,
+        birth_date: date | None = None,
+        sex: str | None = None,
+    ) -> Training:
+        """speedkeiba by horse name, then keibabook history when login is real.
+
+        Without credentials this stays on speedkeiba. ``umacd`` comes from a
+        search row or profile link whose printed birth matches ``birth_date``.
+        The netkeiba horse id is not an umacd.
         """
         if not horse_name or horse_name == "不明":
             return unavailable_training(TRAINING_HORSE_UNAVAILABLE)
+        speed = self._training_from_speedkeiba(horse_name)
+        login = self._ensure_login()
+        if login != "in":
+            if (
+                login == "failed"
+                and not _has_time(speed)
+                and speed.warning != TRAINING_FETCH_FAILED
+                and speed.warning != TRAINING_TABLE_MALFORMED
+                and speed.warning != TRAINING_AMBIGUOUS
+            ):
+                return unavailable_training(TRAINING_LOGIN_FAILED)
+            return speed
+        umacd = self._resolve_umacd(horse_name, birth_date, sex)
+        if umacd is None:
+            if _has_time(speed) or _kept_summary(speed):
+                return speed
+            if speed.warning in {
+                TRAINING_AMBIGUOUS,
+                TRAINING_TABLE_MALFORMED,
+                TRAINING_FETCH_FAILED,
+            }:
+                return speed
+            return unavailable_training(TRAINING_UMACD_UNMAPPED)
+        history = self._fetch_crireki(umacd)
+        if _has_time(history):
+            return history
+        if history.warning == TRAINING_TABLE_MALFORMED:
+            return history
+        if _has_time(speed) or _kept_summary(speed):
+            return speed
+        if speed.warning == TRAINING_AMBIGUOUS:
+            return speed
+        return history
+
+    def training_for_race(
+        self, race_id: str, race_name: str, horse_names: list[str]
+    ) -> dict[str, Training]:
+        """Keibabook clocks when that horse is on the page, else a speedkeiba article.
+
+        A logged-in session also reads ``/db/uma/{umacd}/crireki`` for horses
+        the anonymous 調教 page skipped. ``umacd`` is the shutuba horse-name link.
+        """
+        login = self._ensure_login()
+        keibabook, kb_warning = self._load_keibabook(race_id)
+        histories: dict[str, Training] = {}
+        if login == "in" and _RACE_ID.fullmatch(race_id):
+            histories = self._load_crireki_for_race(race_id, horse_names, keibabook)
+        speed, speed_checked = self._load_speed_for_race(race_name)
+        chosen: dict[str, Training] = {}
+        for horse_name in horse_names:
+            chosen[horse_name] = _choose_training(
+                horse_name,
+                keibabook,
+                kb_warning,
+                speed,
+                speed_checked,
+                crireki=histories.get(horse_name),
+                login_state=login,
+            )
+        return chosen
+
+    def _training_from_speedkeiba(self, horse_name: str) -> Training:
         try:
             index_html = self.http_client.get(SPEEDKEIBA_INDEX, encoding=self.ENCODING)
         except Exception as e:
@@ -212,22 +607,104 @@ class TrainingScraper(BaseScraper):
             return unavailable_training(TRAINING_FETCH_FAILED)
         return unavailable_training(TRAINING_HORSE_UNAVAILABLE)
 
-    def training_for_race(
-        self, race_id: str, race_name: str, horse_names: list[str]
-    ) -> dict[str, Training]:
-        """Keibabook clocks when that horse is on the page, else a speedkeiba article."""
-        keibabook, kb_warning = self._load_keibabook(race_id)
-        speed, speed_checked = self._load_speed_for_race(race_name)
-        chosen: dict[str, Training] = {}
-        for horse_name in horse_names:
-            chosen[horse_name] = _choose_training(
-                horse_name,
-                keibabook,
-                kb_warning,
-                speed,
-                speed_checked,
+    def _ensure_login(self) -> str:
+        """``anonymous`` when creds are absent, ``in`` or ``failed`` after logincheck."""
+        if self._login_state is not None:
+            return self._login_state
+        creds = self.credentials
+        if not creds.configured:
+            self._login_state = "anonymous"
+            return "anonymous"
+        try:
+            if creds.password_login:
+                form = self.http_client.get(KEIBABOOK_LOGIN, encoding=self.ENCODING)
+                token = parse_keibabook_form_token(form)
+                if not token:
+                    self._login_state = "failed"
+                    return "failed"
+                self.http_client.post(
+                    KEIBABOOK_LOGIN,
+                    data={
+                        "_token": token,
+                        "referer": "",
+                        "service": "keibabook",
+                        "login_id": creds.login_id.strip(),
+                        "pswd": creds.password,
+                    },
+                    encoding=self.ENCODING,
+                )
+            else:
+                self.http_client.update_headers({"Cookie": creds.cookie.strip()})
+            check = self.http_client.post(
+                KEIBABOOK_LOGINCHECK,
+                data={"motourl": "/"},
+                encoding=self.ENCODING,
             )
-        return chosen
+        except Exception as e:
+            logger.error("Keibabook login failed: %s", e)
+            self._login_state = "failed"
+            return "failed"
+        if logincheck_authenticated(check):
+            self._login_state = "in"
+            return "in"
+        logger.info("Keibabook logincheck still shows a logged-out session")
+        self._login_state = "failed"
+        return "failed"
+
+    def _resolve_umacd(
+        self, horse_name: str, birth_date: date | None, sex: str | None
+    ) -> str | None:
+        try:
+            form = self.http_client.get(KEIBABOOK_HORSE_SEARCH, encoding=self.ENCODING)
+        except Exception as e:
+            logger.error("Failed to open keibabook horse search: %s", e)
+            return None
+        token = parse_keibabook_form_token(form)
+        data = {"bamei": horse_name}
+        if token:
+            data["_token"] = token
+        try:
+            html = self.http_client.post(KEIBABOOK_HORSE_SEARCH, data=data, encoding=self.ENCODING)
+        except Exception as e:
+            logger.error("Failed to search keibabook horse %s: %s", horse_name, e)
+            return None
+        return select_umacd(parse_keibabook_horse_search(html), horse_name, birth_date, sex)
+
+    def _load_crireki_for_race(
+        self,
+        race_id: str,
+        horse_names: list[str],
+        keibabook: dict[str, Training],
+    ) -> dict[str, Training]:
+        url = KEIBABOOK_SYUTUBA.format(race_id=race_id)
+        try:
+            html = self.http_client.get(url, encoding=self.ENCODING)
+        except Exception as e:
+            logger.error("Failed to fetch keibabook shutuba for %s: %s", race_id, e)
+            return {
+                name: unavailable_training(TRAINING_FETCH_FAILED)
+                for name in horse_names
+                if not _has_time(keibabook.get(name_key(name)))
+            }
+        mapping = parse_keibabook_syutuba(html)
+        histories: dict[str, Training] = {}
+        for horse_name in horse_names:
+            if _has_time(keibabook.get(name_key(horse_name))):
+                continue
+            umacd = mapping.get(name_key(horse_name))
+            if umacd is None:
+                continue
+            histories[horse_name] = self._fetch_crireki(umacd)
+        return histories
+
+    def _fetch_crireki(self, umacd: str) -> Training:
+        url = KEIBABOOK_CRIREKI.format(umacd=umacd)
+        try:
+            html = self.http_client.get(url, encoding=self.ENCODING)
+        except Exception as e:
+            logger.error("Failed to fetch keibabook training history %s: %s", umacd, e)
+            return unavailable_training(TRAINING_FETCH_FAILED)
+        return parse_keibabook_crireki(html)
 
     def _load_keibabook(self, race_id: str) -> tuple[dict[str, Training], str | None]:
         if _RACE_ID.fullmatch(race_id) is None:
@@ -270,21 +747,38 @@ def _choose_training(
     kb_warning: str | None,
     speed: dict[str, Training],
     speed_checked: bool,
+    crireki: Training | None = None,
+    login_state: str = "anonymous",
 ) -> Training:
     kb = keibabook.get(name_key(horse_name))
     sp = speed.get(name_key(horse_name))
     if _has_time(kb):
         return kb  # type: ignore[return-value]
+    if _has_time(crireki):
+        return crireki  # type: ignore[return-value]
     if _has_time(sp):
         return sp  # type: ignore[return-value]
     if kb is not None and kb.warning == TRAINING_TABLE_MALFORMED:
         return kb
+    if crireki is not None and crireki.warning == TRAINING_TABLE_MALFORMED:
+        return crireki
     if kb is not None and kb.summary is not None and kb.warning != TRAINING_TABLE_MALFORMED:
         return kb
+    if _kept_summary(crireki):
+        return crireki  # type: ignore[return-value]
     if sp is not None and sp.summary is not None:
         return sp
-    if kb_warning == TRAINING_FETCH_FAILED and not speed_checked:
+    if kb_warning == TRAINING_FETCH_FAILED and not speed_checked and crireki is None:
         return unavailable_training(TRAINING_FETCH_FAILED)
+    if crireki is not None and crireki.warning == TRAINING_FETCH_FAILED:
+        return crireki
+    if login_state == "failed":
+        return unavailable_training(TRAINING_LOGIN_FAILED)
+    if crireki is not None and crireki.warning in {
+        TRAINING_HISTORY_EMPTY,
+        TRAINING_HISTORY_REQUIRES_LOGIN,
+    }:
+        return crireki
     if kb_warning == TRAINING_TABLE_MALFORMED and not _has_time(sp):
         return unavailable_training(TRAINING_TABLE_MALFORMED)
     if speed_checked:
@@ -292,6 +786,17 @@ def _choose_training(
     if kb_warning == TRAINING_TABLE_NOT_FOUND:
         return unavailable_training(TRAINING_TABLE_NOT_FOUND)
     return unavailable_training(kb_warning or TRAINING_NOT_ON_KEIBABOOK)
+
+
+def _kept_summary(training: Training | None) -> bool:
+    if training is None or training.warning == TRAINING_TABLE_MALFORMED:
+        return False
+    summary = training.summary
+    if summary is None:
+        return False
+    return bool(
+        summary.comment or summary.arrow or summary.evaluation or summary.average or summary.laps
+    )
 
 
 def _has_time(training: Training | None) -> bool:
@@ -356,9 +861,7 @@ def _read_keibabook_table(table: Tag, race_day: date | None) -> list[tuple[str, 
     return horses
 
 
-def _read_cyokyodata(
-    table: Tag, race_day: date | None
-) -> tuple[list[Workout], bool]:
+def _read_cyokyodata(table: Tag, race_day: date | None) -> tuple[list[Workout], bool]:
     headers = _header_cells(table)
     columns = _column_index(headers)
     if columns is None:
@@ -553,9 +1056,20 @@ def _rank_in_group(text: str) -> int | None:
 
 
 def _resolve_date(label: str | None, race_day: date | None) -> tuple[date | None, bool | None]:
-    """A full date only when the page has a race day to pin the year. ``■`` stays null."""
+    """A full date from the cell, or month/day when the page prints a race day.
+
+    ``■`` stays null. A month/day with no year on the page stays null.
+    """
     if not label:
         return None, None
+    full = _FULL_DATE.match(label)
+    if full:
+        try:
+            parsed = date(int(full.group(1)), int(full.group(2)), int(full.group(3)))
+        except ValueError:
+            return None, None
+        long_gap = label.startswith("*") or label.startswith("＊")
+        return parsed, long_gap
     match = _MONTH_DAY.match(label)
     if match is None or race_day is None:
         return None, None

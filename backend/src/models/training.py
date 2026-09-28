@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 SOURCE_SPEEDKEIBA = "speedkeiba"
 SOURCE_KEIBABOOK_SMART = "keibabook_smart"
+SOURCE_KEIBABOOK_CRIREKI = "keibabook_crireki"
 
 TRAINING_FETCH_FAILED = "training fetch failed"
 TRAINING_TABLE_NOT_FOUND = "training table not found"
@@ -21,6 +22,10 @@ TRAINING_HORSE_UNAVAILABLE = (
 TRAINING_AMBIGUOUS = "training ambiguous on speedkeiba"
 TRAINING_THIN = "training sample thin"
 TRAINING_NOT_LOADED = "training not loaded"
+TRAINING_LOGIN_FAILED = "training keibabook login failed"
+TRAINING_HISTORY_EMPTY = "training history empty on keibabook"
+TRAINING_HISTORY_REQUIRES_LOGIN = "training history requires keibabook login"
+TRAINING_UMACD_UNMAPPED = "training unavailable: keibabook umacd was not on a source page"
 
 _HARD_WARNINGS = frozenset(
     {
@@ -32,6 +37,10 @@ _HARD_WARNINGS = frozenset(
         TRAINING_HORSE_UNAVAILABLE,
         TRAINING_AMBIGUOUS,
         TRAINING_NOT_LOADED,
+        TRAINING_LOGIN_FAILED,
+        TRAINING_HISTORY_EMPTY,
+        TRAINING_HISTORY_REQUIRES_LOGIN,
+        TRAINING_UMACD_UNMAPPED,
     }
 )
 
@@ -67,7 +76,9 @@ class TrainingSummary(BaseModel):
     arrow: str | None = Field(None, description="矢印。→ などをそのまま。評価点にはしない")
     evaluation: str | None = Field(None, description="speedkeiba が印字した評価文")
     average: PublishedAverage | None = Field(None, description="ページにある平均行")
-    laps: list[TrainingLap] = Field(default_factory=list, description="今走のラップ。好調・凡走は入れない")
+    laps: list[TrainingLap] = Field(
+        default_factory=list, description="今走のラップ。好調・凡走は入れない"
+    )
 
 
 class Workout(BaseModel):
@@ -79,9 +90,7 @@ class Workout(BaseModel):
     distance: str | None = Field(
         None, description="時計が入っている一番長い列の名前。列名が無い行は null"
     )
-    time: str | None = Field(
-        None, description="distance の時計、または列名の無い行の時計文字列"
-    )
+    time: str | None = Field(None, description="distance の時計、または列名の無い行の時計文字列")
     condition: str | None = Field(None, description="馬場。良、稍重、不。ページの略記のまま")
     rank_in_group: int | None = Field(None, description="回り位置。［８］なら 8。空なら null")
     rider: str | None = Field(None, description="騎乗者")
@@ -111,7 +120,8 @@ class Training(BaseModel):
         None, description="ページが載せている短評・矢印・平均・今走ラップ"
     )
     source: str | None = Field(
-        None, description="speedkeiba / keibabook_smart。取れないときは null"
+        None,
+        description="speedkeiba / keibabook_smart / keibabook_crireki。取れないときは null",
     )
     data_sufficiency: str = Field(
         ...,

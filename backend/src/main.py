@@ -254,7 +254,9 @@ async def get_race_horses(race_id: str):
     ``track_bias`` は出馬表にある競馬場・芝/ダート・距離・馬場状態を写す。
     内外とペースは accessD か JRA 馬場情報にラベルがあるときだけ。無いときは null と warning。
     ``training`` は競馬ブックの調教ページにその馬があるとき、無ければ speedkeiba の重賞記事。
-    匿名ページに無い馬は null。競馬ブックのログインが要る履歴は作らない。
+    ``KEIBABOOK_LOGIN_ID`` と ``KEIBABOOK_PASSWORD``（または ``KEIBABOOK_COOKIE``）があり
+    ログインチェックが成功したときだけ、出馬表リンクの umacd で調教履歴を補う。
+    認証が無い、失敗、対応するリンクが無い馬は null。
 
     Args:
         race_id: レースID
@@ -321,8 +323,10 @@ async def get_horse(horse_id: str):
     ``running_style`` は performances の通過順の最初の数字。3走未満や同数は label が null。
     ``track_bias`` は馬単体には開催日が無いので条件もバイアスも null。
     warning は day-of track bias unavailable without a race card。
-    ``training`` は speedkeiba の今週の重賞記事で馬名が一致したときだけ。
-    記事に無いとき、および競馬ブックの馬個別履歴はログインが要るので null。
+    ``training`` は speedkeiba の今週の重賞記事で馬名が一致したとき。
+    環境変数で競馬ブックにログインできたときは、馬検索のリンクと生年月日が
+    netkeiba のプロフィールと一致した umacd の調教履歴も使う。
+    一致しない、認証が無い、ログインに失敗したときは null。
 
     Args:
         horse_id: 馬ID

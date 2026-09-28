@@ -22,7 +22,7 @@ from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publicati
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
-from backend.scrapers.training_scraper import TrainingScraper
+from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -314,9 +314,13 @@ class RaceService:
 
     @property
     def training_scraper(self) -> TrainingScraper:
-        """Get or create the training client (競馬ブック and speedkeiba)."""
+        """Get or create the training client (競馬ブック and speedkeiba).
+
+        Keibabook login is attempted only when ``KEIBABOOK_LOGIN_ID`` and
+        ``KEIBABOOK_PASSWORD`` are set, or when ``KEIBABOOK_COOKIE`` is set.
+        """
         if self._training_scraper is None:
-            self._training_scraper = TrainingScraper()
+            self._training_scraper = TrainingScraper(credentials=credentials_from_env())
         return self._training_scraper
 
     def get_horse_info(self, horse_id: str) -> Horse | None:
@@ -324,8 +328,9 @@ class RaceService:
 
         ``performances`` are past runs from the horse result page. They are not
         the result of a race being predicted. ``training`` is this week's
-        speedkeiba article when the horse name is on it. Keibabook's per-horse
-        history needs a login, so a miss stays null.
+        speedkeiba article when the horse name is on it. When keibabook login
+        succeeds, ``/db/uma/{umacd}/crireki`` is used if a search row or profile
+        page links that umacd and prints the same birth date. A miss stays null.
 
         Args:
             horse_id: Horse ID
@@ -341,7 +346,11 @@ class RaceService:
         if horse is None:
             return None
         try:
-            training = self.training_scraper.training_for_horse(horse.horse_name)
+            training = self.training_scraper.training_for_horse(
+                horse.horse_name,
+                birth_date=horse.birth_date,
+                sex=horse.sex,
+            )
         except Exception as e:
             logger.error("Failed to get training for %s: %s", horse_id, e)
             training = unavailable_training(TRAINING_FETCH_FAILED)
@@ -356,9 +365,10 @@ class RaceService:
         card's venue, surface, distance, and going. Inside/outside and pace
         bias are copied only when accessD or JRA baba prints those labels.
         ``training`` is the keibabook workout table for this
-        race when that horse is on the anonymous page, otherwise the speedkeiba
-        article whose title is this race. Clocks that are not on those pages
-        stay null.
+        race when that horse is on the page. A logged-in session also reads
+        each missing horse's crireki, using the umacd on the shutuba name link.
+        Otherwise the speedkeiba article whose title is this race.
+        Clocks that are not on those pages stay null.
 
         Args:
             race_id: Race ID
