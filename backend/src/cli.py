@@ -214,7 +214,7 @@ def _print_training(training: Training | None) -> None:
 
 
 def _print_track_bias(bias: TrackBias) -> None:
-    """Conditions that were on the page, and the reason bias itself is null."""
+    """Conditions from the race page, and bias labels copied from official pages."""
     bits: list[str] = []
     if bias.venue:
         bits.append(bias.venue)
@@ -227,7 +227,11 @@ def _print_track_bias(bias: TrackBias) -> None:
     if bias.going:
         bits.append(f"馬場:{bias.going}")
     condition = " ".join(bits) if bits else "開催条件なし"
-    print(f"トラックバイアス: 内外なし / ペースバイアスなし（{condition}）")
+    inside = bias.inside_outside or "なし"
+    pace = bias.pace_bias or "なし"
+    source = f" [{bias.source}]" if bias.source else ""
+    print(f"トラックバイアス: 内外 {inside} / ペース {pace}（{condition}）{source}")
+    print(f"バイアス充足: {bias.data_sufficiency}")
     if bias.warning:
         print(f"バイアス警告: {bias.warning}")
 
@@ -486,7 +490,8 @@ def main():
         help="出馬表を取得",
         description=(
             "出馬表。race.track_bias はページにある競馬場・芝/ダート・距離・馬場状態を写す。"
-            "内外と先行有利などの当日バイアスは accessD/JRADB が無く null。"
+            "内外とペースは accessD/JRADB と JRA 馬場情報にそのラベルがあるときだけ。"
+            "外回り・使用コース・芝の傷み・オッズからは作らず、無いときは null。"
         ),
     )
     card_parser.add_argument("race_id", help="レースID")
@@ -502,7 +507,7 @@ def main():
             "血統がページに無いときは null と warning。脚質はオッズやレース名からは作らない。"
             "調教は speedkeiba の今週の重賞記事。記事に馬名が無いときは null。"
             "競馬ブックの馬個別履歴はログインが要るので埋めない。"
-            "当日のトラックバイアスは出さない（accessD/JRADB が無く、warning 付きの null）。"
+            "当日のトラックバイアスは出さない（開催日が無いので accessD/JRADB を開かず、warning 付きの null）。"
             "馬場状態・芝ダート・距離は近走の各行と、出馬表の race.track_bias にある。"
         ),
     )

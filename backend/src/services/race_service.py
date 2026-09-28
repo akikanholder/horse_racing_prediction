@@ -15,8 +15,10 @@ from backend.models.race import (
     RaceWithResults,
     SettledRaceResult,
     horse_track_bias,
+    track_bias_from_race,
 )
 from backend.models.training import TRAINING_FETCH_FAILED, unavailable_training
+from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publication
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
@@ -34,6 +36,7 @@ class RaceService:
         self._netkeiba_scraper: NetkeibaScraper | None = None
         self._odds_scraper: NetkeibaOddsScraper | None = None
         self._training_scraper: TrainingScraper | None = None
+        self._day_of_bias: DayOfBiasClient | None = None
 
     @property
     def jra_scraper(self) -> JRAScraper:
@@ -168,7 +171,7 @@ class RaceService:
                 e,
             )
 
-        return self._merge_race_cards(netkeiba_card, jra_card)
+        return self._attach_day_of_bias(self._merge_race_cards(netkeiba_card, jra_card))
 
     def get_race_export_bundle(self, race_id: str) -> tuple[RaceCard | None, list[RaceResult]]:
         """Load a race card and its results without fetching the card twice.
@@ -349,9 +352,10 @@ class RaceService:
 
         ``recent_performances`` is that horse's past runs, not this race's result.
         Pedigree comes from ``/horse/ped/{horse_id}/``. Running style is derived
-        only from those near runs (at most five). ``track_bias`` copies the
+        only from those near runs (at most five).         ``track_bias`` copies the
         card's venue, surface, distance, and going. Inside/outside and pace
-        bias stay null. ``training`` is the keibabook workout table for this
+        bias are copied only when accessD or JRA baba prints those labels.
+        ``training`` is the keibabook workout table for this
         race when that horse is on the anonymous page, otherwise the speedkeiba
         article whose title is this race. Clocks that are not on those pages
         stay null.
@@ -369,6 +373,9 @@ class RaceService:
             if not race_card:
                 return horses
 
+            race_card = self._attach_day_of_bias(race_card)
+            if race_card is None:
+                return horses
             bias = race_card.race.track_bias or horse_track_bias()
             names = [
                 entry.horse_name
@@ -492,6 +499,35 @@ class RaceService:
         if race.entry_count is None and entries:
             race = race.model_copy(update={"entry_count": len(entries)})
         return RaceCard(race=race, entries=entries)
+
+    @property
+    def day_of_bias(self) -> DayOfBiasClient:
+        """Official pre-race bias client. Shares the accessD cache with JRA."""
+        if self._day_of_bias is None:
+            self._day_of_bias = DayOfBiasClient(self.jra_scraper)
+        return self._day_of_bias
+
+    def _attach_day_of_bias(self, card: RaceCard | None) -> RaceCard | None:
+        """Fill inside/outside and pace from official pages. Misses stay null."""
+        if card is None:
+            return None
+        try:
+            publication = self.day_of_bias.publication_for(card.race)
+        except Exception as e:
+            logger.warning("Day-of track bias lookup failed for %s: %s", card.race.race_id, e)
+            publication = fetch_failed_publication()
+        current = card.race.track_bias or track_bias_from_race(card.race)
+        bias = current.model_copy(
+            update={
+                "inside_outside": publication.inside_outside,
+                "pace_bias": publication.pace_bias,
+                "source": publication.source,
+                "warning": publication.warning,
+                "data_sufficiency": publication.data_sufficiency,
+            }
+        )
+        race = card.race.model_copy(update={"track_bias": bias})
+        return card.model_copy(update={"race": race})
 
     def _merge_entries(
         self, primary: list[RaceEntry], secondary: list[RaceEntry]

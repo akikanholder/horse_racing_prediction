@@ -190,7 +190,8 @@ class HorseBasicInfo(BaseModel):
     track_bias: TrackBias = Field(
         default_factory=horse_track_bias,
         description=(
-            "このレースの馬場条件と、当日バイアスが無いという warning。内外とペースバイアスは null"
+            "このレースの馬場条件と、accessD / JRA 馬場情報にラベルがあるときの当日バイアス。"
+            "ラベルが無いときは null と warning"
         ),
     )
     training: Training | None = Field(

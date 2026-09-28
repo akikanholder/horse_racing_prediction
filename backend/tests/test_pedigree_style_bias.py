@@ -24,6 +24,7 @@ from backend.models.horse import (
     PedigreeHorse,
 )
 from backend.models.race import (
+    TRACK_BIAS_NOT_LOADED,
     TRACK_BIAS_UNAVAILABLE,
     Race,
     RaceCard,
@@ -38,6 +39,10 @@ from backend.models.running_style import (
     derive_running_style,
 )
 from backend.models.training import TRAINING_NOT_ON_KEIBABOOK, unavailable_training
+from backend.scrapers.day_of_bias import (
+    TRACK_BIAS_NOT_PUBLISHED,
+    DayOfBiasPublication,
+)
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.services.race_service import RaceService
 
@@ -488,7 +493,8 @@ def test_race_card_copies_conditions_and_leaves_bias_null():
     assert bias.inside_outside is None
     assert bias.pace_bias is None
     assert bias.source is None
-    assert bias.warning == TRACK_BIAS_UNAVAILABLE
+    assert bias.data_sufficiency == "unavailable"
+    assert bias.warning == TRACK_BIAS_NOT_LOADED
 
     blank = RaceCard(
         race=Race(
@@ -508,7 +514,8 @@ def test_race_card_copies_conditions_and_leaves_bias_null():
     assert blank.race.track_bias.surface is None
     assert blank.race.track_bias.distance is None
     assert blank.race.track_bias.going is None
-    assert blank.race.track_bias.warning == TRACK_BIAS_UNAVAILABLE
+    assert blank.race.track_bias.warning == TRACK_BIAS_NOT_LOADED
+    assert blank.race.track_bias.data_sufficiency == "unavailable"
 
 
 def test_schedule_race_does_not_invent_track_bias():
@@ -577,9 +584,21 @@ def test_race_horses_payload_includes_pedigree_style_and_race_bias():
         def close(self) -> None:
             return None
 
+    class _Bias:
+        def publication_for(self, race: Race) -> DayOfBiasPublication:
+            assert race.venue == "中山"
+            return DayOfBiasPublication(
+                inside_outside=None,
+                pace_bias=None,
+                source=None,
+                warning=TRACK_BIAS_NOT_PUBLISHED,
+                data_sufficiency="unavailable",
+            )
+
     service = RaceService()
     service._netkeiba_scraper = Scraper()  # type: ignore[assignment]
     service._training_scraper = _Training()  # type: ignore[assignment]
+    service._day_of_bias = _Bias()  # type: ignore[assignment]
     horses = service.get_horses_for_race("202609280601")
     assert len(horses) == 1
     horse = horses[0]
@@ -597,7 +616,10 @@ def test_race_horses_payload_includes_pedigree_style_and_race_bias():
     assert horse.track_bias.surface == "ダート"
     assert horse.track_bias.distance == 1200
     assert horse.track_bias.inside_outside is None
-    assert horse.track_bias.warning == TRACK_BIAS_UNAVAILABLE
+    assert horse.track_bias.pace_bias is None
+    assert horse.track_bias.source is None
+    assert horse.track_bias.data_sufficiency == "unavailable"
+    assert horse.track_bias.warning == TRACK_BIAS_NOT_PUBLISHED
     assert horse.training is not None
     assert horse.training.workouts == []
     assert horse.training.warning == TRAINING_NOT_ON_KEIBABOOK

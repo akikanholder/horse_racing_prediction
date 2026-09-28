@@ -137,7 +137,8 @@ async def get_race_card(race_id: str):
         race_id: レースID
 
     ``race.track_bias`` はページにある競馬場・芝/ダート・距離・馬場状態。
-    内外と先行有利は null。warning は day-of track bias unavailable without accessD/JRADB。
+    内外とペースは accessD か JRA 馬場情報のラベルがあるときだけ。
+    無いときは null と warning。
 
     Returns:
         RaceCard: 出馬表（レース情報と出走馬リスト）
@@ -251,7 +252,7 @@ async def get_race_horses(race_id: str):
     ``pedigree`` は ``/horse/ped/{horse_id}/`` の父・母・母父。無い祖先は null。
     ``running_style`` はその近走最大5走の通過順だけから集計する。オッズやレース名からは作らない。
     ``track_bias`` は出馬表にある競馬場・芝/ダート・距離・馬場状態を写す。
-    内外とペースバイアスは null で、warning は day-of track bias unavailable without accessD/JRADB。
+    内外とペースは accessD か JRA 馬場情報にラベルがあるときだけ。無いときは null と warning。
     ``training`` は競馬ブックの調教ページにその馬があるとき、無ければ speedkeiba の重賞記事。
     匿名ページに無い馬は null。競馬ブックのログインが要る履歴は作らない。
 
@@ -318,7 +319,8 @@ async def get_horse(horse_id: str):
     ``pedigree`` はプロフィール表と ``/horse/ped/{horse_id}/`` の血統表。
     父・母が取れないときは null と pedigree.warning。レース名からは埋めない。
     ``running_style`` は performances の通過順の最初の数字。3走未満や同数は label が null。
-    ``track_bias`` は馬単体には開催日が無いので条件もバイアスも null。同じ warning。
+    ``track_bias`` は馬単体には開催日が無いので条件もバイアスも null。
+    warning は day-of track bias unavailable without a race card。
     ``training`` は speedkeiba の今週の重賞記事で馬名が一致したときだけ。
     記事に無いとき、および競馬ブックの馬個別履歴はログインが要るので null。
 

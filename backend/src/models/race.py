@@ -1,20 +1,25 @@
 """Race data models."""
 
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-TRACK_BIAS_UNAVAILABLE = "day-of track bias unavailable without accessD/JRADB"
+TRACK_BIAS_UNAVAILABLE = "day-of track bias unavailable without a race card"
+TRACK_BIAS_NOT_LOADED = "day-of track bias not loaded from accessD/JRADB"
+TrackBiasSource = Literal["accessd", "jra_baba", "accessd+jra_baba"]
+TrackBiasSufficiency = Literal["unavailable", "thin", "sufficient"]
 _GOING = frozenset({"良", "稍重", "重", "不良"})
 _SURFACES = frozenset({"芝", "ダート", "障害"})
 
 
 class TrackBias(BaseModel):
-    """コース条件と、当日バイアスの欠測。
+    """コース条件と、公式ページが印刷した当日バイアス。
 
     ``venue`` / ``surface`` / ``distance`` / ``going`` は、そのレースのページに
-    書いてあったときだけ写す。内外や先行有利は、このスタックの事前ソースには無い。
-    accessD/JRADB には取りにいかない。ブログからも取らない。
+    書いてあったときだけ写す。``inside_outside`` と ``pace_bias`` は accessD か
+    JRA 馬場情報のバイアス見出しのセルだけ。外回り、使用コース、芝の傷み、
+    含水率、クッション値、オッズ、人気、レース名からは作らない。
     """
 
     venue: str | None = Field(None, description="競馬場。ページに無い、または不明のときは null")
@@ -23,12 +28,27 @@ class TrackBias(BaseModel):
     going: str | None = Field(
         None, description="馬場状態（良/稍重/重/不良）。ページに無いときは null"
     )
-    inside_outside: str | None = Field(None, description="内外バイアス。ソースが無いので null")
-    pace_bias: str | None = Field(None, description="先行有利などのバイアス。ソースが無いので null")
-    source: str | None = Field(None, description="バイアスの出典。無いので null")
+    inside_outside: str | None = Field(
+        None, description="内外バイアス。公式ページの見出しセルに無いときは null"
+    )
+    pace_bias: str | None = Field(
+        None, description="先行有利などのバイアス。公式ページの見出しセルに無いときは null"
+    )
+    source: TrackBiasSource | None = Field(
+        None,
+        description="accessd / jra_baba / accessd+jra_baba。ラベルが無いときは null",
+    )
+    data_sufficiency: TrackBiasSufficiency = Field(
+        "unavailable",
+        description="sufficient は内外とペースの両方。thin は片方。無いときは unavailable",
+    )
     warning: str | None = Field(
         None,
-        description=TRACK_BIAS_UNAVAILABLE,
+        description=(
+            "欠測の理由。馬単体は without a race card。"
+            "未取得は not loaded from accessD/JRADB。"
+            "ページを見てラベルが無いときは not published"
+        ),
     )
 
 
@@ -42,12 +62,13 @@ def horse_track_bias() -> TrackBias:
         inside_outside=None,
         pace_bias=None,
         source=None,
+        data_sufficiency="unavailable",
         warning=TRACK_BIAS_UNAVAILABLE,
     )
 
 
 def track_bias_from_race(race: "Race") -> TrackBias:
-    """Copy conditions the race page actually had. Bias fields stay null."""
+    """Copy conditions the race page actually had. Bias labels are not loaded yet."""
     venue = race.venue if race.venue and race.venue != "不明" else None
     surface = race.track_type if race.track_type in _SURFACES else None
     distance = race.distance if race.distance > 0 else None
@@ -60,8 +81,14 @@ def track_bias_from_race(race: "Race") -> TrackBias:
         inside_outside=None,
         pace_bias=None,
         source=None,
-        warning=TRACK_BIAS_UNAVAILABLE,
+        data_sufficiency="unavailable",
+        warning=TRACK_BIAS_NOT_LOADED,
     )
+
+
+def _publication_applied(bias: TrackBias) -> bool:
+    """True after a lookup replaced the not-loaded placeholder."""
+    return bias.warning != TRACK_BIAS_NOT_LOADED
 
 
 class RaceEntry(BaseModel):
@@ -130,7 +157,8 @@ class Race(BaseModel):
         None,
         description=(
             "当日バイアス。週次一覧では null。"
-            "出馬表では競馬場・芝ダート・距離・馬場状態だけ写し、内外とペースバイアスは null"
+            "出馬表では競馬場・芝ダート・距離・馬場状態を写し、"
+            "内外とペースは accessD か JRA 馬場情報にラベルがあるときだけ"
         ),
     )
 
@@ -143,7 +171,20 @@ class RaceCard(BaseModel):
 
     @model_validator(mode="after")
     def _fill_track_bias(self) -> "RaceCard":
-        self.race = self.race.model_copy(update={"track_bias": track_bias_from_race(self.race)})
+        base = track_bias_from_race(self.race)
+        existing = self.race.track_bias
+        if existing is not None and _publication_applied(existing):
+            base = base.model_copy(
+                update={
+                    "inside_outside": existing.inside_outside,
+                    "pace_bias": existing.pace_bias,
+                    "source": existing.source,
+                    "data_sufficiency": existing.data_sufficiency,
+                    "warning": existing.warning,
+                }
+            )
+        if self.race.track_bias != base:
+            self.race = self.race.model_copy(update={"track_bias": base})
         return self
 
 
