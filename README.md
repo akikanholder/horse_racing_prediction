@@ -188,9 +188,11 @@ with TrackInfoService() as service:
 - 三連複の組み合わせは `1-2-5`（馬番3つの小さい順）。価格は馬連と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。
 - `source` は `netkeiba_live` / `netkeiba_yoso` / `jradb`。`kind` は `live` または `yoso`。CLI を `source` には入れない。
 - `fetched_at` は必須。市場の更新時刻があるときだけ `market_updated_at` を入れる。
+- `encoding` は常に `utf-8`。オッズ API（`api_get_jra_odds.html`、`compress=0`）の JSON を UTF-8 で読む。`combination` は ASCII の馬番（単勝 `1`、ワイド・馬連 `3-7`、三連複 `1-2-5`）。馬成績ページの EUC-JP では読まない。呼び出し側で文字コードを推測しない。
+- `race_phase` はレース前かレース後。API の `status` からの対応は次のとおり。`yoso` と `middle` は `pre`。`result` は `post`（レース後の確定オッズ）。馬券種で局面が食い違うときは `null`。判別できない失敗も `null`。
 - `prefer` は呼び出し側の希望であり、`kind` を書き換えない。`status=yoso` のペイロードは `prefer=live` でも `kind=yoso` のまま。
 - `prefer=live` で市場オッズが取れないとき（`quotes=[]` / `status=unavailable`）、予想オッズへは自動で切り替えない。予想が必要ならクライアントが `prefer=yoso` を明示して取りにいく。単勝・ワイド・馬連・三連複とも同じ。
-- 数値が無いレスポンスは `quotes=[]` と API の `reason`（例: `result odds empty`）。
+- 失敗は `quotes=[]` と `reason`。着順の `warning` に相当し、オッズ側では別名を置かない。API が理由を返すときはそれを使う（例: `result odds empty`）。HTTP 400 は `http 400`、本文に API の理由があれば `http 400: result odds empty`。400 の本文に数値が載っていても価格にはしない。壊れた JSON は `malformed odds payload`。オブジェクトでない JSON は `invalid odds payload`。通信失敗は `fetch failed`。レース後（`post`）で空、または HTTP 400 のときも `quotes` は空のまま。価格は作らない。
 
 ## プロジェクト構成
 

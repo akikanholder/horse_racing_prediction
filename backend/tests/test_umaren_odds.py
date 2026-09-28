@@ -48,6 +48,8 @@ class TestParseUmarenOdds:
         snapshot = _parse_live()
 
         assert snapshot.status == "live"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "post"
         assert snapshot.bet_types == ["umaren"]
         assert len(snapshot.quotes) == 55
         first = snapshot.quotes[0]
@@ -116,6 +118,8 @@ class TestParseUmarenOdds:
         assert snapshot.status == "unavailable"
         assert snapshot.bet_types == ["umaren"]
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "pre"
         assert snapshot.reason == "result odds empty"
 
     def test_middle_with_numbers_is_live(self):
@@ -126,6 +130,7 @@ class TestParseUmarenOdds:
 
         assert snapshot.status == "live"
         assert snapshot.reason is None
+        assert snapshot.race_phase == "pre"
         assert snapshot.quotes
         assert all(quote.kind == "live" for quote in snapshot.quotes)
         assert all(quote.source == "netkeiba_live" for quote in snapshot.quotes)
@@ -136,6 +141,7 @@ class TestParseUmarenOdds:
         snapshot = parse_netkeiba_umaren_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
 
         assert snapshot.status == "yoso"
+        assert snapshot.race_phase == "pre"
         assert snapshot.quotes
         assert {quote.kind for quote in snapshot.quotes} == {"yoso"}
         assert {quote.source for quote in snapshot.quotes} == {"netkeiba_yoso"}
@@ -165,6 +171,7 @@ class TestParseUmarenOdds:
         snapshot = parse_netkeiba_umaren_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.race_phase is None
 
     def test_missing_update_time_leaves_market_updated_at_empty(self):
         payload = _live_payload()
@@ -232,7 +239,9 @@ class TestUmarenOddsScraper:
         snapshot = scraper.get_umaren_odds(RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
-        assert snapshot.reason == "fetch failed"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase is None
+        assert snapshot.reason == "malformed odds payload"
 
 
 class _FakeOddsScraper:
@@ -481,6 +490,8 @@ class TestUmarenOddsApiAndCli:
         body = response.json()
         quote = body["quotes"][0]
         assert body["status"] == "live"
+        assert body["encoding"] == "utf-8"
+        assert body["race_phase"] == "post"
         assert body["prefer"] == "live"
         assert quote["bet_type"] == "umaren"
         assert quote["combination"] == "1-2"
@@ -544,6 +555,8 @@ class TestUmarenOddsApiAndCli:
         cli_main()
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "live"
+        assert payload["encoding"] == "utf-8"
+        assert payload["race_phase"] == "post"
         assert payload["quotes"][0]["combination"] == "1-2"
         assert payload["quotes"][0]["odds"] == 10.2
         assert payload["quotes"][0]["odds_min"] is None
@@ -624,6 +637,8 @@ def test_fetch_live_umaren_odds_from_netkeiba():
         snapshot = scraper.get_umaren_odds("202609040711")
 
     assert snapshot.status == "live"
+    assert snapshot.encoding == "utf-8"
+    assert snapshot.race_phase == "post"
     by_pair = {quote.combination: quote for quote in snapshot.quotes}
     quote = by_pair["3-7"]
     assert quote.odds == 53.9

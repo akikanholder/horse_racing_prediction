@@ -232,6 +232,8 @@ def cmd_odds(args):
 
     print(f"\n=== {_odds_title(snapshot.bet_types)}: {snapshot.race_id} ===")
     print(f"状態: {snapshot.status}")
+    print(f"局面: {_race_phase_label(snapshot.race_phase)}")
+    print(f"文字コード: {snapshot.encoding}")
     if snapshot.reason:
         print(f"理由: {snapshot.reason}")
     print(f"取得時刻: {snapshot.fetched_at}")
@@ -244,6 +246,15 @@ def cmd_odds(args):
     print()
     for quote in snapshot.quotes:
         print(_format_odds_quote(quote))
+
+
+def _race_phase_label(race_phase: str | None) -> str:
+    """Text label. The token matches RaceOdds.race_phase."""
+    if race_phase == "pre":
+        return "pre（レース前）"
+    if race_phase == "post":
+        return "post（レース後）"
+    return "不明"
 
 
 def _odds_title(bet_types: Sequence[str]) -> str:
@@ -416,13 +427,27 @@ def main():
     result_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     result_parser.set_defaults(func=cmd_result)
 
-    odds_parser = subparsers.add_parser("odds", help="単勝・ワイド・馬連・三連複のオッズを取得")
+    odds_parser = subparsers.add_parser(
+        "odds",
+        help="単勝・ワイド・馬連・三連複のオッズを取得",
+        description=(
+            "単勝・ワイド・馬連・三連複のオッズ引用。"
+            "encoding は utf-8（オッズAPIのJSON。馬成績ページの EUC-JP ではない）。"
+            "combination は ASCII の馬番（1、3-7、1-2-5）。"
+            "race_phase は pre（API status の yoso と middle。レース前）か "
+            "post（API status の result。レース後の確定）。"
+            "HTTP 400、空の確定オッズ、壊れた JSON は quotes を空にし reason を返す。"
+            "価格は作らない。prefer は kind を書き換えない。"
+            "prefer=live で市場が無いとき yoso へは自動で切り替えない。"
+        ),
+    )
     odds_parser.add_argument("race_id", help="レースID")
     odds_parser.add_argument(
         "--bet-types",
         default="win",
         help=(
             "馬券種（カンマ区切り。win、wide、umaren、sanrenpuku）。"
+            "応答の encoding は utf-8、race_phase は pre か post。"
             "prefer=live で取れないとき yoso へは切り替えない"
         ),
     )

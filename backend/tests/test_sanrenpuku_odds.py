@@ -49,6 +49,8 @@ class TestParseSanrenpukuOdds:
         snapshot = _parse_live()
 
         assert snapshot.status == "live"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "post"
         assert snapshot.bet_types == ["sanrenpuku"]
         assert len(snapshot.quotes) == 165
         first = snapshot.quotes[0]
@@ -127,6 +129,8 @@ class TestParseSanrenpukuOdds:
         assert snapshot.status == "unavailable"
         assert snapshot.bet_types == ["sanrenpuku"]
         assert snapshot.quotes == []
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase == "pre"
         assert snapshot.reason == "result odds empty"
 
     def test_middle_with_numbers_is_live(self):
@@ -137,6 +141,7 @@ class TestParseSanrenpukuOdds:
 
         assert snapshot.status == "live"
         assert snapshot.reason is None
+        assert snapshot.race_phase == "pre"
         assert snapshot.quotes
         assert all(quote.kind == "live" for quote in snapshot.quotes)
         assert all(quote.source == "netkeiba_live" for quote in snapshot.quotes)
@@ -147,6 +152,7 @@ class TestParseSanrenpukuOdds:
         snapshot = parse_netkeiba_sanrenpuku_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
 
         assert snapshot.status == "yoso"
+        assert snapshot.race_phase == "pre"
         assert snapshot.quotes
         assert {quote.kind for quote in snapshot.quotes} == {"yoso"}
         assert {quote.source for quote in snapshot.quotes} == {"netkeiba_yoso"}
@@ -180,6 +186,7 @@ class TestParseSanrenpukuOdds:
         snapshot = parse_netkeiba_sanrenpuku_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
+        assert snapshot.race_phase is None
 
     def test_missing_update_time_leaves_market_updated_at_empty(self):
         payload = _live_payload()
@@ -247,7 +254,9 @@ class TestSanrenpukuOddsScraper:
         snapshot = scraper.get_sanrenpuku_odds(RACE_ID, fetched_at=FETCHED_AT)
         assert snapshot.status == "unavailable"
         assert snapshot.quotes == []
-        assert snapshot.reason == "fetch failed"
+        assert snapshot.encoding == "utf-8"
+        assert snapshot.race_phase is None
+        assert snapshot.reason == "malformed odds payload"
 
 
 class _FakeOddsScraper:
@@ -550,6 +559,8 @@ class TestSanrenpukuOddsApiAndCli:
         body = response.json()
         quote = next(item for item in body["quotes"] if item["combination"] == "1-2-5")
         assert body["status"] == "live"
+        assert body["encoding"] == "utf-8"
+        assert body["race_phase"] == "post"
         assert body["prefer"] == "live"
         assert quote["bet_type"] == "sanrenpuku"
         assert quote["odds"] == 94.1
@@ -613,6 +624,8 @@ class TestSanrenpukuOddsApiAndCli:
         payload = json.loads(capsys.readouterr().out)
         quote = next(item for item in payload["quotes"] if item["combination"] == "1-2-5")
         assert payload["status"] == "live"
+        assert payload["encoding"] == "utf-8"
+        assert payload["race_phase"] == "post"
         assert quote["odds"] == 94.1
         assert quote["odds_min"] is None
         assert quote["odds_max"] is None
@@ -719,6 +732,8 @@ def test_fetch_live_sanrenpuku_odds_from_netkeiba():
         snapshot = scraper.get_sanrenpuku_odds("202609040711")
 
     assert snapshot.status == "live"
+    assert snapshot.encoding == "utf-8"
+    assert snapshot.race_phase == "post"
     by_trio = {quote.combination: quote for quote in snapshot.quotes}
     quote = by_trio["1-2-5"]
     assert quote.odds == 94.1
