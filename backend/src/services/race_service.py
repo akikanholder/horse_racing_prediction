@@ -16,9 +16,11 @@ from backend.models.race import (
     SettledRaceResult,
     horse_track_bias,
 )
+from backend.models.training import TRAINING_FETCH_FAILED, unavailable_training
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
+from backend.scrapers.training_scraper import TrainingScraper
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class RaceService:
         self._jra_scraper: JRAScraper | None = None
         self._netkeiba_scraper: NetkeibaScraper | None = None
         self._odds_scraper: NetkeibaOddsScraper | None = None
+        self._training_scraper: TrainingScraper | None = None
 
     @property
     def jra_scraper(self) -> JRAScraper:
@@ -306,11 +309,20 @@ class RaceService:
             )
         return snapshot.model_copy(update={"prefer": preference, "bet_types": [bet_type]})
 
+    @property
+    def training_scraper(self) -> TrainingScraper:
+        """Get or create the training client (競馬ブック and speedkeiba)."""
+        if self._training_scraper is None:
+            self._training_scraper = TrainingScraper()
+        return self._training_scraper
+
     def get_horse_info(self, horse_id: str) -> Horse | None:
         """Get horse identity and near-run history.
 
         ``performances`` are past runs from the horse result page. They are not
-        the result of a race being predicted.
+        the result of a race being predicted. ``training`` is this week's
+        speedkeiba article when the horse name is on it. Keibabook's per-horse
+        history needs a login, so a miss stays null.
 
         Args:
             horse_id: Horse ID
@@ -319,10 +331,18 @@ class RaceService:
             Horse information or None
         """
         try:
-            return self.netkeiba_scraper.get_horse_info(horse_id)
+            horse = self.netkeiba_scraper.get_horse_info(horse_id)
         except Exception as e:
             logger.error(f"Failed to get horse info for {horse_id}: {e}")
             return None
+        if horse is None:
+            return None
+        try:
+            training = self.training_scraper.training_for_horse(horse.horse_name)
+        except Exception as e:
+            logger.error("Failed to get training for %s: %s", horse_id, e)
+            training = unavailable_training(TRAINING_FETCH_FAILED)
+        return horse.model_copy(update={"training": training})
 
     def get_horses_for_race(self, race_id: str) -> list[HorseBasicInfo]:
         """Get entrants with near-run history, pedigree, and running style.
@@ -331,7 +351,10 @@ class RaceService:
         Pedigree comes from ``/horse/ped/{horse_id}/``. Running style is derived
         only from those near runs (at most five). ``track_bias`` copies the
         card's venue, surface, distance, and going. Inside/outside and pace
-        bias stay null.
+        bias stay null. ``training`` is the keibabook workout table for this
+        race when that horse is on the anonymous page, otherwise the speedkeiba
+        article whose title is this race. Clocks that are not on those pages
+        stay null.
 
         Args:
             race_id: Race ID
@@ -347,12 +370,29 @@ class RaceService:
                 return horses
 
             bias = race_card.race.track_bias or horse_track_bias()
+            names = [
+                entry.horse_name
+                for entry in race_card.entries
+                if entry.horse_id and entry.horse_name
+            ]
+            try:
+                training_by_name = self.training_scraper.training_for_race(
+                    race_id, race_card.race.race_name, names
+                )
+            except Exception as e:
+                logger.error("Failed to get training for race %s: %s", race_id, e)
+                training_by_name = {
+                    name: unavailable_training(TRAINING_FETCH_FAILED) for name in names
+                }
             for entry in race_card.entries:
                 if entry.horse_id:
                     performances = self.netkeiba_scraper.get_horse_performances(
                         entry.horse_id, limit=5
                     )
                     pedigree = self.netkeiba_scraper.get_pedigree(entry.horse_id)
+                    training = training_by_name.get(entry.horse_name) or unavailable_training(
+                        TRAINING_FETCH_FAILED
+                    )
                     horse_info = HorseBasicInfo(
                         horse_id=entry.horse_id,
                         horse_name=entry.horse_name,
@@ -364,6 +404,7 @@ class RaceService:
                         recent_performances=performances,
                         pedigree=pedigree,
                         track_bias=bias,
+                        training=training,
                     )
                     horses.append(horse_info)
 
@@ -542,6 +583,9 @@ class RaceService:
         if self._odds_scraper:
             self._odds_scraper.close()
             self._odds_scraper = None
+        if self._training_scraper:
+            self._training_scraper.close()
+            self._training_scraper = None
 
     def __enter__(self):
         """Context manager entry."""

@@ -16,6 +16,7 @@ from backend.models.track import (
     Weather,
     WeeklyInfo,
 )
+from backend.models.training import Training, Workout
 
 __all__ = [
     "Course",
@@ -30,6 +31,8 @@ __all__ = [
     "PedigreeHorse",
     "RunningStyle",
     "TrackBias",
+    "Training",
+    "Workout",
     "MoistureContent",
     "OddsQuote",
     "Race",
