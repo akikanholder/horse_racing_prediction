@@ -328,15 +328,18 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 
 - レース単位は `https://p.keibabook.co.jp/cyuou/cyokyo/0/0/{race_id}`。`race_id` が12桁のときだけ取りにいく。列名（`5F`、`半哩`、坂路の `4F`）が HTML にある。`source` は `keibabook_smart`。
 - Smart の `https://s.keibabook.co.jp/...` は同じ表でも列名が無い。位置からハロンは作らないので、その URL は読まない。
-- 匿名の競馬ブック応答に載っている馬だけを埋める。観察したページは出走馬のうち1頭だけが静的 HTML に入っていた。載っていない馬は `workouts: []` と warning。
-- 馬個別の `https://p.keibabook.co.jp/db/uma/{umacd}/crireki` と中間時計は、ログイン無しでは本文が空。`umacd` は netkeiba の馬IDと違うので、`cli horse` からは取りにいかない。
+- 匿名の競馬ブック応答に載っている馬だけを埋める。観察したページは出走馬のうち1頭だけが静的 HTML に入っていた。載っていない馬は `workouts: []` と warning。環境変数が無いときはこのまま。ログインしたことにはしない。
+- ログインできるときだけ、同じ調教 URL をセッション付きで読み、まだ時計が無い馬は出馬表 `https://p.keibabook.co.jp/cyuou/syutuba/{race_id}` の馬名リンク `/db/uma/{umacd}` から `https://p.keibabook.co.jp/db/uma/{umacd}/crireki` を読む。`source` は `keibabook_crireki`。中間時計ページ（`/cyukan`）は時計が匿名 HTML に無いので読まない。
+- `umacd` は netkeiba の馬IDから作らない。レースでは出馬表のリンクだけ。同じ馬名が別の umacd を指すときは捨てる。血統の `/sanku` リンクは使わない。
+- `cli horse` はレースIDが無い。ログインできたとき、`https://p.keibabook.co.jp/db/search/horse` に馬名を送り、結果行か馬ページのリンクを使う。netkeiba プロフィールの生年月日（馬ページに日付があるときはその日付、検索行は生年）と性別がページの印字と一致し、候補が1頭のときだけ。生年月日が無い、複数一致、不一致は `training unavailable: keibabook umacd was not on a source page`。
+- 環境変数は次のとおり。両方のログイン項目が空、かつ Cookie も空なら匿名。`KEIBABOOK_LOGIN_ID` と `KEIBABOOK_PASSWORD` が両方あるときは `POST /login/login`（フォームの `login_id` / `pswd` / `_token`）。パスワードが無いときだけ `KEIBABOOK_COOKIE` を送り、`POST /logincheck/logincheck` が「ログアウト」または `/mypage/` を含み「ログインしていない」を含まないときだけ成功。それ以外は `training keibabook login failed`。匿名の調教ページに既にある時計は残す。
 - 競馬ブックにその馬の時計が無いときは speedkeiba の今週の重賞記事（`https://speedkeiba.com/今週のレース/` の見出しに「調教」があるリンク）。馬名は記事の `h4` と、空白を除いて一致したときだけ。`source` は `speedkeiba`。
-- 両方に時計がある馬は競馬ブックを使う（列名と回り位置がある）。壊れた競馬ブックの時計は捨て、speedkeiba に時計があればそちらを使う。
-- `cli horse` はレースIDが無いので競馬ブックの調教ページは開かない。speedkeiba の今週の記事を最大12本見て、馬名が一つの記事だけにあるときだけ埋める。二つ以上の記事にあるときは混ぜず `training ambiguous on speedkeiba`。
+- 時計の優先は、調教ページ、調教履歴、speedkeiba。壊れた競馬ブックの時計は捨て、speedkeiba に時計があればそちらを使う。
+- `cli horse` は認証が無いとき speedkeiba の今週の記事を最大12本見て、馬名が一つの記事だけにあるときだけ埋める。二つ以上の記事にあるときは混ぜず `training ambiguous on speedkeiba`。
 
 ### 行 `workouts`
 
-- `date` は年月日がページから決まるときだけ。競馬ブックは見出しの `YYYY年M月D日` を基準に、それより後の月日は前年。`■` と `◇` は日付ではないので `date` も `long_gap` も null。`date_label` はセルの文字のまま。
+- `date` は年月日がページから決まるときだけ。セルが `2026/5/29` や `2026年5月29日` のときはその年月日。月日だけのときは見出しの `YYYY年M月D日` を基準に、それより後の月日は前年。年がページに無い月日は `date` も `long_gap` も null。`■` と `◇` は日付ではない。`date_label` はセルの文字のまま。
 - 日付の先頭が `*` または `＊` のときだけ `long_gap: true`。
 - speedkeiba の「今回」は記事見出しの年を使う。「前回連対時」は年が書いていないので `date` は null。
 - `course` はページのコース（`美Ｗ`、`美坂`、`美浦 W`、`栗東 坂`）。`condition` は略記のまま（`不` を不良にはしない）。
@@ -373,6 +376,10 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 - `training ambiguous on speedkeiba`
 - `training sample thin`
 - `training not loaded`（まだ取得していない初期値）
+- `training keibabook login failed`（環境変数はあるがログインチェックがログイン中ではない）
+- `training history empty on keibabook`（履歴ページが「調教履歴データがありません」）
+- `training history requires keibabook login`（履歴の本文がまだ会員案内のまま）
+- `training unavailable: keibabook umacd was not on a source page`（リンクと生年月日で1頭に決まらない）
 
 ```json
 {
@@ -441,7 +448,55 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 
 上はフィクスチャ `keibabook_cyokyo.html` の坂路1本と本追切。実レスポンスはページの行を全部持つ（`■` は `date: null`、併せ馬は `partner_note`）。speedkeiba のフィクスチャでは `time` が `"51.9 – 37.1 – 11.5"`、`distance` は null、`summary.average` はページの `(平均)`、`summary.laps` は `今走` だけ。
 
-ページにその馬が無いとき:
+ログイン後の調教履歴（フィクスチャ `keibabook_crireki.html`。匿名の調教ページにいなかった馬）:
+
+```json
+{
+  "workouts": [
+    {
+      "date": "2026-05-29",
+      "date_label": "2026/5/29(金)",
+      "course": "美Ｗ",
+      "distance": "5F",
+      "time": "67.4",
+      "condition": "良",
+      "rank_in_group": 3,
+      "final_workout": null,
+      "long_gap": false,
+      "slope_reps": null,
+      "splits": [
+        {"label": "5F", "time": "67.4"},
+        {"label": "半哩", "time": "52.4"},
+        {"label": "3F", "time": "37.6"},
+        {"label": "1F", "time": "12.3"}
+      ]
+    },
+    {
+      "date": "2026-06-01",
+      "date_label": "2026/6/1(月)",
+      "course": "美坂",
+      "distance": "4F",
+      "time": "58.1",
+      "condition": "稍",
+      "rank_in_group": null,
+      "slope_reps": 1,
+      "long_gap": false,
+      "splits": [
+        {"label": "4F", "time": "58.1"},
+        {"label": "3F", "time": "42.6"},
+        {"label": "2F", "time": "27.9"},
+        {"label": "1F", "time": "13.8"}
+      ]
+    }
+  ],
+  "summary": {"comment": "動き良い", "arrow": "↗", "evaluation": null, "average": null, "laps": []},
+  "source": "keibabook_crireki",
+  "data_sufficiency": "sufficient",
+  "warning": null
+}
+```
+
+`■` の行は上の2本の前にあり、`date` は null。ページにその馬が無いとき:
 
 ```json
 {
@@ -460,7 +515,8 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 - オッズ・確定結果パーサの書き換え
 - 成績表の列追加（通過順は既存の `passing_order` を読むだけ。ペース列は脚質にしない）
 - オッズ、人気、レース名からの脚質・血統・調教
-- 競馬ブック Smart 画面の列位置からのハロン推定、ログインが要る馬個別の調教履歴
+- 競馬ブック Smart 画面の列位置からのハロン推定
+- 認証が無いときの馬個別の調教履歴（本文が空のまま。時計は作らない）
 
 ## プロジェクト構成
 

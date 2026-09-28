@@ -53,6 +53,12 @@ class HTTPClient:
         self._last_request_time: float = 0
         self._session: requests.Session | None = None
 
+    def update_headers(self, headers: dict[str, str]) -> None:
+        """Store headers on the Session so later requests send them."""
+        self._extra_headers.update(headers)
+        if self._session is not None:
+            self._session.headers.update(headers)
+
     def _get_session(self) -> requests.Session:
         """Get or create requests session with retry configuration."""
         if self._session is None:
@@ -258,9 +264,7 @@ class AsyncHTTPClient:
                     logger.error(f"Async request failed for {url}: {e}")
                     raise
                 wait_time = self.backoff_factor * (2**attempt)
-                logger.warning(
-                    f"Request failed, retrying in {wait_time}s: {e}"
-                )
+                logger.warning(f"Request failed, retrying in {wait_time}s: {e}")
                 await asyncio.sleep(wait_time)
 
         raise RuntimeError("Unexpected end of retry loop")

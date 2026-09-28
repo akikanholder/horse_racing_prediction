@@ -141,8 +141,9 @@ class Horse(BaseModel):
     training: Training | None = Field(
         None,
         description=(
-            "調教。speedkeiba の今週の重賞記事、または競馬ブックの調教ページ。"
-            "ページに無い時計は null。オッズ・人気・レース名からは作らない"
+            "調教。speedkeiba の今週の重賞記事、競馬ブックの調教ページ、"
+            "ログインできたときの調教履歴。ページに無い時計は null。"
+            "オッズ・人気・レース名からは作らない"
         ),
     )
     warning: str | None = Field(
@@ -197,8 +198,8 @@ class HorseBasicInfo(BaseModel):
     training: Training | None = Field(
         None,
         description=(
-            "このレースの調教。競馬ブックの調教ページにその馬があるとき、"
-            "無ければ speedkeiba の重賞記事。どちらにも無ければ null と warning"
+            "このレースの調教。競馬ブックの調教ページ、ログイン時の調教履歴、"
+            "無ければ speedkeiba の重賞記事。どれにも無ければ null と warning"
         ),
     )
 
