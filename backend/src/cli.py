@@ -12,6 +12,7 @@ from backend.models.horse import Horse, HorsePerformance, PedigreeHorse
 from backend.models.odds import OddsQuote
 from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, TrackBias
 from backend.models.running_style import RunningStyle
+from backend.models.training import Training
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -105,6 +106,7 @@ def cmd_horse(args):
         _print_pedigree(horse)
         _print_running_style(horse.running_style)
         _print_track_bias(horse.track_bias)
+        _print_training(horse.training)
         if horse.trainer_name:
             print(f"調教師: {horse.trainer_name}")
         if horse.training_center:
@@ -176,6 +178,39 @@ def _print_running_style(style: RunningStyle | None) -> None:
         )
     if style.warning:
         print(f"脚質警告: {style.warning}")
+
+
+def _print_training(training: Training | None) -> None:
+    """Text view. Clocks that were not on the page stay なし."""
+    if training is None:
+        print("調教: なし")
+        return
+    source = training.source or "なし"
+    print(f"調教: {source}（{training.data_sufficiency}、{len(training.workouts)}本）")
+    if training.warning:
+        print(f"調教警告: {training.warning}")
+    summary = training.summary
+    if summary is not None:
+        if summary.comment or summary.arrow:
+            comment = summary.comment or "なし"
+            arrow = summary.arrow or "なし"
+            print(f"追い切り短評: {comment} {arrow}")
+        if summary.average is not None and summary.average.time:
+            print(f"調教平均: {summary.average.label} {summary.average.time}")
+        if summary.evaluation:
+            print(f"調教評価: {summary.evaluation}")
+    if not training.workouts:
+        print("調教時計: なし")
+        return
+    print("--- 調教（ページにある行。オッズからは作らない） ---")
+    for workout in training.workouts[:5]:
+        when = workout.date.isoformat() if workout.date else (workout.date_label or "日付なし")
+        course = workout.course or "コースなし"
+        distance = workout.distance or "距離なし"
+        clock = workout.time or "時計なし"
+        condition = workout.condition or "馬場なし"
+        rank = "-" if workout.rank_in_group is None else str(workout.rank_in_group)
+        print(f"{when} {course} {distance} {clock} 馬場:{condition} 回り:{rank}")
 
 
 def _print_track_bias(bias: TrackBias) -> None:
@@ -460,11 +495,13 @@ def main():
 
     horse_parser = subparsers.add_parser(
         "horse",
-        help="競走馬の近走・血統・脚質を取得（確定したレース結果ではない）",
+        help="競走馬の近走・血統・脚質・調教を取得（確定したレース結果ではない）",
         description=(
-            "競走馬の近走成績、血統（父・母・母父）、通過順から集計した脚質。"
+            "競走馬の近走成績、血統（父・母・母父）、通過順から集計した脚質、調教。"
             "過去走であり、確定したレース結果ではない。着順と払戻の精算は result を使う。"
             "血統がページに無いときは null と warning。脚質はオッズやレース名からは作らない。"
+            "調教は speedkeiba の今週の重賞記事。記事に馬名が無いときは null。"
+            "競馬ブックの馬個別履歴はログインが要るので埋めない。"
             "当日のトラックバイアスは出さない（accessD/JRADB が無く、warning 付きの null）。"
             "馬場状態・芝ダート・距離は近走の各行と、出馬表の race.track_bias にある。"
         ),

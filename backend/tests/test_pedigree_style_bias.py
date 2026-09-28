@@ -37,6 +37,7 @@ from backend.models.running_style import (
     classify_early_call,
     derive_running_style,
 )
+from backend.models.training import TRAINING_NOT_ON_KEIBABOOK, unavailable_training
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.services.race_service import RaceService
 
@@ -567,8 +568,18 @@ def test_race_horses_payload_includes_pedigree_style_and_race_bias():
                 warning=None,
             )
 
+    class _Training:
+        def training_for_race(self, race_id: str, race_name: str, horse_names: list[str]):
+            assert race_id == "202609280601"
+            assert race_name == "テスト"
+            return {name: unavailable_training(TRAINING_NOT_ON_KEIBABOOK) for name in horse_names}
+
+        def close(self) -> None:
+            return None
+
     service = RaceService()
     service._netkeiba_scraper = Scraper()  # type: ignore[assignment]
+    service._training_scraper = _Training()  # type: ignore[assignment]
     horses = service.get_horses_for_race("202609280601")
     assert len(horses) == 1
     horse = horses[0]
@@ -587,6 +598,10 @@ def test_race_horses_payload_includes_pedigree_style_and_race_bias():
     assert horse.track_bias.distance == 1200
     assert horse.track_bias.inside_outside is None
     assert horse.track_bias.warning == TRACK_BIAS_UNAVAILABLE
+    assert horse.training is not None
+    assert horse.training.workouts == []
+    assert horse.training.warning == TRAINING_NOT_ON_KEIBABOOK
+    assert horse.training.source is None
 
 
 def test_cli_help_documents_pedigree_style_and_bias():
@@ -598,6 +613,7 @@ def test_cli_help_documents_pedigree_style_and_bias():
     )
     assert "血統" in horse_help.stdout
     assert "脚質" in horse_help.stdout
+    assert "調教" in horse_help.stdout
     assert "accessD/JRADB" in horse_help.stdout
     card_help = subprocess.run(
         [sys.executable, "-m", "backend.cli", "card", "--help"],

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from backend.models.race import TRACK_BIAS_UNAVAILABLE, TrackBias, horse_track_bias
 from backend.models.running_style import RunningStyle, derive_running_style
+from backend.models.training import Training, training_not_loaded
 
 PEDIGREE_SOURCE_PROFILE = "profile"
 PEDIGREE_SOURCE_PED = "netkeiba_ped"
@@ -137,6 +138,13 @@ class Horse(BaseModel):
             f"warning は {TRACK_BIAS_UNAVAILABLE}"
         ),
     )
+    training: Training | None = Field(
+        None,
+        description=(
+            "調教。speedkeiba の今週の重賞記事、または競馬ブックの調教ページ。"
+            "ページに無い時計は null。オッズ・人気・レース名からは作らない"
+        ),
+    )
     warning: str | None = Field(
         None,
         description=(
@@ -150,6 +158,8 @@ class Horse(BaseModel):
     def _fill_derived(self) -> "Horse":
         if self.pedigree is None:
             self.pedigree = absent_pedigree()
+        if self.training is None:
+            self.training = training_not_loaded()
         self.running_style = derive_running_style(self.performances)
         return self
 
@@ -183,10 +193,19 @@ class HorseBasicInfo(BaseModel):
             "このレースの馬場条件と、当日バイアスが無いという warning。内外とペースバイアスは null"
         ),
     )
+    training: Training | None = Field(
+        None,
+        description=(
+            "このレースの調教。競馬ブックの調教ページにその馬があるとき、"
+            "無ければ speedkeiba の重賞記事。どちらにも無ければ null と warning"
+        ),
+    )
 
     @model_validator(mode="after")
     def _fill_derived(self) -> "HorseBasicInfo":
         if self.pedigree is None:
             self.pedigree = absent_pedigree()
+        if self.training is None:
+            self.training = training_not_loaded()
         self.running_style = derive_running_style(self.recent_performances)
         return self

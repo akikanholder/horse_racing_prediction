@@ -6,6 +6,7 @@ from backend.scrapers.jra_track_scraper import JRATrackScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
+from backend.scrapers.training_scraper import TrainingScraper
 
 __all__ = [
     "BaseScraper",
@@ -14,4 +15,5 @@ __all__ = [
     "NetkeibaOddsScraper",
     "NetkeibaScraper",
     "NetkeibaTrackScraper",
+    "TrainingScraper",
 ]
