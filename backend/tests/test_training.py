@@ -29,7 +29,15 @@ from backend.scrapers.training_scraper import (
     parse_speedkeiba_article,
     parse_speedkeiba_index,
 )
+from backend.scrapers.day_of_bias import not_loaded_publication
 from backend.services.race_service import RaceService
+
+
+class _OfflineBias:
+    """Keep the training service test off the accessD network."""
+
+    def publication_for(self, race):
+        return not_loaded_publication()
 
 FIXTURES = Path(__file__).parent / "fixtures"
 RACE_ID = "202606050101"
@@ -387,6 +395,7 @@ def test_race_service_attaches_training_without_using_the_race_title():
     service = RaceService()
     service._netkeiba_scraper = _Netkeiba()  # type: ignore[assignment]
     service._training_scraper = _Training()  # type: ignore[assignment]
+    service._day_of_bias = _OfflineBias()  # type: ignore[assignment]
     horses = service.get_horses_for_race(RACE_ID)
     assert len(horses) == 1
     training = horses[0].training

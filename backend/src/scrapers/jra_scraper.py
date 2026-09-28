@@ -21,12 +21,13 @@ _ACCESS_D_ACTION = re.compile(
     re.IGNORECASE,
 )
 _CNAME_PARAM = re.compile(r"(?:CNAME|cname)=([A-Za-z0-9/%]+)")
+# Live tokens (2026-09) use pw01dde10 / pw01drl10. Older fixtures use 01 / 00.
 _RACE_CNAME = re.compile(
-    r"^pw01dde01(?P<venue>\d{2})(?P<year>\d{4})(?P<kai>\d{2})"
+    r"^pw01dde(?:01|10)(?P<venue>\d{2})(?P<year>\d{4})(?P<kai>\d{2})"
     r"(?P<day>\d{2})(?P<race>\d{2})(?P<ymd>\d{8})/[0-9A-Fa-f]{2}$"
 )
 _MEETING_CNAME = re.compile(
-    r"^pw01drl00(?P<venue>\d{2})(?P<year>\d{4})(?P<kai>\d{2})"
+    r"^pw01drl(?:00|10)(?P<venue>\d{2})(?P<year>\d{4})(?P<kai>\d{2})"
     r"(?P<day>\d{2})(?P<ymd>\d{8})/[0-9A-Fa-f]{2}$"
 )
 
@@ -542,6 +543,39 @@ class JRAScraper(BaseScraper):
             else:
                 logger.error("Failed to fetch JRA race card for %s: %s", race_id, e)
             return None
+
+    def get_shutuba_html(self, race_id: str) -> tuple[str | None, str]:
+        """Return the accessD shutuba HTML and a status.
+
+        Status is ``ok``, ``403``, ``not_found``, ``unmapped``, or ``fetch_failed``.
+        HTTP 403 is an edge block. The caller does not invent bias from it.
+        """
+        lookup = self._lookup_from_race_id(race_id)
+        if lookup is None:
+            return None, "unmapped"
+        try:
+            cname = self._find_race_cname(lookup)
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                logger.warning(
+                    "JRA accessD returned 403 while looking up %s. "
+                    "Datacenter egress is often blocked by Akamai.",
+                    race_id,
+                )
+                return None, "403"
+            logger.warning("accessD lookup failed for %s: %s", race_id, e)
+            return None, "fetch_failed"
+        if cname is None:
+            return None, "not_found"
+        try:
+            return self._fetch_access_d(cname.cname), "ok"
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                return None, "403"
+            logger.warning("accessD card fetch failed for %s: %s", race_id, e)
+            return None, "fetch_failed"
 
     def _fetch_access_d(self, cname: str) -> str:
         """POST one accessD command and cache the HTML."""

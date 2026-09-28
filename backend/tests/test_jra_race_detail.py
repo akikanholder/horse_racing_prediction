@@ -3,8 +3,16 @@
 from datetime import date
 
 from backend.models.race import Race, RaceCard, RaceEntry, RaceResult
+from backend.scrapers.day_of_bias import not_loaded_publication
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.services.race_service import RaceService
+
+
+class _OfflineBias:
+    """Keep race-card unit tests off the network."""
+
+    def publication_for(self, race: Race):
+        return not_loaded_publication()
 
 INDEX_HTML = """
 <html><body>
@@ -292,6 +300,7 @@ def test_race_service_merges_cards_and_keeps_netkeiba_ids():
     service = RaceService()
     service._netkeiba_scraper = Netkeiba()
     service._jra_scraper = Jra()
+    service._day_of_bias = _OfflineBias()
 
     card = service.get_race_card("202609260611")
     assert card is not None
@@ -326,6 +335,7 @@ def test_race_service_uses_the_source_that_succeeds():
     service = RaceService()
     service._netkeiba_scraper = NetkeibaDown()
     service._jra_scraper = Jra()
+    service._day_of_bias = _OfflineBias()
     card = service.get_race_card("202609260611")
     assert card is not None
     assert card.race.race_name == "秋風ステークス"
@@ -344,3 +354,18 @@ def test_race_service_uses_the_source_that_succeeds():
     assert card is not None
     assert card.entries[0].horse_id == "123"
     assert card.race.post_time == "15:30"
+
+
+def test_live_accessd_cname_shape_parses():
+    scraper = JRAScraper()
+    race = scraper._parse_race_cname("pw01dde1006202604081120260926/09")
+    assert race is not None
+    assert race.venue_code == "06"
+    assert race.race_number == 11
+    assert race.kai == 4
+    assert race.day_number == 8
+    assert race.race_date == date(2026, 9, 26)
+    meeting = scraper._parse_meeting_cname("pw01drl10062026040820260926/0E")
+    assert meeting is not None
+    assert meeting.venue_code == "06"
+    assert meeting.race_date == date(2026, 9, 26)

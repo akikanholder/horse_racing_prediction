@@ -233,14 +233,53 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 
 馬場状態（良/稍重/重/不良）、芝/ダート/障害、競馬場、距離は、そのページに書いてあるときだけ `going` / `surface` / `venue` / `distance` に写す。`不明` や距離 0 は null。
 
-内外（`inside_outside`）と先行有利などの `pace_bias`、`source` は常に null。このスタックに当日バイアスの事前ソースは無い。accessD/JRADB には取りにいかない。ブログも見ない。
+`inside_outside` と `pace_bias` は、公式の事前ページが**バイアスの見出し**として印刷しているセルだけを写す。見出しは `内外` / `内外バイアス` / `枠バイアス`、または `ペース` / `ペースバイアス` / `展開バイアス`。セルは空白を畳んだ短いラベル（16字まで）。`傷み`、`内柵`、`コース`、`回り`、`メートル` を含む文は捨てる。
 
-`warning` は `day-of track bias unavailable without accessD/JRADB`。
+- accessD / JRADB の出馬表（`POST https://www.jra.go.jp/JRADB/accessD.html`、`cname`）。ラベルがあれば `source` は `accessd`。
+- JRA 馬場情報の当週タブ（`https://www.jra.go.jp/keiba/baba/index.html` と `index2.html`）。タイトルの競馬場がこのレースと一致したページだけ。ラベルがあれば `source` は `jra_baba`。両方に同じ文字があるときは `accessd+jra_baba`。
+- 二つのページの同じ項目が違う文字なら、両方 null。`warning` は `day-of track bias sources disagree`。
 
-- 出馬表と `GET /api/races/{race_id}` の `race.track_bias` は、そのレースの条件を写す。
+写さないもの:
+
+- 出馬表の `（芝・右 外）`。外回りであり、内外バイアスではない。
+- 使用コース（A/B/C）、内柵の位置、芝の傷み、含水率、クッション値、馬場状態。`cli track` のまま。バイアスにはしない。
+- オッズ、人気、レース名、結果の通過順、予想ブログ。
+- netkeiba のトラックバイアス。マスターコースのログインの向こうにあり、匿名 HTML には値が無い。公式の事前ラベルではない。
+
+`data_sufficiency` は、内外とペースが両方あるとき `sufficient`（`warning` は null）、片方だけ `thin`、無いとき `unavailable`。
+
+`warning`:
+
+- 馬単体（開催日が無い）: `day-of track bias unavailable without a race card`
+- まだ取りにいっていない出馬表オブジェクト: `day-of track bias not loaded from accessD/JRADB`
+- accessD と馬場情報を見てラベルが無い: `day-of inside/outside and pace bias not published on accessD or JRA baba`
+- accessD には無く、馬場情報にその競馬場が無い: `day-of inside/outside and pace bias not published on accessD; JRA baba has no page for this venue`
+- accessD が HTTP 403: `day-of track bias unavailable: JRA accessD returned 403`（馬場情報を見たときはその結果を続ける）
+- 通信失敗: `day-of track bias fetch failed`
+- 片方だけ: `day-of pace bias not published` または `day-of inside/outside bias not published`
+
+認証用の環境変数は無い。accessD も馬場情報も公開ページ。403 は資格情報不足ではなく、Akamai がデータセンターの IP を止めたとき。個別の `/keiba/baba/{venue}.html` は 403 になることがあるので、当週の `index.html` / `index2.html` だけを見る。
+
+- 出馬表と `GET /api/races/{race_id}` の `race.track_bias` は、条件を写したうえで上記を取りにいく。
 - 出走馬一覧の各馬にも同じオブジェクトを載せる。
-- `cli horse` の `track_bias` は開催日が無いので条件も null。近走の馬場・距離・芝ダートは `performances` の各行。
-- `cli track` の馬場状態・クッション値・含水率は従来どおり。バイアスにはしない。
+- `cli horse` の `track_bias` は開催日が無いので条件もバイアスも null。accessD は開かない。近走の馬場・距離・芝ダートは `performances` の各行。
+- 週次一覧の `track_bias` は null（そこでは判定しない）。
+
+見出しがあるページ（パーサ契約。2026-09-28 に取得した東京の馬場情報と、9月26日の秋風ステークス出馬表にはこの見出しは無い）:
+
+```json
+{
+  "venue": "中山",
+  "surface": "芝",
+  "distance": 1600,
+  "going": "稍重",
+  "inside_outside": "内有利",
+  "pace_bias": "先行有利",
+  "source": "accessd",
+  "data_sufficiency": "sufficient",
+  "warning": null
+}
+```
 
 ```json
 {
@@ -273,7 +312,8 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
     "inside_outside": null,
     "pace_bias": null,
     "source": null,
-    "warning": "day-of track bias unavailable without accessD/JRADB"
+    "data_sufficiency": "unavailable",
+    "warning": "day-of track bias unavailable without a race card"
   }
 }
 ```
@@ -415,7 +455,7 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 
 ### 対象外
 
-- accessD / JRADB の当日バイアス、および予想ブログ
+- 予想ブログ、netkeiba マスターコースのトラックバイアス（匿名ページに値は無い）
 - 新しい馬券種
 - オッズ・確定結果パーサの書き換え
 - 成績表の列追加（通過順は既存の `passing_order` を読むだけ。ペース列は脚質にしない）
