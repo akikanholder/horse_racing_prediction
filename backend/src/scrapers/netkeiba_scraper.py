@@ -8,7 +8,20 @@ from datetime import date, datetime
 from bs4 import BeautifulSoup, Tag
 
 from backend.models.course import CourseCondition
-from backend.models.horse import Horse, HorsePerformance
+from backend.models.horse import (
+    PEDIGREE_ABSENT,
+    PEDIGREE_FETCH_FAILED,
+    PEDIGREE_INCOMPLETE,
+    PEDIGREE_SOURCE_BOTH,
+    PEDIGREE_SOURCE_PED,
+    PEDIGREE_SOURCE_PROFILE,
+    PEDIGREE_TABLE_MALFORMED,
+    PEDIGREE_TABLE_NOT_FOUND,
+    Horse,
+    HorsePerformance,
+    Pedigree,
+    PedigreeHorse,
+)
 from backend.models.race import (
     Race,
     RaceCard,
@@ -108,8 +121,11 @@ class _HorseIdentity:
     birth_date: date | None = None
     birth_year: int | None = None
     sire_name: str | None = None
+    sire_id: str | None = None
     dam_name: str | None = None
+    dam_id: str | None = None
     damsire_name: str | None = None
+    damsire_id: str | None = None
     breeder_name: str | None = None
     breeder_location: str | None = None
     owner_name: str | None = None
@@ -127,6 +143,233 @@ class _HorseIdentity:
             other = getattr(fallback, field.name)
             merged[field.name] = current if current is not None else other
         return _HorseIdentity(**merged)  # type: ignore[arg-type]
+
+
+def _horse_id_from_href(href: str) -> str | None:
+    """Horse id from a profile link. Pedigree and progeny links are not the horse."""
+    path = href.split("?")[0]
+    if any(
+        part in path for part in ("/horse/ped/", "/horse/sire/", "/horse/result/", "/horse/mare/")
+    ):
+        return None
+    match = re.search(r"/horse/([0-9A-Za-z]+)/?$", path)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _linked_ancestor(cell: Tag) -> tuple[str | None, str | None]:
+    """First real horse link in a cell. Year, color, and 血統/産駒 links are skipped."""
+    fallback: tuple[str | None, str | None] | None = None
+    for anchor in cell.find_all("a"):
+        if not isinstance(anchor, Tag):
+            continue
+        href = str(anchor.get("href") or "")
+        name = _optional_text(anchor.get_text())
+        if href:
+            horse_id = _horse_id_from_href(href)
+            if horse_id and name:
+                return name, horse_id
+            continue
+        if name and fallback is None:
+            fallback = (name, None)
+    return fallback or (None, None)
+
+
+def _ancestor_from_profile_cell(cell: Tag) -> tuple[str | None, str | None]:
+    name, horse_id = _linked_ancestor(cell)
+    if name:
+        return name, horse_id
+    return _optional_text(cell.get_text()), None
+
+
+def _span(cell: Tag, attr: str) -> int:
+    raw = cell.get(attr)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    try:
+        value = int(str(raw or 1))
+    except (TypeError, ValueError):
+        return 1
+    return value if value >= 1 else 1
+
+
+def _expand_table(table: Tag) -> list[list[Tag | None]]:
+    """Expand rowspan and colspan so column 0 is the same generation on every row."""
+    rows = [row for row in table.find_all("tr") if isinstance(row, Tag)]
+    occupied: dict[tuple[int, int], Tag] = {}
+    grid: list[list[Tag | None]] = []
+    for row_index, row in enumerate(rows):
+        cells = [
+            cell for cell in row.find_all(["td", "th"], recursive=False) if isinstance(cell, Tag)
+        ]
+        line: list[Tag | None] = []
+        column = 0
+        for cell in cells:
+            while (row_index, column) in occupied:
+                line.append(occupied.pop((row_index, column)))
+                column += 1
+            rowspan = _span(cell, "rowspan")
+            colspan = _span(cell, "colspan")
+            for offset in range(colspan):
+                line.append(cell)
+                for depth in range(1, rowspan):
+                    occupied[(row_index + depth, column + offset)] = cell
+            column += colspan
+        while (row_index, column) in occupied:
+            line.append(occupied.pop((row_index, column)))
+            column += 1
+        grid.append(line)
+    return grid
+
+
+def _read_blood_table(
+    table: Tag,
+) -> tuple[
+    str, tuple[str | None, str | None], tuple[str | None, str | None], tuple[str | None, str | None]
+]:
+    """Sire is row 0 col 0. Dam is halfway down column 0. Damsire is the next cell.
+
+    An odd number of rows, or a dam cell that is the same span as the sire,
+    is malformed. Names in that table are not used.
+    """
+    empty: tuple[str | None, str | None] = (None, None)
+    grid = _expand_table(table)
+    if not grid or not grid[0] or len(grid) % 2 != 0:
+        return "malformed", empty, empty, empty
+    mid = len(grid) // 2
+    sire_cell = grid[0][0]
+    if not isinstance(sire_cell, Tag) or mid >= len(grid) or not grid[mid]:
+        return "malformed", empty, empty, empty
+    dam_cell = grid[mid][0]
+    if not isinstance(dam_cell, Tag) or dam_cell is sire_cell:
+        return "malformed", empty, empty, empty
+    sire = _linked_ancestor(sire_cell)
+    dam = _linked_ancestor(dam_cell)
+    damsire = empty
+    if len(grid[mid]) > 1:
+        damsire_cell = grid[mid][1]
+        if (
+            isinstance(damsire_cell, Tag)
+            and damsire_cell is not dam_cell
+            and damsire_cell is not sire_cell
+        ):
+            damsire = _linked_ancestor(damsire_cell)
+    return "ok", sire, dam, damsire
+
+
+def _apply_ancestor(
+    current_name: str | None,
+    current_id: str | None,
+    new_name: str | None,
+    new_id: str | None,
+) -> tuple[str | None, str | None, bool]:
+    """Fill a blank name. Attach an id only when the names match. Never replace a name."""
+    if current_name is None and new_name is not None:
+        return new_name, new_id, True
+    if (
+        current_name is not None
+        and current_id is None
+        and new_id
+        and new_name is not None
+        and _compact(current_name) == _compact(new_name)
+    ):
+        return current_name, new_id, True
+    return current_name, current_id, False
+
+
+def _apply_ancestors(
+    identity: _HorseIdentity,
+    sire: tuple[str | None, str | None],
+    dam: tuple[str | None, str | None],
+    damsire: tuple[str | None, str | None],
+) -> bool:
+    identity.sire_name, identity.sire_id, sire_changed = _apply_ancestor(
+        identity.sire_name, identity.sire_id, sire[0], sire[1]
+    )
+    identity.dam_name, identity.dam_id, dam_changed = _apply_ancestor(
+        identity.dam_name, identity.dam_id, dam[0], dam[1]
+    )
+    identity.damsire_name, identity.damsire_id, damsire_changed = _apply_ancestor(
+        identity.damsire_name, identity.damsire_id, damsire[0], damsire[1]
+    )
+    return sire_changed or dam_changed or damsire_changed
+
+
+def _merge_ped_soup(soup: BeautifulSoup, identity: _HorseIdentity) -> tuple[str, bool]:
+    table = soup.find("table", class_=lambda value: bool(value) and "blood_table" in value)
+    if not isinstance(table, Tag):
+        return "missing", False
+    status, sire, dam, damsire = _read_blood_table(table)
+    if status != "ok":
+        return "malformed", False
+    return "found", _apply_ancestors(identity, sire, dam, damsire)
+
+
+def _pedigree_satisfied(identity: _HorseIdentity) -> bool:
+    return all(
+        (
+            identity.sire_name,
+            identity.sire_id,
+            identity.dam_name,
+            identity.dam_id,
+            identity.damsire_name,
+            identity.damsire_id,
+        )
+    )
+
+
+def _profile_has_pedigree(identity: _HorseIdentity) -> bool:
+    return any(
+        (
+            identity.sire_name,
+            identity.sire_id,
+            identity.dam_name,
+            identity.dam_id,
+            identity.damsire_name,
+            identity.damsire_id,
+        )
+    )
+
+
+def _pedigree_member(name: str | None, horse_id: str | None) -> PedigreeHorse | None:
+    if name is None and horse_id is None:
+        return None
+    return PedigreeHorse(name=name, horse_id=horse_id)
+
+
+def _assemble_pedigree(
+    identity: _HorseIdentity,
+    *,
+    profile_contributed: bool,
+    ped_contributed: bool,
+    ped_attempted: bool,
+    ped_table: str,
+) -> Pedigree:
+    sire = _pedigree_member(identity.sire_name, identity.sire_id)
+    dam = _pedigree_member(identity.dam_name, identity.dam_id)
+    damsire = _pedigree_member(identity.damsire_name, identity.damsire_id)
+    if profile_contributed and ped_contributed:
+        source: str | None = PEDIGREE_SOURCE_BOTH
+    elif ped_contributed:
+        source = PEDIGREE_SOURCE_PED
+    elif profile_contributed:
+        source = PEDIGREE_SOURCE_PROFILE
+    else:
+        source = None
+    if sire is not None and dam is not None:
+        warning = None
+    elif ped_table == "failed":
+        warning = PEDIGREE_FETCH_FAILED
+    elif ped_table == "malformed":
+        warning = PEDIGREE_TABLE_MALFORMED
+    elif ped_attempted and ped_table == "missing":
+        warning = PEDIGREE_TABLE_NOT_FOUND
+    elif sire is None and dam is None:
+        warning = PEDIGREE_ABSENT
+    else:
+        warning = PEDIGREE_INCOMPLETE
+    return Pedigree(sire=sire, dam=dam, damsire=damsire, source=source, warning=warning)
 
 
 def _compact(text: str) -> str:
@@ -646,9 +889,7 @@ class NetkeibaScraper(BaseScraper):
         if not isinstance(table, Tag):
             if header.race_name is None and header.race_date is None and header.venue is None:
                 return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_NOT_FOUND)
-            return self._empty_settled_result(
-                race_id, fetched_at, RACE_RESULT_NOT_SETTLED, header
-            )
+            return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_NOT_SETTLED, header)
 
         columns = self._settled_columns(table)
         if any(name not in columns for name in ("rank", "horse_number", "horse_name")):
@@ -755,18 +996,12 @@ class NetkeibaScraper(BaseScraper):
                 columns[field_name] = index
         return columns
 
-    def _settled_finishers(
-        self, table: Tag, columns: dict[str, int]
-    ) -> list[SettledFinisher]:
+    def _settled_finishers(self, table: Tag, columns: dict[str, int]) -> list[SettledFinisher]:
         finishers: list[SettledFinisher] = []
         for row in table.find_all("tr")[1:]:
             if not isinstance(row, Tag):
                 continue
-            cols = [
-                cell
-                for cell in row.find_all("td", recursive=False)
-                if isinstance(cell, Tag)
-            ]
+            cols = [cell for cell in row.find_all("td", recursive=False) if isinstance(cell, Tag)]
             if not cols:
                 continue
             finisher = self._settled_finisher(cols, columns)
@@ -774,9 +1009,7 @@ class NetkeibaScraper(BaseScraper):
                 finishers.append(finisher)
         return finishers
 
-    def _settled_finisher(
-        self, cols: list[Tag], columns: dict[str, int]
-    ) -> SettledFinisher | None:
+    def _settled_finisher(self, cols: list[Tag], columns: dict[str, int]) -> SettledFinisher | None:
         horse_cell = _cell(cols, columns, "horse_name")
         horse_name = _optional_text(horse_cell.get_text()) if horse_cell is not None else None
         horse_number = _optional_int(_cell_text(cols, columns, "horse_number"))
@@ -887,9 +1120,7 @@ class NetkeibaScraper(BaseScraper):
         ]
         return payouts, " ".join(notes) or None
 
-    def get_horse_info(
-        self, horse_id: str, *, fetched_at: datetime | None = None
-    ) -> Horse | None:
+    def get_horse_info(self, horse_id: str, *, fetched_at: datetime | None = None) -> Horse | None:
         """Get horse identity and near-run history.
 
         Performances come from ``/horse/result/{horse_id}/``.
@@ -944,6 +1175,11 @@ class NetkeibaScraper(BaseScraper):
         if identity.horse_name is None and identity.total_races is None and not performances:
             return None
 
+        pedigree = self._resolve_pedigree(
+            horse_id,
+            identity,
+            profile_contributed=_profile_has_pedigree(identity),
+        )
         return Horse(
             horse_id=horse_id,
             horse_name=identity.horse_name or "不明",
@@ -952,9 +1188,12 @@ class NetkeibaScraper(BaseScraper):
             birth_date=identity.birth_date,
             birth_year=identity.birth_year,
             coat_color=identity.coat_color,
-            sire_name=identity.sire_name,
-            dam_name=identity.dam_name,
-            damsire_name=identity.damsire_name,
+            sire_name=pedigree.sire.name if pedigree.sire else None,
+            sire_id=pedigree.sire.horse_id if pedigree.sire else None,
+            dam_name=pedigree.dam.name if pedigree.dam else None,
+            dam_id=pedigree.dam.horse_id if pedigree.dam else None,
+            damsire_name=pedigree.damsire.name if pedigree.damsire else None,
+            damsire_id=pedigree.damsire.horse_id if pedigree.damsire else None,
             breeder_name=identity.breeder_name,
             breeder_location=identity.breeder_location,
             owner_name=identity.owner_name,
@@ -966,11 +1205,47 @@ class NetkeibaScraper(BaseScraper):
             performances=performances,
             fetched_at=fetched,
             warning=warning,
+            pedigree=pedigree,
         )
 
-    def get_horse_performances(
-        self, horse_id: str, limit: int = 10
-    ) -> list[HorsePerformance]:
+    def get_pedigree(self, horse_id: str) -> Pedigree:
+        """Pedigree from ``/horse/ped/{horse_id}/`` only.
+
+        The race-horses payload does not open the profile page. A miss stays
+        null and sets ``warning``. Names are not taken from other tables.
+        """
+        return self._resolve_pedigree(horse_id, _HorseIdentity(), profile_contributed=False)
+
+    def _resolve_pedigree(
+        self,
+        horse_id: str,
+        identity: _HorseIdentity,
+        *,
+        profile_contributed: bool,
+    ) -> Pedigree:
+        """Fill blanks from the ped page. Names already found are kept."""
+        ped_attempted = False
+        ped_table = "skipped"
+        ped_contributed = False
+        if not _pedigree_satisfied(identity):
+            ped_attempted = True
+            url = f"{self.DB_URL}/horse/ped/{horse_id}/"
+            try:
+                soup = self._fetch_horse_page(url, referer=f"{self.DB_URL}/horse/{horse_id}/")
+            except Exception as e:
+                logger.error("Failed to fetch pedigree for %s: %s", horse_id, e)
+                ped_table = "failed"
+            else:
+                ped_table, ped_contributed = _merge_ped_soup(soup, identity)
+        return _assemble_pedigree(
+            identity,
+            profile_contributed=profile_contributed,
+            ped_contributed=ped_contributed,
+            ped_attempted=ped_attempted,
+            ped_table=ped_table,
+        )
+
+    def get_horse_performances(self, horse_id: str, limit: int = 10) -> list[HorsePerformance]:
         """Get a horse's past performances from the result page.
 
         Args:
@@ -1103,15 +1378,11 @@ class NetkeibaScraper(BaseScraper):
         try:
             race_name_elem = soup.find(class_=re.compile(r"RaceName|race_name"))
             race_name = (
-                self.clean_text(race_name_elem.get_text())
-                if race_name_elem
-                else f"Race {race_id}"
+                self.clean_text(race_name_elem.get_text()) if race_name_elem else f"Race {race_id}"
             )
 
             race_data_elem = soup.find(class_=re.compile(r"RaceData|race_data"))
-            race_data_text = (
-                self.clean_text(race_data_elem.get_text()) if race_data_elem else ""
-            )
+            race_data_text = self.clean_text(race_data_elem.get_text()) if race_data_elem else ""
 
             race_number = self._extract_race_number(race_id)
             race_date = self._extract_date_from_race_id(race_id) or date.today()
@@ -1363,7 +1634,7 @@ class NetkeibaScraper(BaseScraper):
             english_name=self._english_name(soup),
         )
         identity.sex, identity.coat_color = self._sex_and_coat(soup)
-        profile = self._profile_table(soup)
+        profile, ancestors = self._profile_table(soup)
         table_sex = _normalize_sex(profile.get("性別", ""))
         if table_sex:
             identity.sex = table_sex
@@ -1371,15 +1642,13 @@ class NetkeibaScraper(BaseScraper):
         if birth:
             identity.birth_date = birth
             identity.birth_year = birth.year
-        identity.trainer_name, identity.training_center = _parse_trainer(
-            profile.get("調教師", "")
-        )
+        identity.trainer_name, identity.training_center = _parse_trainer(profile.get("調教師", ""))
         identity.owner_name = _optional_text(profile.get("馬主", ""))
         identity.breeder_name = _optional_text(profile.get("生産者", ""))
         identity.breeder_location = _optional_text(profile.get("産地", ""))
-        identity.sire_name = _optional_text(profile.get("父", ""))
-        identity.dam_name = _optional_text(profile.get("母", ""))
-        identity.damsire_name = _optional_text(profile.get("母父", ""))
+        identity.sire_name, identity.sire_id = ancestors.get("父", (None, None))
+        identity.dam_name, identity.dam_id = ancestors.get("母", (None, None))
+        identity.damsire_name, identity.damsire_id = ancestors.get("母父", (None, None))
         self._fill_blood(soup, identity)
         identity.total_races, identity.total_wins = _parse_career(profile.get("通算成績", ""))
         central = _parse_earnings_man(profile.get("獲得賞金(中央)", ""))
@@ -1422,29 +1691,53 @@ class NetkeibaScraper(BaseScraper):
         coat = next((color for color in _COAT_COLORS if color in compact), None)
         return _normalize_sex(compact), coat
 
-    def _profile_table(self, soup: BeautifulSoup) -> dict[str, str]:
+    def _profile_table(
+        self, soup: BeautifulSoup
+    ) -> tuple[dict[str, str], dict[str, tuple[str | None, str | None]]]:
         table = soup.find("table", class_=re.compile(r"db_prof_table|profile"))
         data: dict[str, str] = {}
+        ancestors: dict[str, tuple[str | None, str | None]] = {}
         if not isinstance(table, Tag):
-            return data
+            return data, ancestors
         for row in table.find_all("tr"):
             header = row.find("th")
             value = row.find("td")
             if isinstance(header, Tag) and isinstance(value, Tag):
-                data[_profile_label(header.get_text())] = value.get_text()
-        return data
+                label = _profile_label(header.get_text())
+                data[label] = value.get_text()
+                if label in {"父", "母", "母父"}:
+                    ancestors[label] = _ancestor_from_profile_cell(value)
+        return data, ancestors
 
     def _fill_blood(self, soup: BeautifulSoup, identity: _HorseIdentity) -> None:
-        if identity.sire_name:
+        table = soup.find("table", class_=lambda value: bool(value) and "blood_table" in value)
+        if isinstance(table, Tag):
+            status, sire, dam, damsire = _read_blood_table(table)
+            if status == "ok":
+                _apply_ancestors(identity, sire, dam, damsire)
             return
-        blood = soup.find("table", class_=re.compile(r"blood"))
+        blood = soup.find(
+            "table",
+            class_=lambda value: bool(value) and "blood" in value and "blood_table" not in value,
+        )
         if not isinstance(blood, Tag):
             return
-        links = blood.find_all("a")
-        if len(links) >= 1:
-            identity.sire_name = _optional_text(links[0].get_text())
-        if len(links) >= 2 and not identity.dam_name:
-            identity.dam_name = _optional_text(links[1].get_text())
+        ancestors: list[tuple[str | None, str | None]] = []
+        for anchor in blood.find_all("a"):
+            if not isinstance(anchor, Tag):
+                continue
+            href = str(anchor.get("href") or "")
+            horse_id = _horse_id_from_href(href) if href else None
+            if href and horse_id is None:
+                continue
+            name = _optional_text(anchor.get_text())
+            if name:
+                ancestors.append((name, horse_id))
+        # Two links in one cell are sire then dam. A third link is not damsire.
+        if len(ancestors) >= 1:
+            _apply_ancestors(identity, ancestors[0], (None, None), (None, None))
+        if len(ancestors) >= 2:
+            _apply_ancestors(identity, (None, None), ancestors[1], (None, None))
 
     def _parse_horse_performances(
         self, soup: BeautifulSoup, limit: int | None = None
@@ -1545,10 +1838,7 @@ class NetkeibaScraper(BaseScraper):
             prize_money=_optional_float(_cell_text(cols, columns, "prize_money")),
         )
 
-
-    def _parse_track_condition(
-        self, element: Tag, venue: str
-    ) -> CourseCondition | None:
+    def _parse_track_condition(self, element: Tag, venue: str) -> CourseCondition | None:
         """Parse track condition from element."""
         text = self.clean_text(str(element))
 
@@ -1610,11 +1900,7 @@ class NetkeibaScraper(BaseScraper):
             netkeiba_venue = race_id[4:6]
             kai = int(race_id[6:8])
             day_number = int(race_id[8:10])
-            if (
-                netkeiba_venue in self.VENUE_CODES
-                and 1 <= kai <= 6
-                and 1 <= day_number <= 12
-            ):
+            if netkeiba_venue in self.VENUE_CODES and 1 <= kai <= 6 and 1 <= day_number <= 12:
                 return netkeiba_venue, self.VENUE_CODES[netkeiba_venue]
 
             project_venue = race_id[8:10]

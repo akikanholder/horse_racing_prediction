@@ -8,9 +8,10 @@ import sys
 from collections.abc import Sequence
 from datetime import date
 
-from backend.models.horse import HorsePerformance
+from backend.models.horse import Horse, HorsePerformance, PedigreeHorse
 from backend.models.odds import OddsQuote
-from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult
+from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, TrackBias
+from backend.models.running_style import RunningStyle
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -71,7 +72,10 @@ def cmd_race_card(args):
         print(f"開催日: {race_card.race.race_date}")
         print(f"競馬場: {race_card.race.venue}")
         print(f"コース: {race_card.race.track_type} {race_card.race.distance}m")
-        print(f"出走頭数: {len(race_card.entries)}\n")
+        print(f"出走頭数: {len(race_card.entries)}")
+        if race_card.race.track_bias:
+            _print_track_bias(race_card.race.track_bias)
+        print()
 
         if args.json:
             print_json(race_card)
@@ -98,12 +102,9 @@ def cmd_horse(args):
         print(f"取得時刻: {horse.fetched_at}")
         if horse.birth_year:
             print(f"生年: {horse.birth_year}年")
-        if horse.sire_name:
-            print(f"父: {horse.sire_name}")
-        if horse.dam_name:
-            print(f"母: {horse.dam_name}")
-        if horse.damsire_name:
-            print(f"母父: {horse.damsire_name}")
+        _print_pedigree(horse)
+        _print_running_style(horse.running_style)
+        _print_track_bias(horse.track_bias)
         if horse.trainer_name:
             print(f"調教師: {horse.trainer_name}")
         if horse.training_center:
@@ -128,6 +129,72 @@ def cmd_horse(args):
             for perf in horse.performances[:5]:
                 result = f"{perf.rank}着" if perf.rank else "---"
                 print(f"{_format_performance(perf)} → {result}")
+
+
+def _print_pedigree(horse: Horse) -> None:
+    """Text view of sire, dam, and damsire. Missing sides stay 不明."""
+    pedigree = horse.pedigree
+    if pedigree is None:
+        print("血統: 不明")
+        return
+    print(
+        "血統: "
+        f"{_format_ancestor('父', pedigree.sire)} / "
+        f"{_format_ancestor('母', pedigree.dam)} / "
+        f"{_format_ancestor('母父', pedigree.damsire)}"
+    )
+    if pedigree.source:
+        print(f"血統ソース: {pedigree.source}")
+    if pedigree.warning:
+        print(f"血統警告: {pedigree.warning}")
+
+
+def _format_ancestor(label: str, member: PedigreeHorse | None) -> str:
+    if member is None or (member.name is None and member.horse_id is None):
+        return f"{label} 不明"
+    name = member.name or "名前不明"
+    horse_id = member.horse_id or "id不明"
+    return f"{label} {name} ({horse_id})"
+
+
+def _print_running_style(style: RunningStyle | None) -> None:
+    """Text view. A null label is not filled from odds or the race name."""
+    if style is None:
+        print("脚質: 不明")
+        return
+    label = style.label or "不明"
+    confidence = "-" if style.confidence is None else f"{style.confidence:.2f}"
+    print(f"脚質: {label}（{style.data_sufficiency}, 信頼度 {confidence}, {style.sample_size}走）")
+    counts = " ".join(
+        f"{name}{style.counts.get(name, 0)}" for name in ("逃げ", "先行", "差し", "追込")
+    )
+    print(f"脚質内訳: {counts}")
+    if style.short_distance_front_under_specified:
+        print(
+            f"短距離の逃げ・先行: {style.short_distance_front_runs}走"
+            f"（{style.short_distance_m}m以下、3走未満のため未充足）"
+        )
+    if style.warning:
+        print(f"脚質警告: {style.warning}")
+
+
+def _print_track_bias(bias: TrackBias) -> None:
+    """Conditions that were on the page, and the reason bias itself is null."""
+    bits: list[str] = []
+    if bias.venue:
+        bits.append(bias.venue)
+    if bias.surface and bias.distance:
+        bits.append(f"{bias.surface}{bias.distance}m")
+    elif bias.surface:
+        bits.append(bias.surface)
+    elif bias.distance:
+        bits.append(f"{bias.distance}m")
+    if bias.going:
+        bits.append(f"馬場:{bias.going}")
+    condition = " ".join(bits) if bits else "開催条件なし"
+    print(f"トラックバイアス: 内外なし / ペースバイアスなし（{condition}）")
+    if bias.warning:
+        print(f"バイアス警告: {bias.warning}")
 
 
 def _format_performance(perf: HorsePerformance) -> str:
@@ -176,8 +243,7 @@ def cmd_courses(args):
                     print(f"【{course.venue_name}】")
                     if course.turf_circumference:
                         print(
-                            f"  芝: 周回{course.turf_circumference}m / "
-                            f"直線{course.turf_straight}m"
+                            f"  芝: 周回{course.turf_circumference}m / 直線{course.turf_straight}m"
                         )
                     if course.dirt_circumference:
                         print(
@@ -380,17 +446,27 @@ def main():
     races_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     races_parser.set_defaults(func=cmd_races)
 
-    card_parser = subparsers.add_parser("card", help="出馬表を取得")
+    card_parser = subparsers.add_parser(
+        "card",
+        help="出馬表を取得",
+        description=(
+            "出馬表。race.track_bias はページにある競馬場・芝/ダート・距離・馬場状態を写す。"
+            "内外と先行有利などの当日バイアスは accessD/JRADB が無く null。"
+        ),
+    )
     card_parser.add_argument("race_id", help="レースID")
     card_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     card_parser.set_defaults(func=cmd_race_card)
 
     horse_parser = subparsers.add_parser(
         "horse",
-        help="競走馬の近走成績を取得（確定したレース結果ではない）",
+        help="競走馬の近走・血統・脚質を取得（確定したレース結果ではない）",
         description=(
-            "競走馬の近走成績。過去走であり、確定したレース結果ではない。"
-            "着順と払戻の精算は result を使う。"
+            "競走馬の近走成績、血統（父・母・母父）、通過順から集計した脚質。"
+            "過去走であり、確定したレース結果ではない。着順と払戻の精算は result を使う。"
+            "血統がページに無いときは null と warning。脚質はオッズやレース名からは作らない。"
+            "当日のトラックバイアスは出さない（accessD/JRADB が無く、warning 付きの null）。"
+            "馬場状態・芝ダート・距離は近走の各行と、出馬表の race.track_bias にある。"
         ),
     )
     horse_parser.add_argument("horse_id", help="馬ID")

@@ -101,7 +101,7 @@ python -m backend.cli races
 # 出馬表を取得
 python -m backend.cli card <race_id>
 
-# 競走馬の近走成績を取得（確定したレース結果ではない）
+# 競走馬の近走・血統・脚質（確定したレース結果ではない。当日バイアスは null）
 python -m backend.cli horse <horse_id>
 
 # 確定した1レースの着順と払戻（馬の近走成績ではない。予測入力に混ぜない）
@@ -152,7 +152,7 @@ with TrackInfoService() as service:
 
 ## 競走馬の近走
 
-`GET /api/horses/{horse_id}` と `python -m backend.cli horse <horse_id>` はその馬の過去走を返す。今走の確定結果ではない。着順の精算や `cli result` には使わず、近走の能力評価にだけ使う。
+`GET /api/horses/{horse_id}` と `python -m backend.cli horse <horse_id>` はその馬の過去走を返す。今走の確定結果ではない。着順の精算や `cli result` には使わず、近走の能力評価にだけ使う。血統・脚質・トラックバイアスの契約は後述。
 
 - 成績の行は `https://db.netkeiba.com/horse/result/{horse_id}/` の表。列名で読む。水分量や馬場指数の列をタイムや上がりには使わない。
 - 馬名と通算成績は馬ページ `https://db.netkeiba.com/horse/{horse_id}/`。結果ページの見出しに名前があるときは、馬ページが取れなくても名前を埋める。
@@ -193,6 +193,100 @@ with TrackInfoService() as service:
 - `prefer` は呼び出し側の希望であり、`kind` を書き換えない。`status=yoso` のペイロードは `prefer=live` でも `kind=yoso` のまま。
 - `prefer=live` で市場オッズが取れないとき（`quotes=[]` / `status=unavailable`）、予想オッズへは自動で切り替えない。予想が必要ならクライアントが `prefer=yoso` を明示して取りにいく。単勝・ワイド・馬連・三連複とも同じ。
 - 失敗は `quotes=[]` と `reason`。着順の `warning` に相当し、オッズ側では別名を置かない。API が理由を返すときはそれを使う（例: `result odds empty`）。HTTP 400 は `http 400`、本文に API の理由があれば `http 400: result odds empty`。400 の本文に数値が載っていても価格にはしない。壊れた JSON は `malformed odds payload`。オブジェクトでない JSON は `invalid odds payload`。通信失敗は `fetch failed`。レース後（`post`）で空、または HTTP 400 のときも `quotes` は空のまま。価格は作らない。
+
+## 血統・脚質・トラックバイアス
+
+EV がコース適性、ペース、血統を見るための構造。無い値は null のまま。レース名、オッズ、人気からは作らない。
+
+`cli horse` / `GET /api/horses/{horse_id}` と `GET /api/races/{race_id}/horses` に載せる。当日バイアスの枠は出馬表の `race.track_bias` にもある。週次一覧の `track_bias` は null（そこでは判定しない）。
+
+### 血統 `pedigree`
+
+- 父・母・母父。各々 `name` と `horse_id`。ページに無い側は null。
+- 馬ページのプロフィール表（`父` / `母` / `母父`）と、表が `class="blood"` のときの先頭2リンク（父、母。3番目は母父にしない）。
+- プロフィールに父・母・母父の名前と ID が揃わないときは `https://db.netkeiba.com/horse/ped/{horse_id}/` の `table.blood_table`。父は1行目の1列、母は表の半分の1列、母父はその右。行数が奇数、または母のセルが父と同じ rowspan のときは名前を使わず `pedigree table malformed`。
+- 名前は血統表のリンク文字そのもの。外国馬の `(米)` のようにリンクに国が書いてあれば残す。削らない。
+- すでに入っている名前は上書きしない。ID は同じ名前のときだけ足す。
+- 出走馬一覧はプロフィールを開かず、血統表だけを見る。
+- `source` は `profile` / `netkeiba_ped` / `profile+netkeiba_ped`。取れないときは null。
+- 父と母が揃えば `warning` は null（母父が表に無ければ `damsire` だけ null）。揃わないときの `warning` は `pedigree fetch failed`、`pedigree table not found`、`pedigree table malformed`、`pedigree not on profile or ped page`、`pedigree incomplete`。
+- 平坦な `sire_name` / `sire_id` / `dam_name` / `dam_id` / `damsire_name` / `damsire_id` は `pedigree` と同じ値。
+
+### 脚質 `running_style`
+
+netkeiba の馬ページに脚質の項目は無い。成績の「ペース」は `37.1-33.4` のようなラップで、逃げ・先行・差し・追込でもハイ/スローでもない。分類しない。
+
+通過順の最初の数字だけを使う。`13-12-12-7` の初角は 13。数字とハイフン以外は捨てる。頭数が無い、または順位が頭数を超える走はラベルにしない。
+
+- 初角が 1 なら逃げ。
+- それ以外は頭数を三等分する。`front_end = ceil(頭数 / 3)`、`mid_end = ceil(頭数 * 2 / 3)`。先行は `front_end` まで、差しは `mid_end` まで、残りは追込。
+- `label` は判定できた走が 3 走以上で、最多が一つだけのとき。未満や同数は null。内訳は `counts`（逃げ・先行・差し・追込）。
+- `confidence` は `label` の占有率。`label` が null なら null。
+- `data_sufficiency` は `insufficient`（3走未満、または1走も判定できない）、`thin`（3走以上だが5走未満、信頼度 0.6 未満、または同数）、`sufficient`（5走以上かつ信頼度 0.6 以上）。
+- `basis` は `passing_order_first_call`。1走も判定できないときは null。
+- `warning` は `passing order unavailable`、`running style field size unavailable`、`running style sample too small`、`running style tie`。
+- 1400m 以下を短距離とする。障害は短距離に数えない。短距離の逃げ・先行が 1〜2 走なら `short_distance_front_under_specified` が true。全体の `label` は消さない。EV はここで感度を上げる。
+- `cli horse` は成績ページの全走。出走馬一覧の脚質は近走最大5走だけ。
+
+### トラックバイアス `track_bias`
+
+馬場状態（良/稍重/重/不良）、芝/ダート/障害、競馬場、距離は、そのページに書いてあるときだけ `going` / `surface` / `venue` / `distance` に写す。`不明` や距離 0 は null。
+
+内外（`inside_outside`）と先行有利などの `pace_bias`、`source` は常に null。このスタックに当日バイアスの事前ソースは無い。accessD/JRADB には取りにいかない。ブログも見ない。
+
+`warning` は `day-of track bias unavailable without accessD/JRADB`。
+
+- 出馬表と `GET /api/races/{race_id}` の `race.track_bias` は、そのレースの条件を写す。
+- 出走馬一覧の各馬にも同じオブジェクトを載せる。
+- `cli horse` の `track_bias` は開催日が無いので条件も null。近走の馬場・距離・芝ダートは `performances` の各行。
+- `cli track` の馬場状態・クッション値・含水率は従来どおり。バイアスにはしない。
+
+```json
+{
+  "pedigree": {
+    "sire": {"name": "ハーツクライ", "horse_id": "2001103038"},
+    "dam": {"name": "ダストアンドダイヤモンズ", "horse_id": "000a0137a4"},
+    "damsire": {"name": "Vindication", "horse_id": "000a010544"},
+    "source": "netkeiba_ped",
+    "warning": null
+  },
+  "running_style": {
+    "label": null,
+    "counts": {"逃げ": 0, "先行": 0, "差し": 0, "追込": 2},
+    "sample_size": 2,
+    "unusable_runs": 1,
+    "confidence": null,
+    "data_sufficiency": "insufficient",
+    "basis": "passing_order_first_call",
+    "short_distance_m": 1400,
+    "short_distance_runs": 0,
+    "short_distance_front_runs": 0,
+    "short_distance_front_under_specified": false,
+    "warning": "running style sample too small"
+  },
+  "track_bias": {
+    "venue": null,
+    "surface": null,
+    "distance": null,
+    "going": null,
+    "inside_outside": null,
+    "pace_bias": null,
+    "source": null,
+    "warning": "day-of track bias unavailable without accessD/JRADB"
+  }
+}
+```
+
+上の脚質は、通過が空の1走と追込2走しか無い例。ラベルは出さない。
+
+### 対象外
+
+- 調教（speedkeiba）
+- accessD / JRADB の当日バイアス、および予想ブログ
+- 新しい馬券種
+- オッズ・確定結果パーサの書き換え
+- 成績表の列追加（通過順は既存の `passing_order` を読むだけ。ペース列は脚質にしない）
+- オッズ、人気、レース名からの脚質や血統
 
 ## プロジェクト構成
 

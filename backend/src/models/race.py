@@ -2,7 +2,66 @@
 
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+TRACK_BIAS_UNAVAILABLE = "day-of track bias unavailable without accessD/JRADB"
+_GOING = frozenset({"良", "稍重", "重", "不良"})
+_SURFACES = frozenset({"芝", "ダート", "障害"})
+
+
+class TrackBias(BaseModel):
+    """コース条件と、当日バイアスの欠測。
+
+    ``venue`` / ``surface`` / ``distance`` / ``going`` は、そのレースのページに
+    書いてあったときだけ写す。内外や先行有利は、このスタックの事前ソースには無い。
+    accessD/JRADB には取りにいかない。ブログからも取らない。
+    """
+
+    venue: str | None = Field(None, description="競馬場。ページに無い、または不明のときは null")
+    surface: str | None = Field(None, description="芝 / ダート / 障害。不明のときは null")
+    distance: int | None = Field(None, description="距離 (m)。0 や欠測は null")
+    going: str | None = Field(
+        None, description="馬場状態（良/稍重/重/不良）。ページに無いときは null"
+    )
+    inside_outside: str | None = Field(None, description="内外バイアス。ソースが無いので null")
+    pace_bias: str | None = Field(None, description="先行有利などのバイアス。ソースが無いので null")
+    source: str | None = Field(None, description="バイアスの出典。無いので null")
+    warning: str | None = Field(
+        None,
+        description=TRACK_BIAS_UNAVAILABLE,
+    )
+
+
+def horse_track_bias() -> TrackBias:
+    """Horse payload has no race day. Conditions and bias stay null."""
+    return TrackBias(
+        venue=None,
+        surface=None,
+        distance=None,
+        going=None,
+        inside_outside=None,
+        pace_bias=None,
+        source=None,
+        warning=TRACK_BIAS_UNAVAILABLE,
+    )
+
+
+def track_bias_from_race(race: "Race") -> TrackBias:
+    """Copy conditions the race page actually had. Bias fields stay null."""
+    venue = race.venue if race.venue and race.venue != "不明" else None
+    surface = race.track_type if race.track_type in _SURFACES else None
+    distance = race.distance if race.distance > 0 else None
+    going = race.track_condition if race.track_condition in _GOING else None
+    return TrackBias(
+        venue=venue,
+        surface=surface,
+        distance=distance,
+        going=going,
+        inside_outside=None,
+        pace_bias=None,
+        source=None,
+        warning=TRACK_BIAS_UNAVAILABLE,
+    )
 
 
 class RaceEntry(BaseModel):
@@ -67,6 +126,13 @@ class Race(BaseModel):
     weight_condition: str | None = Field(None, description="斤量条件")
     prize_money: int | None = Field(None, description="1着賞金 (万円)")
     entry_count: int | None = Field(None, description="出走頭数")
+    track_bias: TrackBias | None = Field(
+        None,
+        description=(
+            "当日バイアス。週次一覧では null。"
+            "出馬表では競馬場・芝ダート・距離・馬場状態だけ写し、内外とペースバイアスは null"
+        ),
+    )
 
 
 class RaceCard(BaseModel):
@@ -74,6 +140,11 @@ class RaceCard(BaseModel):
 
     race: Race
     entries: list[RaceEntry] = Field(default_factory=list, description="出走馬リスト")
+
+    @model_validator(mode="after")
+    def _fill_track_bias(self) -> "RaceCard":
+        self.race = self.race.model_copy(update={"track_bias": track_bias_from_race(self.race)})
+        return self
 
 
 class RaceWithResults(BaseModel):
@@ -110,8 +181,12 @@ class RacePayout(BaseModel):
     ページに金額が無い馬券種は作らない。
     """
 
-    bet_type: str = Field(..., description="馬券種。ページの表記（単勝、複勝、馬連、ワイド、3連複など）")
-    combination: str = Field(..., description="馬番または枠番。ページの並び。馬単・3連単は着順どおり")
+    bet_type: str = Field(
+        ..., description="馬券種。ページの表記（単勝、複勝、馬連、ワイド、3連複など）"
+    )
+    combination: str = Field(
+        ..., description="馬番または枠番。ページの並び。馬単・3連単は着順どおり"
+    )
     payout: int = Field(..., description="払戻金（円）", gt=0)
     popularity: int | None = Field(None, description="人気。ページに無いときは null")
 
