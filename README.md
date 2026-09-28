@@ -5,6 +5,8 @@
 
 JRA（日本中央競馬会）の競馬データをスクレイピングして、レース情報、競走馬情報、コース情報、馬場情報を提供するバックエンドシステムです。パッケージは `backend` ディレクトリです。
 
+EV（競馬予想）が CLI と HTTP JSON を読む契約は [docs/ev-contract.md](docs/ev-contract.md)。取得と欠測の意味、環境変数。組み合わせの確率と買うかどうかは EV 側。
+
 ## 機能
 
 ### スクレイピング対象
@@ -64,6 +66,8 @@ pip install -e backend
 ```
 
 ## 使用方法
+
+コマンド、JSON のフィールド、`null` と `warning` の一覧は [docs/ev-contract.md](docs/ev-contract.md)。
 
 ### REST API サーバー
 
