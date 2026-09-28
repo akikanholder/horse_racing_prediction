@@ -6,7 +6,19 @@
 
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from backend.models.race import TRACK_BIAS_UNAVAILABLE, TrackBias, horse_track_bias
+from backend.models.running_style import RunningStyle, derive_running_style
+
+PEDIGREE_SOURCE_PROFILE = "profile"
+PEDIGREE_SOURCE_PED = "netkeiba_ped"
+PEDIGREE_SOURCE_BOTH = "profile+netkeiba_ped"
+PEDIGREE_FETCH_FAILED = "pedigree fetch failed"
+PEDIGREE_TABLE_NOT_FOUND = "pedigree table not found"
+PEDIGREE_TABLE_MALFORMED = "pedigree table malformed"
+PEDIGREE_ABSENT = "pedigree not on profile or ped page"
+PEDIGREE_INCOMPLETE = "pedigree incomplete"
 
 
 class HorsePerformance(BaseModel):
@@ -37,6 +49,42 @@ class HorsePerformance(BaseModel):
     passing_order: str | None = Field(None, description="通過順位")
     last_3f: float | None = Field(None, description="上がり3F")
     prize_money: float | None = Field(None, description="賞金 (万円)")
+
+
+class PedigreeHorse(BaseModel):
+    """One ancestor taken from a netkeiba link. Missing sides are null, not guessed."""
+
+    name: str | None = Field(None, description="馬名。ページに無いときは null")
+    horse_id: str | None = Field(None, description="netkeiba の馬ID。リンクが無いときは null")
+
+
+class Pedigree(BaseModel):
+    """父・母・母父。
+
+    プロフィール表に無いときは ``/horse/ped/{horse_id}/`` の ``blood_table``。
+    レース名や兄弟馬のリンクからは埋めない。母父が表に無いときは ``damsire`` だけ null。
+    """
+
+    sire: PedigreeHorse | None = Field(None, description="父")
+    dam: PedigreeHorse | None = Field(None, description="母")
+    damsire: PedigreeHorse | None = Field(None, description="母父")
+    source: str | None = Field(
+        None,
+        description="profile / netkeiba_ped / profile+netkeiba_ped。取れないときは null",
+    )
+    warning: str | None = Field(
+        None,
+        description=(
+            "父と母が揃わない理由。"
+            "pedigree fetch failed / pedigree table not found / "
+            "pedigree table malformed / pedigree not on profile or ped page / "
+            "pedigree incomplete"
+        ),
+    )
+
+
+def absent_pedigree() -> Pedigree:
+    return Pedigree(warning=PEDIGREE_ABSENT)
 
 
 class Horse(BaseModel):
@@ -73,6 +121,22 @@ class Horse(BaseModel):
         description="過去成績。馬成績ページの近走履歴であり、今走の確定結果ではない",
     )
     fetched_at: datetime = Field(..., description="取得日時")
+    pedigree: Pedigree | None = Field(
+        None,
+        description="父・母・母父。プロフィールに無いときは血統表。無い祖先は null",
+    )
+    running_style: RunningStyle | None = Field(
+        None,
+        description="近走の通過順から集計した脚質。成績を検証したあと必ず入る",
+    )
+    track_bias: TrackBias = Field(
+        default_factory=horse_track_bias,
+        description=(
+            "当日のトラックバイアス。馬ペイロードには開催日が無いので"
+            "競馬場・芝ダート・距離・馬場も null。"
+            f"warning は {TRACK_BIAS_UNAVAILABLE}"
+        ),
+    )
     warning: str | None = Field(
         None,
         description=(
@@ -81,6 +145,13 @@ class Horse(BaseModel):
             "horse result table malformed / no performances on horse result page"
         ),
     )
+
+    @model_validator(mode="after")
+    def _fill_derived(self) -> "Horse":
+        if self.pedigree is None:
+            self.pedigree = absent_pedigree()
+        self.running_style = derive_running_style(self.performances)
+        return self
 
 
 class HorseBasicInfo(BaseModel):
@@ -98,3 +169,24 @@ class HorseBasicInfo(BaseModel):
         default_factory=list,
         description="近走成績。馬成績ページの過去走であり、当該レースの確定結果ではない",
     )
+    pedigree: Pedigree | None = Field(
+        None,
+        description="父・母・母父。出走馬一覧では /horse/ped/ だけを見る",
+    )
+    running_style: RunningStyle | None = Field(
+        None,
+        description="recent_performances の通過順から集計した脚質。この一覧は近走最大5走",
+    )
+    track_bias: TrackBias = Field(
+        default_factory=horse_track_bias,
+        description=(
+            "このレースの馬場条件と、当日バイアスが無いという warning。内外とペースバイアスは null"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _fill_derived(self) -> "HorseBasicInfo":
+        if self.pedigree is None:
+            self.pedigree = absent_pedigree()
+        self.running_style = derive_running_style(self.recent_performances)
+        return self

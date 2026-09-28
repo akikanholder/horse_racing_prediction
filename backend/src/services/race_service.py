@@ -14,6 +14,7 @@ from backend.models.race import (
     RaceSchedule,
     RaceWithResults,
     SettledRaceResult,
+    horse_track_bias,
 )
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
@@ -83,6 +84,7 @@ class RaceService:
             logger.error(f"Failed to fetch from netkeiba: {e}")
 
         from backend.utils.date_utils import get_current_week_dates
+
         week_start, week_end = get_current_week_dates()
 
         return RaceSchedule(
@@ -123,9 +125,7 @@ class RaceService:
             dated_races = self.netkeiba_scraper.get_races_by_date(target_date)
             for race in dated_races:
                 if race.race_id in all_races:
-                    all_races[race.race_id] = self._merge_race_info(
-                        all_races[race.race_id], race
-                    )
+                    all_races[race.race_id] = self._merge_race_info(all_races[race.race_id], race)
                 else:
                     all_races[race.race_id] = race
             logger.info(f"Fetched {len(dated_races)} races for {target_date} from netkeiba")
@@ -167,9 +167,7 @@ class RaceService:
 
         return self._merge_race_cards(netkeiba_card, jra_card)
 
-    def get_race_export_bundle(
-        self, race_id: str
-    ) -> tuple[RaceCard | None, list[RaceResult]]:
+    def get_race_export_bundle(self, race_id: str) -> tuple[RaceCard | None, list[RaceResult]]:
         """Load a race card and its results without fetching the card twice.
 
         Args:
@@ -269,8 +267,7 @@ class RaceService:
             )
 
         snapshots = [
-            self._fetch_bet_odds(race_id, bet_type, fetched_at, preference)
-            for bet_type in selected
+            self._fetch_bet_odds(race_id, bet_type, fetched_at, preference) for bet_type in selected
         ]
         if len(snapshots) == 1:
             return snapshots[0].model_copy(update={"prefer": preference, "bet_types": selected})
@@ -328,9 +325,13 @@ class RaceService:
             return None
 
     def get_horses_for_race(self, race_id: str) -> list[HorseBasicInfo]:
-        """Get entrants with near-run history from each horse result page.
+        """Get entrants with near-run history, pedigree, and running style.
 
         ``recent_performances`` is that horse's past runs, not this race's result.
+        Pedigree comes from ``/horse/ped/{horse_id}/``. Running style is derived
+        only from those near runs (at most five). ``track_bias`` copies the
+        card's venue, surface, distance, and going. Inside/outside and pace
+        bias stay null.
 
         Args:
             race_id: Race ID
@@ -345,18 +346,24 @@ class RaceService:
             if not race_card:
                 return horses
 
+            bias = race_card.race.track_bias or horse_track_bias()
             for entry in race_card.entries:
                 if entry.horse_id:
                     performances = self.netkeiba_scraper.get_horse_performances(
                         entry.horse_id, limit=5
                     )
+                    pedigree = self.netkeiba_scraper.get_pedigree(entry.horse_id)
                     horse_info = HorseBasicInfo(
                         horse_id=entry.horse_id,
                         horse_name=entry.horse_name,
                         sex=entry.sex or "不明",
                         age=entry.age or 0,
+                        sire_name=pedigree.sire.name if pedigree.sire else None,
+                        dam_name=pedigree.dam.name if pedigree.dam else None,
                         trainer_name=entry.trainer_name,
                         recent_performances=performances,
+                        pedigree=pedigree,
+                        track_bias=bias,
                     )
                     horses.append(horse_info)
 
@@ -501,9 +508,7 @@ class RaceService:
         return Race(
             race_id=race1.race_id,
             race_name=(
-                race2.race_name
-                if len(race2.race_name) > len(race1.race_name)
-                else race1.race_name
+                race2.race_name if len(race2.race_name) > len(race1.race_name) else race1.race_name
             ),
             race_number=race1.race_number,
             race_date=race1.race_date,

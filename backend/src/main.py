@@ -136,6 +136,9 @@ async def get_race_card(race_id: str):
     Args:
         race_id: レースID
 
+    ``race.track_bias`` はページにある競馬場・芝/ダート・距離・馬場状態。
+    内外と先行有利は null。warning は day-of track bias unavailable without accessD/JRADB。
+
     Returns:
         RaceCard: 出馬表（レース情報と出走馬リスト）
     """
@@ -245,6 +248,10 @@ async def get_race_horses(race_id: str):
     """レースに出走する競走馬の情報を取得する。
 
     ``recent_performances`` は各馬の成績ページにある過去走で、このレースの確定結果ではない。
+    ``pedigree`` は ``/horse/ped/{horse_id}/`` の父・母・母父。無い祖先は null。
+    ``running_style`` はその近走最大5走の通過順だけから集計する。オッズやレース名からは作らない。
+    ``track_bias`` は出馬表にある競馬場・芝/ダート・距離・馬場状態を写す。
+    内外とペースバイアスは null で、warning は day-of track bias unavailable without accessD/JRADB。
 
     Args:
         race_id: レースID
@@ -265,9 +272,7 @@ async def get_race_horses(race_id: str):
 
 @app.post("/api/races/export", response_model=DailyRaceCsvExport, tags=["Races"])
 async def export_races_csv(
-    race_date: Annotated[
-        date, Query(alias="date", description="対象日 (YYYY-MM-DD)")
-    ],
+    race_date: Annotated[date, Query(alias="date", description="対象日 (YYYY-MM-DD)")],
     include_horse_details: Annotated[
         bool, Query(description="出走馬の血統など詳細情報も取得する")
     ] = False,
@@ -308,6 +313,10 @@ async def get_horse(horse_id: str):
     ``performances`` は ``/horse/result/{horse_id}/`` の過去走であり、
     今走の確定結果ではない。着順の精算には使わず、近走の能力評価にだけ使う。
     成績を取れないときは ``performances`` は空で、``warning`` に理由が入る。
+    ``pedigree`` はプロフィール表と ``/horse/ped/{horse_id}/`` の血統表。
+    父・母が取れないときは null と pedigree.warning。レース名からは埋めない。
+    ``running_style`` は performances の通過順の最初の数字。3走未満や同数は label が null。
+    ``track_bias`` は馬単体には開催日が無いので条件もバイアスも null。同じ warning。
 
     Args:
         horse_id: 馬ID
@@ -417,9 +426,7 @@ async def get_track_info(
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        results = track_info_service.get_track_info(
-            racecourse=venue, date=date, merge=merge
-        )
+        results = track_info_service.get_track_info(racecourse=venue, date=date, merge=merge)
         if not results:
             raise HTTPException(status_code=404, detail="Track info not found")
         return results
