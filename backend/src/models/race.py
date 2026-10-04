@@ -17,9 +17,11 @@ class TrackBias(BaseModel):
     """コース条件と、公式ページが印刷した当日バイアス。
 
     ``venue`` / ``surface`` / ``distance`` / ``going`` は、そのレースのページに
-    書いてあったときだけ写す。``inside_outside`` と ``pace_bias`` は accessD か
-    JRA 馬場情報のバイアス見出しのセルだけ。外回り、使用コース、芝の傷み、
-    含水率、クッション値、オッズ、人気、レース名からは作らない。
+    書いてあったときだけ写す。``venue`` は開催ヘッダが race_id の競馬場と
+    一致するときだけ。netkeiba ID の日次（2日目の ``02``）は場コードではない。
+    ナビや 403 本文に出る場名は写さない。``inside_outside`` と ``pace_bias`` は
+    accessD か JRA 馬場情報のバイアス見出しのセルだけ。外回り、使用コース、
+    芝の傷み、含水率、クッション値、オッズ、人気、レース名からは作らない。
     """
 
     venue: str | None = Field(None, description="競馬場。ページに無い、または不明のときは null")

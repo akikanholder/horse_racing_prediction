@@ -120,9 +120,10 @@ python -m backend.cli courses --venue 東京
 # 開催競馬場を取得
 python -m backend.cli venues
 
-# 馬場情報を取得
+# 馬場情報を取得（--json は TrackInfo だけ。403 でも cushion / moisture は null）
 python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
+python -m backend.cli track --venue 東京 --json
 
 # オッズを取得（単勝が既定。ワイド・馬連・三連複は --bet-types）
 python -m backend.cli odds <race_id> --bet-types wide --prefer live
@@ -236,6 +237,8 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 ### トラックバイアス `track_bias`
 
 馬場状態（良/稍重/重/不良）、芝/ダート/障害、競馬場、距離は、そのページに書いてあるときだけ `going` / `surface` / `venue` / `distance` に写す。`不明` や距離 0 は null。
+
+`venue` は出馬表の開催ヘッダが `race_id` の場と一致するときだけ。netkeiba ID の日次（東京2日・京都2日の `02`）は函館の場コードではない。ナビや 403 本文の場名は写さない。
 
 `inside_outside` と `pace_bias` は、公式の事前ページが**バイアスの見出し**として印刷しているセルだけを写す。見出しは `内外` / `内外バイアス` / `枠バイアス`、または `ペース` / `ペースバイアス` / `展開バイアス`。セルは空白を畳んだ短いラベル（16字まで）。`傷み`、`内柵`、`コース`、`回り`、`メートル` を含む文は捨てる。
 

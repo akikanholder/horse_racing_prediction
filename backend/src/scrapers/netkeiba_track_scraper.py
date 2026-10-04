@@ -18,6 +18,7 @@ from backend.models.track import (
     TrackCondition,
     TrackInfo,
     Weather,
+    empty_track_info,
 )
 from backend.scrapers.base_scraper import BaseScraper
 
@@ -44,6 +45,10 @@ class NetkeibaTrackScraper(BaseScraper):
     }
 
     RACECOURSE_NAME_TO_ID = {v: k for k, v in RACECOURSE_ID_MAPPING.items()}
+    TRACK_403 = "netkeiba track returned 403"
+    TRACK_NOT_MEETING = "netkeiba track page is not the requested meeting"
+    TRACK_UNPARSEABLE = "netkeiba track page could not be parsed"
+    TRACK_FETCH_FAILED = "netkeiba track fetch failed"
 
     def get_base_url(self) -> str:
         """Return the base URL for Netkeiba."""
@@ -86,8 +91,30 @@ class NetkeibaTrackScraper(BaseScraper):
             TrackInfo object with the scraped data
         """
         url = self.get_track_url(racecourse_id, date)
-        soup = self.fetch_page(url)
-        return self._parse_track_info(soup, racecourse_id)
+        try:
+            html = self.http_client.get(url, encoding=self.ENCODING)
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            warning = self.TRACK_403 if status == 403 else self.TRACK_FETCH_FAILED
+            logger.info("Netkeiba track fetch failed for %s (%s)", url, e)
+            return empty_track_info("Netkeiba", warning)
+
+        soup = BeautifulSoup(html, "lxml")
+        requested = self.RACECOURSE_ID_MAPPING.get(racecourse_id) if racecourse_id else None
+        if racecourse_id and requested is None:
+            if racecourse_id in self.RACECOURSE_NAME_TO_ID:
+                requested = racecourse_id
+            else:
+                return empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE)
+        page_venue = self._active_venue(soup)
+        if requested:
+            if page_venue != requested:
+                warning = self.TRACK_NOT_MEETING if page_venue else self.TRACK_UNPARSEABLE
+                return empty_track_info("Netkeiba", warning)
+            return self._parse_track_info(soup, requested)
+        if page_venue is None:
+            return empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE)
+        return self._parse_track_info(soup, page_venue)
 
     def scrape_by_name(
         self, racecourse_name: str, date: str | None = None
@@ -109,11 +136,8 @@ class NetkeibaTrackScraper(BaseScraper):
             raise ValueError(f"Unknown racecourse: {racecourse_name}")
         return self.scrape(racecourse_id, date)
 
-    def _parse_track_info(
-        self, soup: BeautifulSoup, racecourse_id: str | None
-    ) -> TrackInfo:
-        """Parse track information from the page."""
-        racecourse_name = self._extract_racecourse_name(soup, racecourse_id)
+    def _parse_track_info(self, soup: BeautifulSoup, racecourse_name: str) -> TrackInfo:
+        """Parse a page already matched to this meeting."""
         race_date = self._extract_race_date(soup)
 
         turf_info, turf_weather = self._extract_course_info(soup, CourseType.TURF)
@@ -128,30 +152,23 @@ class NetkeibaTrackScraper(BaseScraper):
             turf=turf_info,
             dirt=dirt_info,
             source="Netkeiba",
+            warning=None,
         )
 
-    def _extract_racecourse_name(
-        self, soup: BeautifulSoup, racecourse_id: str | None
-    ) -> str:
-        """Extract the racecourse name from the page."""
-        if racecourse_id and racecourse_id in self.RACECOURSE_ID_MAPPING:
-            return self.RACECOURSE_ID_MAPPING[racecourse_id]
-
-        for name in self.RACECOURSE_ID_MAPPING.values():
-            if soup.find(string=re.compile(name)):
-                return name
-
-        tabs = soup.find_all(["li", "a", "span"])
-        for tab in tabs:
-            text = tab.get_text().strip()
-            if text in self.RACECOURSE_ID_MAPPING.values():
-                if tab.get("class") and any(
-                    "active" in c or "current" in c or "selected" in c
-                    for c in tab.get("class", [])
-                ):
-                    return text
-
-        return "不明"
+    def _active_venue(self, soup: BeautifulSoup) -> str | None:
+        """Venue of the selected tab. Other links on the page are ignored."""
+        names = set(self.RACECOURSE_ID_MAPPING.values())
+        found: list[str] = []
+        for tab in soup.find_all(["li", "a", "span"]):
+            classes = tab.get("class") or []
+            if not any(str(name).lower() in {"active", "current", "selected"} for name in classes):
+                continue
+            text = tab.get_text(strip=True)
+            if text in names and text not in found:
+                found.append(text)
+        if len(found) == 1:
+            return found[0]
+        return None
 
     def _extract_race_date(self, soup: BeautifulSoup) -> datetime:
         """Extract the race date from the page."""

@@ -20,6 +20,7 @@ from backend.models.track import (
     TrackInfo,
     Weather,
     WeeklyInfo,
+    empty_track_info,
 )
 from backend.scrapers.base_scraper import BaseScraper
 
@@ -44,6 +45,17 @@ class JRATrackScraper(BaseScraper):
         "chukyo": "中京",
         "kokura": "小倉",
     }
+    # Direct /keiba/baba/{venue}.html URLs often return 403. The current
+    # meetings are the two index tabs, encoded cp932.
+    BABA_INDEX_URLS = (
+        "https://www.jra.go.jp/keiba/baba/index.html",
+        "https://www.jra.go.jp/keiba/baba/index2.html",
+    )
+    BABA_ENCODING = "cp932"
+    BABA_403 = "JRA baba returned 403"
+    BABA_NOT_MEETING = "JRA baba page is not the requested meeting"
+    BABA_UNPARSEABLE = "JRA baba page could not be parsed"
+    BABA_FETCH_FAILED = "JRA baba fetch failed"
 
     def get_base_url(self) -> str:
         """Return the base URL for JRA."""
@@ -64,24 +76,87 @@ class JRATrackScraper(BaseScraper):
         return urljoin(self.BASE_URL, self.TRACK_INFO_PATH)
 
     def scrape(self, racecourse: str | None = None) -> TrackInfo:
-        """Scrape track information from JRA.
+        """Scrape track information from the current JRA baba tabs.
+
+        Direct venue URLs are not requested. A 403, a non-page, or a tab for
+        a different meeting returns TrackInfo with null racecourse, cushion,
+        and moisture plus ``warning``.
 
         Args:
-            racecourse: Racecourse code (e.g., 'nakayama', 'tokyo').
-                       If None, scrapes the current default page.
+            racecourse: Racecourse code (e.g., 'nakayama', 'tokyo') or a
+                       Japanese name. If None, uses the first tab whose
+                       title names a meeting.
 
         Returns:
-            TrackInfo object with the scraped data
+            TrackInfo object with the scraped data, or an empty one
         """
-        url = self.get_track_url(racecourse)
-        soup = self.fetch_page(url)
-        return self._parse_track_info(soup, racecourse)
+        requested = self._requested_name(racecourse)
+        if racecourse and requested is None:
+            return empty_track_info("JRA", self.BABA_UNPARSEABLE)
+        pages: list[str] = []
+        saw_403 = False
+        saw_error = False
+        for url in self.BABA_INDEX_URLS:
+            try:
+                html = self.http_client.get(url, encoding=self.BABA_ENCODING)
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 403:
+                    saw_403 = True
+                else:
+                    saw_error = True
+                logger.info("JRA baba fetch failed for %s (%s)", url, e)
+                continue
+            pages.append(html)
 
-    def _parse_track_info(
-        self, soup: BeautifulSoup, racecourse: str | None
-    ) -> TrackInfo:
-        """Parse track information from the page."""
-        racecourse_name = self._extract_racecourse_name(soup, racecourse)
+        if requested:
+            for html in pages:
+                if self._title_venue(html) == requested:
+                    soup = BeautifulSoup(html, "lxml")
+                    return self._parse_track_info(soup, requested)
+            return empty_track_info("JRA", self._miss_warning(pages, saw_403, saw_error))
+
+        for html in pages:
+            venue = self._title_venue(html)
+            if venue:
+                soup = BeautifulSoup(html, "lxml")
+                return self._parse_track_info(soup, venue)
+        return empty_track_info("JRA", self._miss_warning(pages, saw_403, saw_error))
+
+    def _requested_name(self, racecourse: str | None) -> str | None:
+        """Japanese meeting name for a code or name. Unknown codes stay unset."""
+        if not racecourse:
+            return None
+        if racecourse in self.RACECOURSE_MAPPING:
+            return self.RACECOURSE_MAPPING[racecourse]
+        if racecourse in self.RACECOURSE_MAPPING.values():
+            return racecourse
+        return None
+
+    def _title_venue(self, html: str) -> str | None:
+        """Venue in the baba title. Nav text and 403 pages do not match."""
+        soup = BeautifulSoup(html or "", "lxml")
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        match = re.search(r"馬場情報（(.+?)競馬場）", title)
+        if not match:
+            return None
+        name = match.group(1).strip()
+        if name in self.RACECOURSE_MAPPING.values():
+            return name
+        return None
+
+    def _miss_warning(self, pages: list[str], saw_403: bool, saw_error: bool) -> str:
+        """Why no tab was copied. A foreign title is not this meeting."""
+        if any(self._title_venue(html) for html in pages):
+            return self.BABA_NOT_MEETING
+        if saw_403:
+            return self.BABA_403
+        if saw_error or not pages:
+            return self.BABA_FETCH_FAILED
+        return self.BABA_UNPARSEABLE
+
+    def _parse_track_info(self, soup: BeautifulSoup, racecourse_name: str) -> TrackInfo:
+        """Parse track information from a page already matched to this meeting."""
         race_date = self._extract_race_date(soup)
         weather = self._extract_weather(soup)
 
@@ -116,27 +191,8 @@ class JRATrackScraper(BaseScraper):
             grass_info=grass_info,
             weekly_info=weekly_info,
             source="JRA",
+            warning=None,
         )
-
-    def _extract_racecourse_name(
-        self, soup: BeautifulSoup, racecourse: str | None
-    ) -> str:
-        """Extract the racecourse name from the page title or mapping."""
-        if racecourse and racecourse in self.RACECOURSE_MAPPING:
-            return self.RACECOURSE_MAPPING[racecourse]
-
-        title = soup.find("title")
-        if title:
-            title_text = title.get_text()
-            match = re.search(r"馬場情報（(.+?)競馬場）", title_text)
-            if match:
-                return match.group(1)
-
-        for name in self.RACECOURSE_MAPPING.values():
-            if soup.find(string=re.compile(f"{name}競馬場")):
-                return name
-
-        return "不明"
 
     def _extract_race_date(self, soup: BeautifulSoup) -> datetime:
         """Extract the race date from the page."""

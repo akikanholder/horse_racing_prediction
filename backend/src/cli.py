@@ -28,12 +28,20 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _json_ready(data):
+    """Turn models, including ones nested in dicts, into JSON values."""
+    if hasattr(data, "model_dump"):
+        return data.model_dump(mode="json")
+    if isinstance(data, dict):
+        return {str(key): _json_ready(value) for key, value in data.items()}
+    if isinstance(data, (list, tuple)) and not isinstance(data, (str, bytes)):
+        return [_json_ready(item) for item in data]
+    return data
+
+
 def print_json(data, indent: int = 2):
     """Print data as formatted JSON."""
-    if hasattr(data, "model_dump"):
-        data = data.model_dump()
-    elif hasattr(data, "__iter__") and not isinstance(data, (str, dict)):
-        data = [d.model_dump() if hasattr(d, "model_dump") else d for d in data]
+    data = _json_ready(data)
 
     def date_handler(obj):
         if isinstance(obj, date):
@@ -299,27 +307,33 @@ def cmd_track(args):
             date=args.date,
             merge=args.merge,
         )
-        print("\n=== 馬場情報 ===")
-        if args.venue:
-            print(f"競馬場: {args.venue}")
-        print(f"ソース: {', '.join(results.keys()) or 'なし'}\n")
 
-        if args.json:
-            print_json(results)
-            return
+    if args.json:
+        print_json(results)
+        return
 
-        for source, info in results.items():
-            print(f"[{source}] {info.racecourse} 天候: {info.weather.value}")
-            if info.turf:
-                cushion = ""
-                if info.turf.cushion and info.turf.cushion.value is not None:
-                    cushion = (
-                        f" クッション値: {info.turf.cushion.value}"
-                        f" ({info.turf.cushion.hardness_level})"
-                    )
-                print(f"  芝: {info.turf.condition.value}{cushion}")
-            if info.dirt:
-                print(f"  ダート: {info.dirt.condition.value}")
+    print("\n=== 馬場情報 ===")
+    if args.venue:
+        print(f"競馬場: {args.venue}")
+    print(f"ソース: {', '.join(results.keys()) or 'なし'}\n")
+
+    for source, info in results.items():
+        place = info.racecourse or "不明"
+        print(f"[{source}] {place} 天候: {info.weather.value}")
+        if info.warning:
+            print(f"  警告: {info.warning}")
+        if info.warning and info.racecourse is None:
+            continue
+        if info.turf:
+            cushion = ""
+            if info.turf.cushion and info.turf.cushion.value is not None:
+                cushion = (
+                    f" クッション値: {info.turf.cushion.value}"
+                    f" ({info.turf.cushion.hardness_level})"
+                )
+            print(f"  芝: {info.turf.condition.value}{cushion}")
+        if info.dirt:
+            print(f"  ダート: {info.dirt.condition.value}")
 
 
 def cmd_odds(args):

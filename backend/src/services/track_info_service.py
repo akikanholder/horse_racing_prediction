@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 
-from backend.models.track import CourseInfo, TrackInfo
+from backend.models.track import CourseInfo, TrackInfo, empty_track_info
 from backend.scrapers.jra_track_scraper import JRATrackScraper
 from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
 
@@ -123,6 +123,7 @@ class TrackInfoService:
             except Exception as e:
                 logger.warning(f"Failed to get JRA track info: {e}")
                 errors["jra"] = str(e)
+                results["jra"] = empty_track_info("JRA", "JRA baba fetch failed")
 
         if "netkeiba" in sources:
             try:
@@ -132,11 +133,19 @@ class TrackInfoService:
             except Exception as e:
                 logger.warning(f"Failed to get Netkeiba track info: {e}")
                 errors["netkeiba"] = str(e)
+                results["netkeiba"] = empty_track_info(
+                    "Netkeiba", "netkeiba track fetch failed"
+                )
 
-        if merge and len(results) > 1:
-            results["merged"] = self._merge_track_info(
-                results.get("jra"), results.get("netkeiba")
-            )
+        jra_info = results.get("jra")
+        netkeiba_info = results.get("netkeiba")
+        if (
+            merge
+            and jra_info is not None
+            and netkeiba_info is not None
+            and (jra_info.racecourse or netkeiba_info.racecourse)
+        ):
+            results["merged"] = self._merge_track_info(jra_info, netkeiba_info)
 
         if errors:
             logger.info(f"Errors during scraping: {errors}")
@@ -214,7 +223,7 @@ class TrackInfoService:
 
         return TrackInfo(
             racecourse=jra_info.racecourse or netkeiba_info.racecourse,
-            date=jra_info.date,
+            date=jra_info.date or netkeiba_info.date,
             weather=jra_info.weather
             if jra_info.weather.value != "不明"
             else netkeiba_info.weather,
