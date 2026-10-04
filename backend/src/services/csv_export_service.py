@@ -384,9 +384,10 @@ class CsvExportService:
             )
         except Exception as e:
             return [], [f"{venue_name}: 馬場情報の取得に失敗しました: {e}"]
-        if not tracks:
+        usable = [info for info in tracks.values() if info.racecourse]
+        if not usable:
             return [], [f"{venue_name}: 馬場情報を取得できませんでした"]
-        return [_track_row(info) for info in tracks.values()], []
+        return [_track_row(info) for info in usable], []
 
 
 def _course_row(course: Course) -> dict:

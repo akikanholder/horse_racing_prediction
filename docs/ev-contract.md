@@ -393,6 +393,8 @@ python -m backend.cli result 202605030811 --json
 
 馬場状態・芝/ダート/障害・競馬場・距離は、そのページに書いてあるときだけ `going` / `surface` / `venue` / `distance`。`不明` や距離 0 は null。`going` は 良/稍重/重/不良。
 
+`venue` は出馬表の開催ヘッダ（`RaceData02` の競馬場名）が、その `race_id` の場と一致するときだけ。netkeiba の ID は `年 + 場 + 回 + 日 + レース`。日次（2日目の `02`）は場コードではない。`02` は函館の場コードだが、東京2日・京都2日の ID からは函館にしない。ナビや 403 本文に場名が出ていても写さない。ヘッダが別の場なら `venue` は null。
+
 `inside_outside` と `pace_bias` は、公式の事前ページがバイアスの見出しとして印刷しているセルだけ。見出しは `内外` / `内外バイアス` / `枠バイアス`、または `ペース` / `ペースバイアス` / `展開バイアス`。セルは空白を畳んだ短いラベル（16字まで）。`傷み`、`内柵`、`コース`、`回り`、`メートル` を含む文は捨てる。同じ項目がページ内で食い違うときも捨てる。
 
 ソース:
@@ -576,9 +578,13 @@ python -m backend.cli result 202605030811 --json
 
 `WeeklyVenueSchedule`: `venue`, `venue_code`, `dates`, `round_number`, `conditions`, `fetched_at`。
 
-`TrackInfo`（`GET /api/tracks` の値）: `racecourse`, `date`, `weather`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` または `Netkeiba`。オッズの `source` とは別の語）, `scraped_at`。
+`TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` または `Netkeiba`。オッズの `source` とは別の語）, `warning`, `scraped_at`。
 
-芝/ダートの `condition` は 良/稍重/重/不良/不明。`moisture` は `goal_front` と `fourth_corner`。`cushion.value` が null のとき硬さは「不明」。`grass_info.course_name` は使用コース（A/B/C）。バイアスにはしない。`merge=true` のとき統合結果はキー `merged`。掲載が無い HTTP は 404。
+芝/ダートの `condition` は 良/稍重/重/不良/不明。`moisture` は `goal_front` と `fourth_corner`。`cushion.value` が null のとき硬さは「不明」。`grass_info.course_name` は使用コース（A/B/C）。バイアスにはしない。`merge=true` のとき、場が取れたソースがある場合だけ統合結果はキー `merged`。
+
+JRA は個別の `/keiba/baba/{venue}.html` を見ない。当週の `index.html` と `index2.html`（cp932）だけ。タイトル `馬場情報（○○競馬場）` が依頼した場のタブだけを読む。403、タイトルの無い本文、別場のタブでは `racecourse` も `date` も null。`turf.cushion` と `turf.moisture` / `dirt.moisture` も null。`warning` は `JRA baba returned 403`、`JRA baba page is not the requested meeting`、`JRA baba page could not be parsed`、`JRA baba fetch failed` のいずれか。netkeiba の馬場も、選択中のタブが依頼した場のときだけ数値を写す。失敗しても HTTP は 200 で、この形の JSON を返す。`cli track --json` は見出しを混ぜず、このオブジェクトだけを出す。クッション値・含水率・馬場状態は 403 本文やレース名からは作らない。
+
+掲載が無くソース自体が空のときの HTTP は 404。
 
 ## 対象外
 

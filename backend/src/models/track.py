@@ -143,10 +143,16 @@ class GrassInfo(BaseModel):
 
 
 class TrackInfo(BaseModel):
-    """競馬場の馬場情報."""
+    """競馬場の馬場情報.
 
-    racecourse: str = Field(..., description="競馬場名")
-    date: datetime = Field(..., description="開催日")
+    取得できないときもこの形のまま返す。競馬場・日付・クッション値・含水率は
+    null。``warning`` に理由を書く。403 本文や別場のページからは埋めない。
+    """
+
+    racecourse: str | None = Field(
+        None, description="競馬場名。依頼した場のページでなければ null"
+    )
+    date: datetime | None = Field(None, description="開催日。ページに無ければ null")
     weather: Weather = Field(default=Weather.UNKNOWN, description="天候")
     turf: CourseInfo | None = Field(None, description="芝コース情報")
     dirt: CourseInfo | None = Field(None, description="ダートコース情報")
@@ -155,10 +161,30 @@ class TrackInfo(BaseModel):
         default_factory=list, description="週間天候情報"
     )
     source: str = Field(..., description="データソース (JRA/Netkeiba)")
+    warning: str | None = Field(
+        None, description="取得できない理由。取れたときは null"
+    )
     scraped_at: datetime = Field(
         default_factory=datetime.now, description="スクレイピング時刻"
     )
 
     model_config = ConfigDict(
         ser_json_timedelta="iso8601",
+    )
+
+
+def empty_track_info(source: str, warning: str) -> TrackInfo:
+    """TrackInfo shape when the page cannot be used.
+
+    Cushion and moisture stay null. The racecourse is not filled from a
+    403 body, nav chrome, or the requested name alone.
+    """
+    return TrackInfo(
+        racecourse=None,
+        date=None,
+        weather=Weather.UNKNOWN,
+        turf=CourseInfo(course_type=CourseType.TURF),
+        dirt=CourseInfo(course_type=CourseType.DIRT),
+        source=source,
+        warning=warning,
     )

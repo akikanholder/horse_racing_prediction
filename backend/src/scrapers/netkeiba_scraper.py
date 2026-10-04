@@ -1381,31 +1381,29 @@ class NetkeibaScraper(BaseScraper):
                 self.clean_text(race_name_elem.get_text()) if race_name_elem else f"Race {race_id}"
             )
 
-            race_data_elem = soup.find(class_=re.compile(r"RaceData|race_data"))
-            race_data_text = self.clean_text(race_data_elem.get_text()) if race_data_elem else ""
-
             race_number = self._extract_race_number(race_id)
             race_date = self._extract_date_from_race_id(race_id) or date.today()
-            venue_code = self._extract_venue_code_from_race_id(race_id)
-            venue = self.VENUE_CODES.get(venue_code, "不明")
-            distance, track_type = self._extract_distance_info(race_data_text)
-
-            track_condition = None
-            for cond in ["良", "稍重", "重", "不良"]:
-                if cond in race_data_text:
-                    track_condition = cond
-                    break
-
-            weather = None
-            for w in ["晴", "曇", "雨", "小雨", "雪"]:
-                if w in race_data_text:
-                    weather = w
-                    break
-
-            post_time = None
-            time_match = re.search(r"(\d{1,2}:\d{2})", race_data_text)
-            if time_match:
-                post_time = time_match.group(1)
+            venue_code, venue, race_data_text = self._confirmed_meeting(soup, race_id)
+            if venue == "不明":
+                distance, track_type = None, None
+                track_condition = None
+                weather = None
+                post_time = None
+            else:
+                distance, track_type = self._extract_distance_info(race_data_text)
+                track_condition = None
+                going_match = re.search(r"馬場[:：]\s*(\S+)", race_data_text)
+                if going_match:
+                    track_condition = _parse_going(going_match.group(1))
+                weather = None
+                for w in ["晴", "曇", "雨", "小雨", "雪"]:
+                    if w in race_data_text:
+                        weather = w
+                        break
+                post_time = None
+                time_match = re.search(r"(\d{1,2}:\d{2})", race_data_text)
+                if time_match:
+                    post_time = time_match.group(1)
 
             return Race(
                 race_id=race_id,
@@ -1424,6 +1422,69 @@ class NetkeibaScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"Failed to parse race info: {e}")
             return None
+
+    def _confirmed_meeting(
+        self, soup: BeautifulSoup, race_id: str
+    ) -> tuple[str | None, str, str]:
+        """Return venue code, name, and RaceData01 text when the page is that meeting.
+
+        The name is copied only from a ``RaceData02`` span. Nav chrome and a
+        403 body are ignored. A netkeiba id's day field is not a venue code:
+        day 2 is ``02``, which is 函館 only when the header actually says so.
+        """
+        page_venue = self._meeting_header_venue(soup)
+        requested_code, requested_name = self._venue_requested_by_race_id(race_id)
+        if page_venue is None:
+            return None, "不明", ""
+        if requested_name is not None and page_venue != requested_name:
+            return None, "不明", ""
+        code = requested_code
+        if code is None:
+            code = next(
+                (venue_code for venue_code, name in self.VENUE_CODES.items() if name == page_venue),
+                None,
+            )
+        data01 = soup.select_one(".RaceData01")
+        text = self.clean_text(data01.get_text()) if isinstance(data01, Tag) else ""
+        return code, page_venue, text
+
+    def _meeting_header_venue(self, soup: BeautifulSoup) -> str | None:
+        """Venue printed in the meeting header. One name, or none."""
+        data02 = soup.select_one(".RaceData02")
+        if not isinstance(data02, Tag):
+            return None
+        venues = set(self.VENUE_CODES.values())
+        found: list[str] = []
+        for span in data02.find_all("span"):
+            name = self.clean_text(span.get_text())
+            if name in venues and name not in found:
+                found.append(name)
+        if len(found) == 1:
+            return found[0]
+        return None
+
+    def _venue_requested_by_race_id(self, race_id: str) -> tuple[str | None, str | None]:
+        """Venue of a netkeiba id (year+venue+kai+day+race) or a project id.
+
+        Netkeiba is used when kai is 1-6 and the day is 1-12. The day digits
+        are not read as a venue code.
+        """
+        if len(race_id) < 12 or not race_id[:12].isdigit():
+            return None, None
+        body = race_id[:12]
+        netkeiba_code = body[4:6]
+        kai = int(body[6:8])
+        day_number = int(body[8:10])
+        if netkeiba_code in self.VENUE_CODES and 1 <= kai <= 6 and 1 <= day_number <= 12:
+            return netkeiba_code, self.VENUE_CODES[netkeiba_code]
+        try:
+            date(int(body[:4]), int(body[4:6]), int(body[6:8]))
+        except ValueError:
+            return None, None
+        project_code = body[8:10]
+        if project_code in self.VENUE_CODES:
+            return project_code, self.VENUE_CODES[project_code]
+        return None, None
 
     def _parse_race_entries(self, soup: BeautifulSoup) -> list[RaceEntry]:
         """Parse race entries from shutuba page."""
