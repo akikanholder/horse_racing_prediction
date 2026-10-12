@@ -14,7 +14,9 @@ from backend.models.course import CourseCondition
 from backend.models.horse import (
     PEDIGREE_ABSENT,
     PEDIGREE_FETCH_FAILED,
+    PEDIGREE_FORBIDDEN,
     PEDIGREE_INCOMPLETE,
+    PEDIGREE_LOGIN,
     PEDIGREE_SOURCE_BOTH,
     PEDIGREE_SOURCE_PED,
     PEDIGREE_SOURCE_PROFILE,
@@ -405,6 +407,18 @@ def _pedigree_member(name: str | None, horse_id: str | None) -> PedigreeHorse | 
     return PedigreeHorse(name=name, horse_id=horse_id)
 
 
+def _pedigree_failure(exc: Exception) -> str:
+    """403 and a login wall are not retried and are not labeled as a generic miss."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(exc, AccessBlocked):
+        status = exc.status
+    if status == 403:
+        return "forbidden"
+    if status == 401:
+        return "login"
+    return "failed"
+
+
 def _assemble_pedigree(
     identity: _HorseIdentity,
     *,
@@ -426,6 +440,10 @@ def _assemble_pedigree(
         source = None
     if sire is not None and dam is not None:
         warning = None
+    elif ped_table == "forbidden":
+        warning = PEDIGREE_FORBIDDEN
+    elif ped_table == "login":
+        warning = PEDIGREE_LOGIN
     elif ped_table == "failed":
         warning = PEDIGREE_FETCH_FAILED
     elif ped_table == "malformed":
@@ -2185,7 +2203,7 @@ class NetkeibaScraper(BaseScraper):
                 soup = self._fetch_horse_page(url, referer=f"{self.DB_URL}/horse/{horse_id}/")
             except Exception as e:
                 logger.error("Failed to fetch pedigree for %s: %s", horse_id, e)
-                ped_table = "failed"
+                ped_table = _pedigree_failure(e)
             else:
                 ped_table, ped_contributed = _merge_ped_soup(soup, identity)
         return _assemble_pedigree(

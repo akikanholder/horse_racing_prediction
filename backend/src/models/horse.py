@@ -16,6 +16,8 @@ PEDIGREE_SOURCE_PROFILE = "profile"
 PEDIGREE_SOURCE_PED = "netkeiba_ped"
 PEDIGREE_SOURCE_BOTH = "profile+netkeiba_ped"
 PEDIGREE_FETCH_FAILED = "pedigree fetch failed"
+PEDIGREE_FORBIDDEN = "pedigree returned 403"
+PEDIGREE_LOGIN = "pedigree requires login"
 PEDIGREE_TABLE_NOT_FOUND = "pedigree table not found"
 PEDIGREE_TABLE_MALFORMED = "pedigree table malformed"
 PEDIGREE_ABSENT = "pedigree not on profile or ped page"
@@ -77,9 +79,9 @@ class Pedigree(BaseModel):
         None,
         description=(
             "父と母が揃わない理由。"
-            "pedigree fetch failed / pedigree table not found / "
-            "pedigree table malformed / pedigree not on profile or ped page / "
-            "pedigree incomplete"
+            "pedigree fetch failed / pedigree returned 403 / pedigree requires login / "
+            "pedigree table not found / pedigree table malformed / "
+            "pedigree not on profile or ped page / pedigree incomplete"
         ),
     )
 

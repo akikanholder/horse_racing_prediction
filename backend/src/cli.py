@@ -5,14 +5,16 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from backend.models.historical import HistoricalBatch, HistoricalRace
 from backend.models.horse import Horse, HorsePerformance, PedigreeHorse
 from backend.models.odds import OddsQuote
 from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, TrackBias
+from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
 from backend.services.race_service import RaceService
@@ -634,6 +636,94 @@ def _print_historical_race(race: HistoricalRace) -> None:
         print(f"返還: {horses or '印字なし'}")
 
 
+def cmd_trends(args):
+    """Win rate, top-2, top-3, and ROI over settled history."""
+    if not args.recent_meeting and not args.date and not args.date_from:
+        print("--date か --from か --recent-meeting を指定してください")
+        sys.exit(1)
+    with RaceService() as service:
+        report = service.get_race_trends(
+            venues=args.venue,
+            surface=args.surface,
+            distance=args.distance,
+            race_class=args.race_class,
+            going=args.going,
+            on_date=_cli_date(args.date),
+            date_from=_cli_date(args.date_from),
+            date_to=_cli_date(args.date_to),
+            recent_meeting=args.recent_meeting,
+            as_of=_cli_date(args.as_of),
+        )
+    if args.json:
+        print_json(report)
+        return
+    _print_trends(report)
+
+
+def _print_trends(report: RaceTrendReport) -> None:
+    print("\n=== レース傾向（確定結果の集計。予想の入力ではない） ===")
+    print(f"モード: {report.mode}")
+    print(f"レース数: {report.sample_size}  出走: {report.runner_sample_size}")
+    if report.recent_meeting and report.recent_meeting.previous_meeting_date:
+        print(
+            f"当日: {report.recent_meeting.as_of}  "
+            f"前開催日: {report.recent_meeting.previous_meeting_date}"
+        )
+    if report.source:
+        print(f"ソース: {report.source}")
+    print(f"計算時刻: {report.computed_at}")
+    if report.fetched_at:
+        print(f"取得時刻: {report.fetched_at}")
+    elif report.fetched_at_min:
+        print(f"取得時刻: {report.fetched_at_min} から {report.fetched_at_max}")
+    if report.warning:
+        print(f"警告: {report.warning}")
+    if report.excluded:
+        print("除外:")
+        for item in report.excluded:
+            print(f"  {item.race_id}: {item.reason}")
+    _print_trend_rows("人気", report.by_popularity, lambda row: row.band)
+    _print_trend_rows("馬番", report.by_gate, lambda row: f"{row.horse_number}番")
+    _print_trend_rows("枠", report.by_frame, lambda row: f"{row.bracket_number}枠")
+    print(f"脚質の定義: {report.running_style_definition.position}")
+    print(f"  逃げ: {report.running_style_definition.escape}")
+    print(f"  先行: {report.running_style_definition.front_end}")
+    print(f"  差し: {report.running_style_definition.mid_end}")
+    _print_trend_rows("脚質", report.by_running_style, lambda row: row.label)
+    _print_trend_rows(
+        "騎手",
+        report.by_jockey,
+        lambda row: f"{row.jockey_name} {row.surface}",
+    )
+    _print_trend_rows(
+        "父",
+        report.by_sire,
+        lambda row: f"{row.sire_name or row.sire_id or '父不明'} {row.surface}",
+    )
+
+
+def _print_trend_rows(title: str, rows: Sequence[Any], label: Callable[[Any], str]) -> None:
+    print(f"\n--- {title} ---")
+    if not rows:
+        print("なし")
+        return
+    for row in rows:
+        rates = _rate_text(row)
+        warning = f" 警告: {row.warning}" if row.warning else ""
+        print(f"{label(row)}  n={row.sample_size}  {rates}{warning}")
+
+
+def _rate_text(row: TrendBucket) -> str:
+    def _num(value: float | None) -> str:
+        return "-" if value is None else f"{value:.4f}"
+
+    return (
+        f"勝 {_num(row.win_rate)} 連対 {_num(row.top2_rate)} "
+        f"複勝率 {_num(row.top3_rate)} 単勝ROI {_num(row.win_roi)} "
+        f"複勝ROI {_num(row.place_roi)}"
+    )
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with RaceService() as service:
@@ -820,6 +910,38 @@ def main():
     )
     history_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     history_parser.set_defaults(func=cmd_history)
+
+    trends_parser = subparsers.add_parser(
+        "trends",
+        help="確定レースの人気・枠・脚質・騎手・父の勝率と回収を集計する",
+        description=(
+            "history の確定着順・確定オッズ・払戻と、ローカルキャッシュから集計する。"
+            "人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分けて出す。"
+            "脚質は通過順の最初の数字と頭数の三等分。4コーナーは使わない。"
+            "少ない標本も sample_size 付きで残す。計算できない値は null と warning。"
+            "403 とログイン画面は再試行せず、User-Agent の差し替えや captcha はしない。"
+            "--recent-meeting は当日の確定と、同じ競馬場の前開催日だけ。"
+        ),
+    )
+    trends_parser.add_argument("--date", help="その日だけ。YYYY-MM-DD")
+    trends_parser.add_argument("--from", dest="date_from", help="開始日 YYYY-MM-DD")
+    trends_parser.add_argument("--to", dest="date_to", help="終了日 YYYY-MM-DD")
+    trends_parser.add_argument("--venue", action="append", help="競馬場。繰り返す")
+    trends_parser.add_argument("--surface", choices=["芝", "ダート"], help="芝またはダート")
+    trends_parser.add_argument("--distance", type=int, help="距離 (m)")
+    trends_parser.add_argument("--class", dest="race_class", help="クラス。印字との一致")
+    trends_parser.add_argument("--going", choices=["良", "稍重", "重", "不良"], help="馬場状態")
+    trends_parser.add_argument(
+        "--recent-meeting",
+        action="store_true",
+        help="当日の確定レースと、同じ競馬場の前開催日だけ",
+    )
+    trends_parser.add_argument(
+        "--as-of",
+        help="recent meeting の当日。YYYY-MM-DD。無ければ今日",
+    )
+    trends_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    trends_parser.set_defaults(func=cmd_trends)
 
     args = parser.parse_args()
 
