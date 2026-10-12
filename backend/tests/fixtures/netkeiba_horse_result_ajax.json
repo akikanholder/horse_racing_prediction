@@ -1,0 +1,11 @@
+{
+  "performances": [
+    {"race_date": "2024/06/23", "race_id": "202408040811", "race_name": "宝塚記念(GI)", "venue": "京都", "距離": "芝2200", "馬場": "重"},
+    {"race_date": "2024/03/31", "race_id": "202409020811", "race_name": "大阪杯(GI)", "venue": "阪神", "distance": 2000, "track_type": "芝"},
+    {"race_date": "2023/12/24", "race_id": "202306050811", "race_name": "有馬記念(GI)", "venue": "中山", "distance": 2500, "track_type": "芝"},
+    {"race_date": "2023/11/26", "race_id": "202305050812", "race_name": "ジャパンC(GI)", "venue": "東京", "distance": 2400, "track_type": "芝"},
+    {"race_date": "2023/06/25", "race_id": "202308040811", "race_name": "宝塚記念(GI)", "venue": "阪神", "distance": 2200, "track_type": "芝"},
+    {"race_date": "2023/04/02", "race_id": "202309020811", "race_name": "大阪杯(GI)", "venue": "阪神", "distance": 2000, "track_type": "芝"},
+    {"race_date": "2022/12/25", "race_id": "202206050811", "race_name": "有馬記念(GI)", "venue": "中山", "distance": 2500, "track_type": "芝"}
+  ]
+}

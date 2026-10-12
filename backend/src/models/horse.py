@@ -121,7 +121,25 @@ class Horse(BaseModel):
     total_earnings: int | None = Field(None, description="総獲得賞金 (万円)")
     performances: list[HorsePerformance] = Field(
         default_factory=list,
-        description="過去成績。馬成績ページの近走履歴であり、今走の確定結果ではない",
+        description="過去成績。ログイン無しで見える近走。今走の確定結果ではない",
+    )
+    runs_fetched: int = Field(
+        0,
+        description="返した近走の数。performances の長さ。失敗時は 0",
+    )
+    login_required_for_more: bool | None = Field(
+        None,
+        description=(
+            "ページが、返した走より先はログインが必要と示しているとき true。"
+            "全成績でログイン不要と示しているとき false。どちらとも読めなければ null"
+        ),
+    )
+    source: str | None = Field(
+        None,
+        description=(
+            "近走を得た方法。netkeiba_html / netkeiba_js / headless。"
+            "混ざるときは netkeiba_html+netkeiba_js。1走も無いときは null"
+        ),
     )
     fetched_at: datetime = Field(..., description="取得日時")
     pedigree: Pedigree | None = Field(
@@ -151,9 +169,13 @@ class Horse(BaseModel):
     warning: str | None = Field(
         None,
         description=(
-            "成績を取れなかった理由。"
+            "近走が取れない、または要求した走数に公開分が足りない理由。"
             "horse result fetch failed / horse result table not found / "
-            "horse result table malformed / no performances on horse result page"
+            "horse result table malformed / no performances on horse result page / "
+            "horse result returned 403 / horse result requires login / "
+            "horse result blocked by captcha / "
+            "fewer than N recent runs available without login / "
+            "headless browser is not installed"
         ),
     )
 
@@ -163,6 +185,8 @@ class Horse(BaseModel):
             self.pedigree = absent_pedigree()
         if self.training is None:
             self.training = training_not_loaded()
+        if "runs_fetched" not in self.model_fields_set:
+            self.runs_fetched = len(self.performances)
         self.running_style = derive_running_style(self.performances)
         return self
 
@@ -180,7 +204,26 @@ class HorseBasicInfo(BaseModel):
     training_center: str | None = Field(None, description="所属")
     recent_performances: list[HorsePerformance] = Field(
         default_factory=list,
-        description="近走成績。馬成績ページの過去走であり、当該レースの確定結果ではない",
+        description="近走成績。ログイン無しで見える過去走であり、当該レースの確定結果ではない",
+    )
+    runs_fetched: int = Field(0, description="返した近走の数。失敗時は 0")
+    login_required_for_more: bool | None = Field(
+        None,
+        description=(
+            "成績ページが、返した走より先はログインが必要と示しているとき true。"
+            "示していなければ false。不明なら null"
+        ),
+    )
+    source: str | None = Field(
+        None,
+        description="近走を得た方法。netkeiba_html / netkeiba_js / headless。無ければ null",
+    )
+    fetched_at: datetime | None = Field(None, description="近走を得た時刻。失敗時は null")
+    warning: str | None = Field(
+        None,
+        description=(
+            "近走が取れない、または要求した走数に公開分が足りない理由。出走馬一覧の要求は 5 走"
+        ),
     )
     pedigree: Pedigree | None = Field(
         None,
@@ -211,5 +254,7 @@ class HorseBasicInfo(BaseModel):
             self.pedigree = absent_pedigree()
         if self.training is None:
             self.training = training_not_loaded()
+        if "runs_fetched" not in self.model_fields_set:
+            self.runs_fetched = len(self.recent_performances)
         self.running_style = derive_running_style(self.recent_performances)
         return self

@@ -165,13 +165,15 @@ with TrackInfoService() as service:
 
 `GET /api/horses/{horse_id}` と `python -m backend.cli horse <horse_id>` はその馬の過去走を返す。今走の確定結果ではない。着順の精算や `cli result` には使わず、近走の能力評価にだけ使う。血統・脚質・トラックバイアス・調教の契約は後述。
 
-- 成績の行は `https://db.netkeiba.com/horse/result/{horse_id}/` の表。列名で読む。水分量や馬場指数の列をタイムや上がりには使わない。
+- 成績の行は `https://db.netkeiba.com/horse/result/{horse_id}/` の、ログイン無しで見える表。列名で読む。水分量や馬場指数の列をタイムや上がりには使わない。netkeiba のログイン、Cookie、資格情報は使わない。403、captcha、ログイン画面は止める。
 - 馬名と通算成績は馬ページ `https://db.netkeiba.com/horse/{horse_id}/`。結果ページの見出しに名前があるときは、馬ページが取れなくても名前を埋める。
 - 通算成績はページの「通算成績」（`16戦8勝`）。走った行数から勝ち数は作らない。獲得賞金は中央と地方を万円で足す。
 - セルが空、`**`、`取`、`計不` のときは数値を作らず null。距離が読めない行も `distance: null`（0 にはしない）。
-- 取れないときは `performances: []` と `warning`。値は `horse result fetch failed`、`horse result table not found`、`horse result table malformed`、`no performances on horse result page`。
-- `fetched_at` は取得時刻。フィールド名は従来どおり。追加は `fetched_at` と `warning`。`prize_money` は万円の小数を残すため数値（例: `50298.2`）。
-- `GET /api/races/{race_id}/horses` の `recent_performances` も同じ成績ページの過去走であり、そのレースの結果ではない。
+- 取れないときは `performances: []` と `warning`。値は `horse result fetch failed`、`horse result table not found`、`horse result table malformed`、`no performances on horse result page`、`horse result returned 403`、`horse result requires login`、`horse result blocked by captcha`。
+- 公開分が要求より少ないときは `fewer than N recent runs available without login`。`Horse` の要求は 9 走。見えている行は返す。`runs_fetched` はその数。`login_required_for_more` はページが続きにログインが必要と示しているとき true、不要と示しているとき false、不明なら null。`source` は `netkeiba_html` / `netkeiba_js` / `headless`。
+- 表が短く、ページ自身が呼ぶ同一サイトの URL がある、または「読み込み中」のときは、ページ内 JSON、その URL、入っていればヘッドレスの順。続きがログインのときは進まない。
+- `fetched_at` は取得時刻。`prize_money` は万円の小数を残すため数値（例: `50298.2`）。
+- `GET /api/races/{race_id}/horses` の `recent_performances` も同じ成績ページの公開分であり、そのレースの結果ではない。最大5走。
 - 着順の精算は `cli result` / `GET /api/races/{race_id}/result`。近走の行を今走の結果として使わない。
 
 ## 確定結果
