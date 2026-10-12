@@ -26,6 +26,7 @@ from backend.models.race import (
     horse_track_bias,
     track_bias_from_race,
 )
+from backend.models.race_trends import RaceTrendReport
 from backend.models.training import TRAINING_FETCH_FAILED, unavailable_training
 from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publication
 from backend.scrapers.jra_scraper import JRAScraper
@@ -41,6 +42,7 @@ from backend.scrapers.runner_status import (
 )
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
 from backend.services.historical_service import HistoricalService
+from backend.services.race_trend_service import RaceTrendService
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +290,39 @@ class RaceService:
     ) -> HistoricalExport:
         """Write JSONL or per-surface CSV. Out-of-scope races are left out."""
         return HistoricalService.export(batch, Path(directory), fmt)
+
+    def get_race_trends(
+        self,
+        *,
+        venues: list[str] | None = None,
+        surface: str | None = None,
+        distance: int | None = None,
+        race_class: str | None = None,
+        going: str | None = None,
+        on_date: date | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        recent_meeting: bool = False,
+        as_of: date | None = None,
+    ) -> RaceTrendReport:
+        """Win, top-2, top-3, and ROI tables over settled history.
+
+        The rows come from ``history`` and the local page cache. A missing
+        price or sire stays null. A 403 or a login wall is not retried.
+        """
+        with RaceTrendService() as service:
+            return service.get(
+                venues=venues,
+                surface=surface,
+                distance=distance,
+                race_class=race_class,
+                going=going,
+                on_date=on_date,
+                date_from=date_from,
+                date_to=date_to,
+                recent_meeting=recent_meeting,
+                as_of=as_of,
+            )
 
     def get_race_odds(
         self,

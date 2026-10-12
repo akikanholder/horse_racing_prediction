@@ -55,12 +55,12 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 
 | サブコマンド | `--json` の標準出力 |
 |---|---|
-| `odds` `result` `history` `track` | JSON だけ |
+| `odds` `result` `history` `trends` `track` | JSON だけ |
 | `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
 
 混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
 
-HTTP は JSON だけ。見つからないレース・馬・コースは 404。サービス未初期化は 503。スクレイパ例外は 500。オッズと確定結果は欠測でも 200 で、本体の `status` / `warning` を見る。
+HTTP は JSON だけ。見つからないレース・馬・コースは 404。サービス未初期化は 503。スクレイパ例外は 500。オッズ、確定結果、レース傾向は欠測でも 200 で、本体の `status` / `warning` を見る。傾向で日付も recent meeting も無いときは 400。
 
 ## CLI と HTTP
 
@@ -77,6 +77,8 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli history <race_id> --json` | `GET /api/races/{race_id}/history` | `HistoricalBatch`。2025年以降の平地のバックテスト。予想の入力にしない |
 | `python -m backend.cli history --date 2025-01-05 --venue 東京 --json` | `GET /api/races/history?date=2025-01-05&venue=東京` | その日の範囲内レース。日付範囲は `--from` `--to` と `date_from` `date_to` |
 | `python -m backend.cli history --date 2025-01-05 --export csv` | `POST /api/races/history/export?date=2025-01-05&format=csv` | 芝・ダートで分けられる CSV。`format=jsonl` は1レース1行 |
+| `python -m backend.cli trends --date 2025-06-08 --venue 東京 --surface 芝 --json` | `GET /api/races/trends?date=2025-06-08&venue=東京&surface=芝` | 確定レースの人気・枠・脚質・騎手・父の集計。予想の入力にしない |
+| `python -m backend.cli trends --recent-meeting --venue 東京 --json` | `GET /api/races/trends?recent_meeting=true&venue=東京` | 当日の確定と、同じ競馬場の前開催日 |
 | `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds` |
 | `python -m backend.cli courses --json` | `GET /api/courses` | `Course` の配列 |
 | `python -m backend.cli courses --venue 東京 --json` | `GET /api/courses/{venue}` | `Course` |
@@ -523,6 +525,55 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 | `jsonl` | `historical.jsonl`。1レース1行。`surface` で分ける。`progress.json` に停止位置 |
 | `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、馬番、馬名、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻。`progress.json` に停止位置 |
 
+## レース傾向 `RaceTrendReport`
+
+確定した過去レースの集計。予想の入力に混ぜない。行は `history` と同じ確定着順・確定オッズ・払戻。ページは `backend/.cache/pages` を使い、キャッシュにある URL は開き直さない。
+
+```bash
+python -m backend.cli trends --from 2025-06-01 --to 2025-06-08 --venue 東京 --surface 芝 --distance 1600 --class 未勝利 --going 良 --json
+python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 --json
+```
+
+`GET /api/races/trends`。日付が無く `--recent-meeting` でもないときは 400。欠測の集計は 200 で、rate は null、`warning` を見る。
+
+| クエリ | 意味 |
+|---|---|
+| `venue` | 競馬場。繰り返す |
+| `surface` | `芝` または `ダート` |
+| `distance` | メートル。印字と一致 |
+| `class` | クラス。印字と一致 |
+| `going` | 良 / 稍重 / 重 / 不良 |
+| `date` / `date_from` / `date_to` | 開催日。含む |
+| `recent_meeting` | true のとき、当日の確定とその競馬場の前開催日だけ |
+| `as_of` | recent meeting の当日。無ければ今日 |
+
+`--recent-meeting` は競馬場が一つ必要。前開催日は、当日の前日以前でその競馬場のレースが並んだ最も近い日。空の日は飛ばす。一覧が 403 またはログイン画面のときは、それより前の日も、レースページも開かない。User-Agent の差し替え、captcha、ログインはしない。120日見ても無いときは `previous_meeting_date` は null。
+
+集計に入れるのは `result_phase=confirmed` で、出走馬ごとに単勝の確定オッズがあるレース。無いレースは `excluded` に理由を書く。例: `final win odds were not on the page`、`race result returned 403`、`result phase is provisional`、`result phase was not on the page`。フィルタと印字が違うレースは除外一覧に入れない。印字が無くてフィルタを適用できないレースは入れる（`distance was not on the page` など）。
+
+各表の `sample_size` は出走馬数。取消・除外は入れない。`sample_size` が 0 の rate と ROI は null。0.0 にはしない。1頭の区分も落とさない。
+
+| 表 | 区分 |
+|---|---|
+| `by_popularity` | 1 / 2 / 3 / 4-6 / 7-9 / 10+。空の帯も残す |
+| `by_gate` | 馬番。出た番だけ |
+| `by_frame` | 枠番。出た枠だけ |
+| `by_running_style` | 逃げ / 先行 / 差し / 追込。0頭でも残す |
+| `by_jockey` | 騎手 × 芝/ダート。面は混ぜない |
+| `by_sire` | 父 × 芝/ダート。父が取れない馬は行にしない |
+
+`win_rate` / `top2_rate` / `top3_rate` は頭数で割った占有率（小数4桁）。
+
+`win_roi` と `place_roi` は `(回収円 / (100円 × 価格が付いた頭数)) - 1`。0 が元返し。単勝の回収は、その馬番の単勝払戻。払戻が無く確定オッズがある勝ち馬はオッズ×100。両方があって1円でも違うときは、その馬を ROI に入れず `win payout and final win odds disagree`。平均は作らない。
+
+複勝は、出走が8頭以上なら3着まで、5頭以上7頭以下なら2着まで。4頭以下は `place_roi` を null にし、`place betting is not sold when fewer than 5 horses start`。入着馬の回収は複勝払戻。単一の確定複勝オッズは、払戻が無いときだけオッズ×100。範囲（`odds_min` / `odds_max`）の中央値は作らず、`place odds are a range and were not used`。
+
+脚質は1レースの通過順で、4区分（逃げ・先行・差し・追込）。定義は `running_style_definition`。`basis` は `passing_order_first_call`。使うのは最初の数字（`13-12-12-7` の 13）。4コーナー（最後の数字）は使わない。最初の通過順位が 1 の馬は逃げで、三等分に入れない。それ以外の馬は `ceil(field_size / 3)` までが先行、`ceil(field_size * 2 / 3)` までが差し、それより後ろが追込。`ceil(field_size / 3)` が 1 のときは先行は 0 頭。頭数はページの `field_size`。読めない走はラベルにしない。0頭や1頭の区分も `sample_size` 付きで残す。
+
+父は履歴の着順に無い。馬IDがある馬だけ、既存の血統（`/horse/ped/{horse_id}/`）を1回読む。キャッシュにあれば開き直さない。父が無いときはその行を作らず、`runner_omissions` に血統の `warning`。403（`pedigree returned 403`）かログイン画面のあとは、残りの馬の血統を開かない。
+
+`source` は入れたレースの source を `+` でつないだもの。無ければ null。`fetched_at` は入れたレースの時刻が全て同じときだけ。違うときは null と `fetched_at differs across included races`。`fetched_at_min` と `fetched_at_max` は観測した端。`computed_at` は集計した時刻。
+
 ## 血統 `pedigree`
 
 `horse` と `/horses` に載る。出走馬一覧は `https://db.netkeiba.com/horse/ped/{horse_id}/` の `table.blood_table` だけ。馬単体はプロフィール表（`父` / `母` / `母父`）が先で、名前と ID が揃わないとき血統表。`class="blood"` の表は先頭2リンクが父と母。3番目を母父にはしない。
@@ -538,6 +589,8 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 `warning`:
 
 - `pedigree fetch failed`
+- `pedigree returned 403`
+- `pedigree requires login`
 - `pedigree table not found`
 - `pedigree table malformed`
 - `pedigree not on profile or ped page`

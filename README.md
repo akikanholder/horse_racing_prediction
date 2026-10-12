@@ -88,6 +88,7 @@ API ドキュメント: http://localhost:8000/docs
 | `GET /api/races/{race_id}` | 特定のレース情報を取得 |
 | `GET /api/races/{race_id}/card` | 出馬表を取得 |
 | `GET /api/races/{race_id}/result` | 確定した1レースの着順と払戻（近走ではない） |
+| `GET /api/races/trends` | 人気・枠・脚質・騎手・父の勝率と回収（確定レースの集計） |
 | `GET /api/races/{race_id}/horses` | 出走馬の詳細情報を取得（血統・脚質・調教を含む） |
 | `GET /api/races/{race_id}/odds` | 単勝・ワイド・馬連のオッズを取得 |
 | `GET /api/horses/{horse_id}` | 競走馬の近走・血統・脚質・調教を取得（今走の結果ではない） |
@@ -112,6 +113,10 @@ python -m backend.cli horse <horse_id>
 # 確定した1レースの着順と払戻（馬の近走成績ではない。予測入力に混ぜない）
 python -m backend.cli result <race_id>
 python -m backend.cli result <race_id> --json
+
+# 確定レースの傾向（人気・馬番・枠・脚質・騎手・父）。計算できない値は null
+python -m backend.cli trends --from 2025-06-01 --to 2025-06-08 --venue 東京 --surface 芝 --distance 1600 --class 未勝利 --going 良 --json
+python -m backend.cli trends --recent-meeting --venue 東京 --json
 
 # コース情報を取得
 python -m backend.cli courses
@@ -187,6 +192,10 @@ with TrackInfoService() as service:
 - 払戻はページの単勝・複勝・枠連・馬連・ワイド・馬単・3連複・3連単。同じ馬券種の行も全部残す。金額が無い馬券種は入れず、`payout_note` に残す。ページに無い価格は作らない。JRA の公開払戻に届くときは突き合わせ、不一致は `warning`。行の順番と、片方だけ空の人気は不一致にしない。届かないときも金額は作らず `JRA official payout was not reachable`。
 - 取れないときは `results: []`、`payouts: []` と `warning`。値は `race result fetch failed`、`race result not found`、`race not yet settled`、`race result table malformed`、`no finishers on race result page`、`race result returned 403`、`race result requires login`。
 - `fetched_at` は取得時刻。フィールドの対応は `docs/ev-contract.md`。
+
+## レース傾向
+
+`GET /api/races/trends` と `python -m backend.cli trends` は、確定した過去レースの勝率・連対率・複勝率と、単勝・複勝の ROI を返す。人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分ける。脚質は4区分で、最初の通過順位が 1 なら逃げ、それ以外は `ceil(頭数/3)` と `ceil(頭数*2/3)` で先行・差し・追込に分ける。その定義も返す。少ない標本は頭数付きで残す。計算できない値は null と warning。403 とログインは再試行しない。詳細は [docs/ev-contract.md](docs/ev-contract.md)。
 
 ## オッズ
 

@@ -15,6 +15,7 @@ from backend.models.historical import HistoricalBatch, HistoricalExport
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
+from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
 from backend.services.race_service import RaceService
@@ -76,6 +77,7 @@ async def root():
             "race_history": "/api/races/{race_id}/history",
             "race_history_dates": "/api/races/history?date=YYYY-MM-DD",
             "race_history_export": "/api/races/history/export?date=YYYY-MM-DD&format=jsonl",
+            "race_trends": "/api/races/trends?date=YYYY-MM-DD",
             "race_odds": (
                 "/api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live"
             ),
@@ -195,6 +197,51 @@ async def export_race_history(
         )
     except Exception as e:
         logger.error(f"Failed to export historical races: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/races/trends", response_model=RaceTrendReport, tags=["Races"])
+async def get_race_trends(
+    on_date: Annotated[
+        date | None, Query(alias="date", description="その日だけ YYYY-MM-DD")
+    ] = None,
+    date_from: Annotated[date | None, Query(description="開始日。含む")] = None,
+    date_to: Annotated[date | None, Query(description="終了日。含む")] = None,
+    venue: Annotated[list[str] | None, Query(description="競馬場。繰り返す")] = None,
+    surface: Annotated[Literal["芝", "ダート"] | None, Query(description="芝またはダート")] = None,
+    distance: Annotated[int | None, Query(ge=1, description="距離 (m)")] = None,
+    race_class: Annotated[str | None, Query(alias="class", description="クラス")] = None,
+    going: Annotated[Going | None, Query(description="良 / 稍重 / 重 / 不良")] = None,
+    recent_meeting: Annotated[
+        bool,
+        Query(description="当日の確定レースと、同じ競馬場の前開催日だけ"),
+    ] = False,
+    as_of: Annotated[date | None, Query(description="recent meeting の当日。無ければ今日")] = None,
+):
+    """人気、馬番、枠、脚質、騎手、父の勝率と回収。
+
+    過去レースとローカルキャッシュから計算する。欠測は null と warning。
+    403 とログイン画面は再試行しない。
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    if not recent_meeting and on_date is None and date_from is None:
+        raise HTTPException(status_code=400, detail="date or date_from is required")
+    try:
+        return race_service.get_race_trends(
+            venues=venue,
+            surface=surface,
+            distance=distance,
+            race_class=race_class,
+            going=going,
+            on_date=on_date,
+            date_from=date_from,
+            date_to=date_to,
+            recent_meeting=recent_meeting,
+            as_of=as_of,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get race trends: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

@@ -12,7 +12,9 @@ from backend.cli import _print_pedigree, _print_running_style, _print_track_bias
 from backend.models.horse import (
     PEDIGREE_ABSENT,
     PEDIGREE_FETCH_FAILED,
+    PEDIGREE_FORBIDDEN,
     PEDIGREE_INCOMPLETE,
+    PEDIGREE_LOGIN,
     PEDIGREE_SOURCE_BOTH,
     PEDIGREE_SOURCE_PED,
     PEDIGREE_SOURCE_PROFILE,
@@ -190,6 +192,35 @@ def test_malformed_pedigree_table_is_not_parsed():
     assert horse.sire_name is None
 
 
+def test_pedigree_403_is_not_a_generic_miss():
+    response = requests.Response()
+    response.status_code = 403
+    horse, client = _horse(
+        _load("netkeiba_horse_profile.html"),
+        _load("netkeiba_horse_result_empty.html"),
+        requests.HTTPError("403 Client Error", response=response),
+    )
+    assert horse is not None
+    assert horse.pedigree is not None
+    assert horse.pedigree.sire is None
+    assert horse.pedigree.warning == PEDIGREE_FORBIDDEN
+    assert sum(1 for url, _headers in client.calls if "/horse/ped/" in url) == 1
+
+
+def test_pedigree_login_wall_status_is_not_retried():
+    response = requests.Response()
+    response.status_code = 401
+    horse, client = _horse(
+        _load("netkeiba_horse_profile.html"),
+        _load("netkeiba_horse_result_empty.html"),
+        requests.HTTPError("401 Client Error", response=response),
+    )
+    assert horse is not None
+    assert horse.pedigree is not None
+    assert horse.pedigree.warning == PEDIGREE_LOGIN
+    assert sum(1 for url, _headers in client.calls if "/horse/ped/" in url) == 1
+
+
 def test_pedigree_fetch_failure_stays_empty():
     horse, _client = _horse(
         _load("netkeiba_horse_profile.html"),
@@ -326,6 +357,8 @@ def test_compact_blood_table_still_fills_sire_and_dam():
         (3, 5, "差し"),
         (5, 5, "追込"),
         (2, 2, "差し"),
+        (2, 3, "差し"),
+        (3, 3, "追込"),
         (8, 18, "差し"),
         (13, 18, "追込"),
         (5, 4, None),
