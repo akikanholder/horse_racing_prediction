@@ -470,7 +470,10 @@ class RaceService:
     def get_horses_for_race(self, race_id: str) -> list[HorseBasicInfo]:
         """Get entrants with near-run history, pedigree, and running style.
 
-        ``recent_performances`` is that horse's past runs, not this race's result.
+        ``recent_performances`` is that horse's public past runs, at most five,
+        not this race's result. Fewer than five public runs set ``warning``.
+        ``login_required_for_more`` is taken from the result page. No netkeiba
+        login is attempted.
         Pedigree comes from ``/horse/ped/{horse_id}/``. Running style is derived
         only from those near runs (at most five).         ``track_bias`` copies the
         card's venue, surface, distance, and going. Inside/outside and pace
@@ -514,9 +517,15 @@ class RaceService:
                 }
             for entry in race_card.entries:
                 if entry.horse_id:
-                    performances = self.netkeiba_scraper.get_horse_performances(
-                        entry.horse_id, limit=5
-                    )
+                    fetched = self.netkeiba_scraper.get_horse_performances(entry.horse_id, limit=5)
+                    (
+                        performances,
+                        runs_fetched,
+                        login_required_for_more,
+                        run_source,
+                        run_fetched_at,
+                        run_warning,
+                    ) = _recent_runs_from_fetch(fetched)
                     pedigree = self.netkeiba_scraper.get_pedigree(entry.horse_id)
                     training = training_by_name.get(entry.horse_name) or unavailable_training(
                         TRAINING_FETCH_FAILED
@@ -530,6 +539,11 @@ class RaceService:
                         dam_name=pedigree.dam.name if pedigree.dam else None,
                         trainer_name=entry.trainer_name,
                         recent_performances=performances,
+                        runs_fetched=runs_fetched,
+                        login_required_for_more=login_required_for_more,
+                        source=run_source,
+                        fetched_at=run_fetched_at,
+                        warning=run_warning,
                         pedigree=pedigree,
                         track_bias=bias,
                         training=training,
@@ -771,6 +785,31 @@ class RaceService:
         """Context manager exit."""
         self.close()
         return False
+
+
+def _recent_runs_from_fetch(
+    fetched: object,
+) -> tuple[list, int, bool | None, str | None, datetime | None, str | None]:
+    """Read a public-run payload. A bare list has no login or source metadata."""
+    if isinstance(fetched, list):
+        return fetched, len(fetched), None, None, None, None
+    performances = getattr(fetched, "performances", None)
+    if not isinstance(performances, list):
+        return [], 0, None, None, None, None
+    runs_fetched = getattr(fetched, "runs_fetched", None)
+    count = runs_fetched if isinstance(runs_fetched, int) else len(performances)
+    login = getattr(fetched, "login_required_for_more", None)
+    source = getattr(fetched, "source", None)
+    fetched_at = getattr(fetched, "fetched_at", None)
+    warning = getattr(fetched, "warning", None)
+    return (
+        performances,
+        count,
+        login if isinstance(login, bool) or login is None else None,
+        source if isinstance(source, str) or source is None else None,
+        fetched_at if isinstance(fetched_at, datetime) else None,
+        warning if isinstance(warning, str) or warning is None else None,
+    )
 
 
 def _supported_bet_types(requested: list[str]) -> list[BetType]:

@@ -29,6 +29,11 @@ _JSON_URL = re.compile(
     r"""(?:url|URL)\s*:\s*['"]([^'"]+)['"]""",
 )
 _RESULT_API = re.compile(r"/api/[^\"'\s]*result", re.IGNORECASE)
+_HORSE_RESULT_PATH = re.compile(
+    r"/horse/[^\"'\s]*result|/api/[^\"'\s]*result",
+    re.IGNORECASE,
+)
+_BLOCKED_URL = re.compile(r"login|captcha|signin|odds", re.IGNORECASE)
 
 
 class AccessBlocked(Exception):
@@ -150,6 +155,33 @@ def same_site_result_urls(html: str, page_url: str) -> list[str]:
         if parsed.scheme not in {"http", "https"}:
             continue
         if parsed.netloc != page.netloc:
+            continue
+        if absolute in seen or absolute.split("?", 1)[0] == page_url.split("?", 1)[0]:
+            continue
+        seen.add(absolute)
+        found.append(absolute)
+    return found
+
+
+def same_site_horse_result_urls(html: str, page_url: str) -> list[str]:
+    """Absolute URLs of same-site horse-result documents the page's own scripts call.
+
+    Login, captcha, odds, and other hosts are not included. The result page
+    itself is not treated as a second request.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    page = urlparse(page_url)
+    for match in _JSON_URL.finditer(html):
+        raw = match.group(1).strip()
+        if _BLOCKED_URL.search(raw):
+            continue
+        path = raw.split("?", 1)[0]
+        if not _HORSE_RESULT_PATH.search(path):
+            continue
+        absolute = urljoin(page_url, raw)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc != page.netloc:
             continue
         if absolute in seen or absolute.split("?", 1)[0] == page_url.split("?", 1)[0]:
             continue

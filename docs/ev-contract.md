@@ -28,7 +28,7 @@ OpenAPI（起動中の `http://localhost:8000/openapi.json` と `/docs`）は型
 - 成績の空セル、`**`、`取`、`計不` は数値にしない。距離が読めない行の `distance` は `null`（0 にしない）。
 - 配列が空でもオブジェクトは残ることがある。理由は隣の `warning` または `reason`。
 - `data_sufficiency` の語は面ごとに違う。脚質は `insufficient` / `thin` / `sufficient`。バイアスと調教は `unavailable` / `thin` / `sufficient`。オッズは `data_sufficiency` を持たず、`status` が `live` / `yoso` / `unavailable`。
-- 馬のトップレベル `warning` は近走の取得失敗だけ。血統・脚質・調教・バイアスの理由は各オブジェクトの `warning`。
+- 馬のトップレベル `warning` は近走の取得失敗と、要求した走数に公開分が足りないとき。血統・脚質・調教・バイアスの理由は各オブジェクトの `warning`。
 - JSON は欠測フィールドを省略しない。Pydantic の既定どおり `null` を出す。日付と時刻は ISO 8601（タイムゾーン無しのナイーブ時刻を含む）。
 
 EV は生 HTML を読まない。文字コード（オッズ API の UTF-8、馬成績の EUC-JP、馬場情報の cp932）はツールが JSON にする前に解く。
@@ -71,8 +71,8 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli races --json` | `GET /api/races` | 今週の `RaceSchedule`。`track_bias` は null |
 | `python -m backend.cli card <race_id> --json` | `GET /api/races/{race_id}/card` | `RaceCard`。`race.track_bias` あり |
 | （card の `race` と同じ） | `GET /api/races/{race_id}` | `Race` だけ |
-| `python -m backend.cli horse <horse_id> --json` | `GET /api/horses/{horse_id}` | `Horse`。近走は全走。当日バイアスは null |
-| （CLI なし。HTTP のみ） | `GET /api/races/{race_id}/horses` | `HorseBasicInfo` の配列。近走は最大5走 |
+| `python -m backend.cli horse <horse_id> --json` | `GET /api/horses/{horse_id}` | `Horse`。近走はログイン無しで見える全走。9走未満は warning。当日バイアスは null |
+| （CLI なし。HTTP のみ） | `GET /api/races/{race_id}/horses` | `HorseBasicInfo` の配列。近走はログイン無しで最大5走 |
 | `python -m backend.cli result <race_id> --json` | `GET /api/races/{race_id}/result` | `SettledRaceResult`。予想の入力にしない |
 | `python -m backend.cli history <race_id> --json` | `GET /api/races/{race_id}/history` | `HistoricalBatch`。2025年以降の平地のバックテスト。予想の入力にしない |
 | `python -m backend.cli history --date 2025-01-05 --venue 東京 --json` | `GET /api/races/history?date=2025-01-05&venue=東京` | その日の範囲内レース。日付範囲は `--from` `--to` と `date_from` `date_to` |
@@ -163,7 +163,9 @@ netkeiba の出馬表と accessD（`POST https://www.jra.go.jp/JRADB/accessD.htm
 python -m backend.cli horse 2019104308 --json
 ```
 
-`GET /api/horses/{horse_id}` は成績ページ `https://db.netkeiba.com/horse/result/{horse_id}/` の過去走。馬名と通算は `https://db.netkeiba.com/horse/{horse_id}/`。結果ページの見出しに名前があるときは、馬ページが無くても名前を埋める。
+`GET /api/horses/{horse_id}` は成績ページ `https://db.netkeiba.com/horse/result/{horse_id}/` の、ログイン無しで見える過去走。馬名と通算は `https://db.netkeiba.com/horse/{horse_id}/`。結果ページの見出しに名前があるときは、馬ページが無くても名前を埋める。
+
+netkeiba のログイン、Cookie、資格情報の環境変数は無い。403、captcha、ログイン画面はそこで止め、User-Agent の差し替えや別の身元では取りにいかない。表が要求走数より短く、ページ自身が呼ぶ同一サイトの成績 URL がある、または本文に「読み込み中」があるときは、その HTML に埋め込まれた JSON、その URL、入っていればヘッドレス描画の順で足す。ページが続きはログインと示しているときは、その先へ進まない。ブラウザが無いときは `headless browser is not installed`。すでに表に書いてある行は残す。
 
 | フィールド | 意味 | null / 空 |
 |---|---|---|
@@ -174,13 +176,16 @@ python -m backend.cli horse 2019104308 --json
 | `trainer_name` / `trainer_id` / `training_center` | 調教師、美浦/栗東 | 無いとき null |
 | `total_races` / `total_wins` | ページの「通算成績」（`16戦8勝`）。行数から勝ち数は作らない | 読めないとき null |
 | `total_earnings` | 中央と地方の獲得賞金を万円で足した整数 | 無いとき null |
-| `performances` | 過去走。今走の結果ではない | 失敗時は `[]` |
+| `performances` | ログイン無しで見える過去走。今走の結果ではない。各行のフィールドは従来どおり | 失敗時は `[]` |
+| `runs_fetched` | 返した走数。`performances` の長さ | 失敗時は 0 |
+| `login_required_for_more` | ページが、返した走より先はログインが必要と示しているとき true。全成績でログイン不要と示しているとき false | どちらとも示していなければ null |
+| `source` | 近走を得た方法。`netkeiba_html` / `netkeiba_js` / `headless`。混ざるときは `netkeiba_html+netkeiba_js` | 1走も無いとき null |
 | `fetched_at` | 取得時刻 | 必須 |
 | `pedigree` | 後述。検証後はオブジェクト | JSON では null にしない |
 | `running_style` | 後述。検証後はオブジェクト | JSON では null にしない |
 | `track_bias` | 馬単体は開催日が無い | 条件もラベルも null |
 | `training` | 後述。検証後はオブジェクト | 未取得は `training not loaded` |
-| `warning` | 近走が取れない理由 | 取れたら null |
+| `warning` | 近走が取れない、または公開分が要求走数より少ない理由 | 要求を満たせば null |
 
 `warning` の値:
 
@@ -188,6 +193,13 @@ python -m backend.cli horse 2019104308 --json
 - `horse result table not found`
 - `horse result table malformed`
 - `no performances on horse result page`
+- `horse result returned 403`
+- `horse result requires login`
+- `horse result blocked by captcha`
+- `fewer than N recent runs available without login`（N は要求走数。`Horse` は 9、出走馬一覧は 5）
+- `headless browser is not installed`（まだ足りず、Playwright が無いときだけ。ヘッドレスを切ったテストでは出さない）
+
+1走も取れない失敗は上の取得失敗の文のまま。公開分が要求より少ないときは足りない走数の文。途中の 403 や、ブラウザが無いことは `; ` でつなぐ。ログイン画面で 1 走も無いときは `horse result requires login` と `login_required_for_more: true`。403 は `login_required_for_more` を true にしない（null のまま）。続きがログインと分かっていても、見えている行は返す。
 
 `HorsePerformance`（`performances` と、出走馬の `recent_performances`）:
 
@@ -209,12 +221,13 @@ python -m backend.cli horse 2019104308 --json
 
 水分量や馬場指数の列はタイムにも上がりにも入れない。
 
-`GET /api/races/{race_id}/horses` は同じ成績ページの過去走で、最大5走。当該レースの確定結果ではない。`horse_id` が無い枠は落とす。`sex` が空のときは `不明`。`age` が空のときは `0`（null ではない。0 を実年齢にしない）。
+`GET /api/races/{race_id}/horses` は同じ成績ページの、ログイン無しで見える過去走で、最大5走。当該レースの確定結果ではない。`horse_id` が無い枠は落とす。`sex` が空のときは `不明`。`age` が空のときは `0`（null ではない。0 を実年齢にしない）。各馬に `runs_fetched`、`login_required_for_more`、`source`、`fetched_at`、`warning` を載せる。意味は `Horse` と同じ。要求は 5 走なので、公開分が 5 未満の `warning` は `fewer than 5 recent runs available without login`。
 
 | | `Horse` | `HorseBasicInfo` |
 |---|---|---|
-| 近走 | `performances`（全走） | `recent_performances`（最大5走） |
-| 脚質の母数 | 全走 | その最大5走 |
+| 近走 | `performances`（ログイン無しの全走） | `recent_performances`（最大5走） |
+| 足りないときの warning | 公開分が 9 走未満 | 公開分が 5 走未満 |
+| 脚質の母数 | 返した全走 | その最大5走 |
 | 血統 | プロフィール表と血統表 | 血統表だけ |
 | 調教 | 馬名検索（ログイン時）と speedkeiba | その `race_id` の調教ページ、履歴、speedkeiba |
 | `track_bias` | 開催日が無くすべて null | そのレースの出馬表と同じオブジェクト |

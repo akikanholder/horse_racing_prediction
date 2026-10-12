@@ -121,6 +121,13 @@ def cmd_horse(args):
         print(f"馬ID: {horse.horse_id}")
         print(f"性別: {horse.sex}")
         print(f"取得時刻: {horse.fetched_at}")
+        print(f"近走取得: {horse.runs_fetched}走")
+        if horse.source:
+            print(f"近走ソース: {horse.source}")
+        if horse.login_required_for_more is True:
+            print("続きの成績: ログインが必要")
+        elif horse.login_required_for_more is False:
+            print("続きの成績: ログインは不要")
         if horse.birth_year:
             print(f"生年: {horse.birth_year}年")
         _print_pedigree(horse)
@@ -774,6 +781,7 @@ def main():
         help="競走馬の近走・血統・脚質・調教を取得（確定したレース結果ではない）",
         description=(
             "競走馬の近走成績、血統（父・母・母父）、通過順から集計した脚質、調教。"
+            "近走はログイン無しで見える成績だけ。netkeiba の資格情報は使わない。"
             "過去走であり、確定したレース結果ではない。着順と払戻の精算は result を使う。"
             "血統がページに無いときは null と warning。脚質はオッズやレース名からは作らない。"
             "調教は競馬ブックの調教ページと speedkeiba の今週の重賞記事。"

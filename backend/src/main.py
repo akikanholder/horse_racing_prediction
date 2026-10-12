@@ -415,7 +415,10 @@ async def get_race_odds(
 async def get_race_horses(race_id: str):
     """レースに出走する競走馬の情報を取得する。
 
-    ``recent_performances`` は各馬の成績ページにある過去走で、このレースの確定結果ではない。
+    ``recent_performances`` は各馬の成績ページにある、ログイン無しで見える過去走で、
+    最大5走。このレースの確定結果ではない。
+    ``runs_fetched``、``login_required_for_more``、``source``、``fetched_at``、``warning``
+    はその取得の結果。5走に足りないときは warning。netkeiba にはログインしない。
     ``pedigree`` は ``/horse/ped/{horse_id}/`` の父・母・母父。無い祖先は null。
     ``running_style`` はその近走最大5走の通過順だけから集計する。オッズやレース名からは作らない。
     ``track_bias`` は出馬表にある競馬場・芝/ダート・距離・馬場状態を写す。
@@ -482,9 +485,12 @@ async def export_races_csv(
 async def get_horse(horse_id: str):
     """競走馬の近走履歴を取得する。
 
-    ``performances`` は ``/horse/result/{horse_id}/`` の過去走であり、
+    ``performances`` は ``/horse/result/{horse_id}/`` の、ログイン無しで見える過去走であり、
     今走の確定結果ではない。着順の精算には使わず、近走の能力評価にだけ使う。
-    成績を取れないときは ``performances`` は空で、``warning`` に理由が入る。
+    ``runs_fetched`` は返した走数。``login_required_for_more`` はページの表示。
+    ``source`` は netkeiba_html / netkeiba_js / headless。
+    公開分が 9 走より少ないときは ``warning``。成績を取れないときも ``performances`` は空。
+    netkeiba のログインや Cookie は使わない。403 とログイン画面は止める。
     ``pedigree`` はプロフィール表と ``/horse/ped/{horse_id}/`` の血統表。
     父・母が取れないときは null と pedigree.warning。レース名からは埋めない。
     ``running_style`` は performances の通過順の最初の数字。3走未満や同数は label が null。

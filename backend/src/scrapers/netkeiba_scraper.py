@@ -51,9 +51,12 @@ from backend.scrapers.jra_payout import (
 )
 from backend.scrapers.page_fallback import (
     AccessBlocked,
+    FallbackFetch,
     FetchedBody,
     PageFallback,
+    embedded_json_payloads,
     looks_like_login_wall,
+    same_site_horse_result_urls,
 )
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
@@ -84,6 +87,20 @@ HORSE_RESULT_FETCH_FAILED = "horse result fetch failed"
 HORSE_RESULT_TABLE_NOT_FOUND = "horse result table not found"
 HORSE_RESULT_TABLE_MALFORMED = "horse result table malformed"
 HORSE_RESULT_EMPTY = "no performances on horse result page"
+HORSE_RESULT_FORBIDDEN = "horse result returned 403"
+HORSE_RESULT_LOGIN = "horse result requires login"
+HORSE_RESULT_CAPTCHA = "horse result blocked by captcha"
+DEFAULT_RECENT_RUNS = 9
+_RUN_LIST_KEYS = ("performances", "results", "runs", "race_results")
+_LOGIN_MORE = re.compile(
+    r"(?:続きの成績|全成績|過去の成績|以前の成績|続きを見る).{0,24}ログイン"
+    r"|ログイン.{0,24}(?:続きの成績|全成績|過去の成績|以前の成績|続き)"
+    r"|(?:会員限定|プレミアム会員).{0,16}(?:成績|競走)"
+    r"|ログインが必要.{0,16}(?:成績|走)"
+    r"|(?:成績|近走).{0,16}ログインが必要"
+)
+_LOGIN_COMPLETE = re.compile(r"ログイン不要|全成績を表示|これ以上の成績はありません")
+_SKIPPED_REGION = {"script", "style", "nav", "header", "footer"}
 RACE_RESULT_FETCH_FAILED = "race result fetch failed"
 RACE_RESULT_NOT_FOUND = "race result not found"
 RACE_RESULT_NOT_SETTLED = "race not yet settled"
@@ -1261,6 +1278,265 @@ class _SettledHeader:
     result_phase: str | None = None
 
 
+def fewer_recent_runs_warning(requested: int) -> str:
+    """Warning when the public page has fewer runs than the caller asked for."""
+    return f"fewer than {requested} recent runs available without login"
+
+
+@dataclass
+class PublicHorseRuns:
+    """Runs visible on the horse result page without a netkeiba login.
+
+    This object does not carry cookies or credentials. A later login wall is
+    recorded on ``login_required_for_more`` and is not fetched.
+    """
+
+    performances: list[HorsePerformance]
+    runs_fetched: int
+    login_required_for_more: bool | None
+    source: str | None
+    fetched_at: datetime
+    warning: str | None
+
+
+def _login_flag_value(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _merge_login(current: bool | None, extra: bool | None) -> bool | None:
+    if current is True or extra is True:
+        return True
+    if current is False or extra is False:
+        return False
+    return None
+
+
+def _in_skipped_region(node: Tag) -> bool:
+    current: Tag | None = node
+    while current is not None:
+        if current.name in _SKIPPED_REGION:
+            return True
+        role = str(current.get("role") or "")
+        if role in {"navigation", "banner", "contentinfo"}:
+            return True
+        classes = " ".join(str(part) for part in (current.get("class") or []))
+        if re.search(r"\b(header|footer|globalnav|gnav)\b", classes, re.IGNORECASE):
+            return True
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return False
+
+
+def _login_required_from_html(soup: BeautifulSoup) -> bool | None:
+    """True, false, or None from notes on the result page. Nav login links are ignored."""
+    flag: bool | None = None
+    for node in soup.select("[data-login-required-for-more]"):
+        if not isinstance(node, Tag):
+            continue
+        raw = str(node.get("data-login-required-for-more") or "").strip().lower()
+        if raw in {"true", "1", "yes"}:
+            return True
+        if raw in {"false", "0", "no"}:
+            flag = False
+    for anchor in soup.find_all("a", href=True):
+        if not isinstance(anchor, Tag) or _in_skipped_region(anchor):
+            continue
+        href = str(anchor.get("href") or "")
+        label = _compact(anchor.get_text())
+        if re.search(r"login|signin|regist", href, re.IGNORECASE) and re.search(
+            r"続き|全成績|もっと見る", label
+        ):
+            return True
+    saw_false = flag is False
+    for node in soup.find_all(["p", "div", "span", "li", "td", "th"]):
+        if not isinstance(node, Tag) or _in_skipped_region(node):
+            continue
+        compact = _compact(node.get_text(" ", strip=True))
+        if not compact or len(compact) > 80:
+            continue
+        if _LOGIN_MORE.search(compact):
+            return True
+        if _LOGIN_COMPLETE.search(compact):
+            saw_false = True
+    return False if saw_false else None
+
+
+def _horse_captcha_wall(html: str) -> bool:
+    """True when the document is a captcha challenge and not a result table."""
+    soup = BeautifulSoup(html, "lxml")
+    if soup.select_one("table.db_h_race_results, table.nk_tb_common"):
+        return False
+    if soup.select_one(
+        ".g-recaptcha, .h-captcha, iframe[src*='recaptcha'], iframe[src*='hcaptcha']"
+    ):
+        return True
+    title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
+    heading = ""
+    h1 = soup.find("h1")
+    if h1 is not None:
+        heading = h1.get_text(" ", strip=True)
+    label = f"{title} {heading}".lower()
+    return "captcha" in label or "ロボット" in label
+
+
+def _horse_page_offers_network_fallback(html: str, page_url: str) -> bool:
+    """True when the page itself points at more public data or has not rendered."""
+    if same_site_horse_result_urls(html, page_url):
+        return True
+    soup = BeautifulSoup(html, "lxml")
+    if soup.select_one("[data-horse-results='partial'], .horse_result_loading"):
+        return True
+    for node in soup.find_all(string=re.compile(r"読み込み中")):
+        parent = node.parent
+        if isinstance(parent, Tag) and not _in_skipped_region(parent):
+            return True
+    return False
+
+
+def _run_key(run: HorsePerformance) -> tuple[str, ...]:
+    if run.race_id:
+        return ("id", run.race_id)
+    return ("name", run.race_date.isoformat(), run.race_name, run.venue)
+
+
+def _merge_tagged(
+    base: list[tuple[HorsePerformance, str]],
+    extra: list[tuple[HorsePerformance, str]],
+) -> list[tuple[HorsePerformance, str]]:
+    seen = {_run_key(run) for run, _source in base}
+    merged = list(base)
+    for run, source in extra:
+        key = _run_key(run)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append((run, source))
+    return merged
+
+
+def _runs_source(sources: list[str]) -> str | None:
+    found = [name for name in _SOURCE_ORDER if name in sources]
+    if not found:
+        return None
+    return "+".join(found)
+
+
+def _performance_from_mapping(row: dict[str, object]) -> HorsePerformance | None:
+    """One public run from JSON the result page already contained or called."""
+    race_date = parse_japanese_date(_mapping_text(row, "race_date", "日付", "date"))
+    if race_date is None:
+        return None
+    raw_distance = row.get("distance")
+    if isinstance(raw_distance, int | float) and not isinstance(raw_distance, bool):
+        distance: int | None = int(raw_distance)
+        track_type = _optional_text(_mapping_text(row, "track_type"))
+    else:
+        distance, track_type = _parse_distance_cell(_mapping_text(row, "distance", "距離"))
+        named_surface = _optional_text(_mapping_text(row, "track_type"))
+        if track_type is None and named_surface:
+            track_type = named_surface
+    horse_weight, horse_weight_diff = _parse_horse_weight(
+        _mapping_text(row, "horse_weight", "馬体重")
+    )
+    going = _mapping_text(row, "track_condition", "馬場")
+    return HorsePerformance(
+        race_date=race_date,
+        race_id=_optional_text(_mapping_text(row, "race_id", "レースID")),
+        race_name=_optional_text(_mapping_text(row, "race_name", "レース名")) or "",
+        venue=_optional_text(_mapping_text(row, "venue", "開催")) or "",
+        distance=distance,
+        track_type=track_type,
+        track_condition=_parse_going(going),
+        weather=_optional_text(_mapping_text(row, "weather", "天気")),
+        entry_count=_optional_int(_mapping_text(row, "entry_count", "頭数")),
+        horse_number=_optional_int(_mapping_text(row, "horse_number", "馬番")),
+        rank=_optional_int(_mapping_text(row, "rank", "着順")),
+        odds=_optional_float(_mapping_text(row, "odds", "オッズ")),
+        popularity=_optional_int(_mapping_text(row, "popularity", "人気")),
+        jockey_name=_optional_text(_mapping_text(row, "jockey_name", "騎手")),
+        weight=_parse_impost(_mapping_text(row, "weight", "斤量")),
+        horse_weight=horse_weight,
+        horse_weight_diff=horse_weight_diff,
+        finish_time=_parse_finish_time(_mapping_text(row, "finish_time", "タイム")),
+        margin=_optional_text(_mapping_text(row, "margin", "着差")),
+        passing_order=_optional_text(_mapping_text(row, "passing_order", "通過")),
+        last_3f=_optional_float(_mapping_text(row, "last_3f", "上り", "上がり")),
+        prize_money=_optional_float(_mapping_text(row, "prize_money", "賞金")),
+    )
+
+
+def _tagged_from_json(
+    body: str, source: str
+) -> tuple[list[tuple[HorsePerformance, str]], bool | None]:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return [], None
+    login: bool | None = None
+    rows: list[object] | None = None
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        login = _login_flag_value(payload.get("login_required_for_more"))
+        for key in _RUN_LIST_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+    else:
+        return [], None
+    tagged: list[tuple[HorsePerformance, str]] = []
+    if rows is not None:
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            perf = _performance_from_mapping(item)
+            if perf is not None:
+                tagged.append((perf, source))
+    return tagged, login
+
+
+def _compose_horse_run_warning(
+    *,
+    available: int,
+    target: int,
+    hard: str | None,
+    extra: str | None,
+) -> str | None:
+    """Hard failures stay as they are. A short public list names the request."""
+    if available == 0:
+        if extra == HORSE_RESULT_LOGIN:
+            return HORSE_RESULT_LOGIN
+        if extra in {HORSE_RESULT_FORBIDDEN, HORSE_RESULT_FETCH_FAILED} and hard is None:
+            return extra
+        if hard:
+            return _join_warnings(hard, extra)
+        return extra or HORSE_RESULT_FETCH_FAILED
+    parts: list[str | None] = []
+    if available < target:
+        parts.append(fewer_recent_runs_warning(target))
+    if extra and extra != HORSE_RESULT_LOGIN:
+        parts.append(extra)
+    return _join_warnings(*parts)
+
+
+def _horse_chain_extra(loaded: FallbackFetch) -> str | None:
+    if loaded.status == "failed":
+        return HORSE_RESULT_FETCH_FAILED
+    warning = loaded.warning
+    if not warning:
+        return None
+    if "403" in warning:
+        return HORSE_RESULT_FORBIDDEN
+    if "login" in warning:
+        return HORSE_RESULT_LOGIN
+    if warning == HEADLESS_UNAVAILABLE:
+        return HEADLESS_UNAVAILABLE
+    return None
+
+
 class NetkeibaScraper(BaseScraper):
     """Scraper for netkeiba website (https://race.netkeiba.com)."""
 
@@ -2089,49 +2365,63 @@ class NetkeibaScraper(BaseScraper):
             return settled
         return settled.model_copy(update={"warning": warning, "refunds": refunds})
 
-    def get_horse_info(self, horse_id: str, *, fetched_at: datetime | None = None) -> Horse | None:
-        """Get horse identity and near-run history.
+    def get_horse_info(
+        self,
+        horse_id: str,
+        *,
+        fetched_at: datetime | None = None,
+        recent_limit: int = DEFAULT_RECENT_RUNS,
+    ) -> Horse | None:
+        """Get horse identity and the near runs that are public without login.
 
-        Performances come from ``/horse/result/{horse_id}/``.
-        Name and 通算成績 come from ``/horse/{horse_id}/`` when that page has them,
-        with the result-page header as a fallback for the name.
+        Performances come from ``/horse/result/{horse_id}/``. Every public run
+        is returned. ``recent_limit`` (default 9) is the count that avoids a
+        shortfall warning and the point at which a same-site URL or headless
+        render is no longer tried. Name and 通算成績 come from
+        ``/horse/{horse_id}/`` when that page has them, with the result-page
+        header as a fallback for the name.
+
         This is past-race history for near-run evaluation, not the result of the
         race being predicted. Missing cells stay null. A failed or empty result
-        page returns no rows and sets ``warning``.
+        page returns no rows and sets ``warning``. HTTP 403, a captcha, and a
+        login wall stop the fetch. This method does not read netkeiba
+        credentials, cookies, or environment variables.
 
         Args:
             horse_id: Horse ID
             fetched_at: Timestamp stored on the horse. Defaults to now.
+            recent_limit: Public runs required before the shortfall warning.
 
         Returns:
             Horse information, or None when neither page identifies the horse
         """
         fetched = fetched_at or datetime.now()
         profile_url = f"{self.DB_URL}/horse/{horse_id}/"
-        result_url = f"{self.DB_URL}/horse/result/{horse_id}/"
         profile_soup: BeautifulSoup | None = None
-        result_soup: BeautifulSoup | None = None
-        result_error = False
 
         try:
             profile_soup = self._fetch_horse_page(profile_url, referer=f"{self.DB_URL}/")
         except Exception as e:
             logger.error("Failed to fetch horse profile for %s: %s", horse_id, e)
 
-        try:
-            result_soup = self._fetch_horse_page(result_url, referer=profile_url)
-        except Exception as e:
-            logger.error("Failed to fetch horse performances for %s: %s", horse_id, e)
-            result_error = True
+        public, result_html = self._load_public_runs(
+            horse_id,
+            referer=profile_url,
+            fetched_at=fetched,
+            target=recent_limit,
+            limit=None,
+        )
+        result_soup = (
+            BeautifulSoup(result_html, "lxml")
+            if result_html is not None and result_html.lstrip().startswith("<")
+            else None
+        )
 
-        if profile_soup is None and result_soup is None:
+        performances = public.performances
+        warning = public.warning
+
+        if profile_soup is None and result_soup is None and not performances:
             return None
-
-        if result_error or result_soup is None:
-            performances: list[HorsePerformance] = []
-            warning: str | None = HORSE_RESULT_FETCH_FAILED
-        else:
-            performances, warning = self._parse_horse_performances(result_soup)
 
         identity = (
             self._parse_horse_identity(profile_soup)
@@ -2172,6 +2462,9 @@ class NetkeibaScraper(BaseScraper):
             total_wins=identity.total_wins,
             total_earnings=identity.total_earnings,
             performances=performances,
+            runs_fetched=public.runs_fetched,
+            login_required_for_more=public.login_required_for_more,
+            source=public.source,
             fetched_at=fetched,
             warning=warning,
             pedigree=pedigree,
@@ -2214,30 +2507,173 @@ class NetkeibaScraper(BaseScraper):
             ped_table=ped_table,
         )
 
-    def get_horse_performances(self, horse_id: str, limit: int = 10) -> list[HorsePerformance]:
-        """Get a horse's past performances from the result page.
+    def get_horse_performances(
+        self,
+        horse_id: str,
+        limit: int = DEFAULT_RECENT_RUNS,
+        *,
+        fetched_at: datetime | None = None,
+    ) -> PublicHorseRuns:
+        """Public past runs from ``/horse/result/{horse_id}/``, capped at ``limit``.
 
-        Args:
-            horse_id: Horse ID
-            limit: Maximum number of performances to return
-
-        Returns:
-            Past performances, or an empty list when the page cannot be read.
-            Rows are not invented. Callers that need the reason should use
-            ``get_horse_info``, which sets ``warning``.
+        The default request is 9. Fewer public runs set ``warning`` and leave
+        ``login_required_for_more`` as the page indicated. No netkeiba login is
+        attempted. Rows are not invented.
         """
-        url = f"{self.DB_URL}/horse/result/{horse_id}/"
-        try:
-            soup = self._fetch_horse_page(
-                url,
-                referer=f"{self.DB_URL}/horse/{horse_id}/",
-            )
-        except Exception as e:
-            logger.error("Failed to fetch horse performances for %s: %s", horse_id, e)
-            return []
+        fetched = fetched_at or datetime.now()
+        public, _html = self._load_public_runs(
+            horse_id,
+            referer=f"{self.DB_URL}/horse/{horse_id}/",
+            fetched_at=fetched,
+            target=limit,
+            limit=limit,
+        )
+        return public
 
-        performances, _warning = self._parse_horse_performances(soup, limit)
-        return performances
+    def _load_public_runs(
+        self,
+        horse_id: str,
+        *,
+        referer: str,
+        fetched_at: datetime,
+        target: int,
+        limit: int | None,
+    ) -> tuple[PublicHorseRuns, str | None]:
+        """HTML, then JSON in that page, then a same-site URL, then headless.
+
+        A 403, captcha, or login wall stops the chain. Runs already visible
+        stay. The same-site step uses only a URL the page itself calls.
+        """
+        result_url = f"{self.DB_URL}/horse/result/{horse_id}/"
+        fallback = PageFallback(
+            self.http_client,
+            site="netkeiba",
+            headless_render=self._headless_render,
+            url_finder=same_site_horse_result_urls,
+        )
+        loaded = fallback.load(
+            url=result_url,
+            params=None,
+            headers={**self.BROWSER_HEADERS, "Referer": referer},
+            encoding=self.ENCODING,
+            fetched_at=fetched_at,
+            should_fallback=lambda html: self._horse_result_needs_fallback(
+                html, result_url, target
+            ),
+            still_incomplete=lambda pages: self._horse_runs_still_short(pages, target),
+        )
+        if loaded.status == "blocked" and not loaded.pages:
+            logger.warning("Horse result blocked for %s: %s", horse_id, loaded.warning)
+        elif loaded.status == "failed":
+            logger.error("Failed to fetch horse performances for %s", horse_id)
+        return self._public_runs_from_fetch(loaded, target, limit, fetched_at)
+
+    def _horse_result_needs_fallback(self, html: str, page_url: str, target: int) -> bool:
+        """Network fallback only when the public HTML is short and offers more."""
+        if looks_like_login_wall(html) or _horse_captcha_wall(html):
+            return False
+        tagged, login, _hard = self._tagged_from_html_document(
+            html, row_source="netkeiba_html", json_source="netkeiba_js"
+        )
+        if login is True or len(tagged) >= target:
+            return False
+        return _horse_page_offers_network_fallback(html, page_url)
+
+    def _horse_runs_still_short(self, pages: list[FetchedBody], target: int) -> bool:
+        tagged, login, _hard = self._tagged_runs_from_pages(pages)
+        if login is True:
+            return False
+        return len(tagged) < target
+
+    def _public_runs_from_fetch(
+        self,
+        loaded: FallbackFetch,
+        target: int,
+        limit: int | None,
+        fetched_at: datetime,
+    ) -> tuple[PublicHorseRuns, str | None]:
+        extra = _horse_chain_extra(loaded)
+        html = loaded.pages[0].body if loaded.pages else None
+        if html is not None and not html.lstrip().startswith("<"):
+            html = None
+        if not loaded.pages:
+            login = True if extra == HORSE_RESULT_LOGIN else None
+            warning = _compose_horse_run_warning(available=0, target=target, hard=None, extra=extra)
+            return (
+                PublicHorseRuns([], 0, login, None, fetched_at, warning),
+                None,
+            )
+        tagged, login, hard = self._tagged_runs_from_pages(loaded.pages)
+        if extra == HORSE_RESULT_LOGIN:
+            login = True
+        available = len(tagged)
+        if limit is not None:
+            tagged = tagged[:limit]
+        warning = _compose_horse_run_warning(
+            available=available, target=target, hard=hard, extra=extra
+        )
+        source = _runs_source([row_source for _run, row_source in tagged])
+        return (
+            PublicHorseRuns(
+                performances=[run for run, _row_source in tagged],
+                runs_fetched=len(tagged),
+                login_required_for_more=login,
+                source=source,
+                fetched_at=fetched_at,
+                warning=warning,
+            ),
+            html,
+        )
+
+    def _tagged_runs_from_pages(
+        self, pages: list[FetchedBody]
+    ) -> tuple[list[tuple[HorsePerformance, str]], bool | None, str | None]:
+        tagged: list[tuple[HorsePerformance, str]] = []
+        login: bool | None = None
+        hard: str | None = None
+        for index, page in enumerate(pages):
+            page_tagged, page_login, page_hard = self._tagged_from_fetched(page)
+            if index == 0:
+                hard = page_hard
+            if page_tagged:
+                tagged = _merge_tagged(tagged, page_tagged)
+                hard = None
+            login = _merge_login(login, page_login)
+        return tagged, login, hard
+
+    def _tagged_from_fetched(
+        self, page: FetchedBody
+    ) -> tuple[list[tuple[HorsePerformance, str]], bool | None, str | None]:
+        source = page.source if page.source in _SOURCE_ORDER else "netkeiba_html"
+        text = page.body.lstrip()
+        if source == "headless" or text.startswith("<"):
+            if source == "netkeiba_html":
+                return self._tagged_from_html_document(
+                    page.body, row_source="netkeiba_html", json_source="netkeiba_js"
+                )
+            row_source = "headless" if source == "headless" else "netkeiba_js"
+            return self._tagged_from_html_document(
+                page.body, row_source=row_source, json_source=row_source
+            )
+        extra, login = _tagged_from_json(page.body, "netkeiba_js")
+        return extra, login, None
+
+    def _tagged_from_html_document(
+        self, html: str, *, row_source: str, json_source: str
+    ) -> tuple[list[tuple[HorsePerformance, str]], bool | None, str | None]:
+        if _horse_captcha_wall(html):
+            return [], None, HORSE_RESULT_CAPTCHA
+        soup = BeautifulSoup(html, "lxml")
+        runs, hard = self._parse_horse_performances(soup)
+        tagged = [(run, row_source) for run in runs]
+        login = _login_required_from_html(soup)
+        for payload in embedded_json_payloads(html):
+            extra, extra_login = _tagged_from_json(payload, json_source)
+            tagged = _merge_tagged(tagged, extra)
+            login = _merge_login(login, extra_login)
+        if tagged:
+            hard = None
+        return tagged, login, hard
 
     def _fetch_horse_page(self, url: str, *, referer: str) -> BeautifulSoup:
         """Fetch a db.netkeiba horse page with the odds client's browser UA."""
