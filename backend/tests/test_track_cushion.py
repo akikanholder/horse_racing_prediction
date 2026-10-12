@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import requests
 
 from backend.cli import cmd_race_card, cmd_track
 from backend.models.race import RaceCard
@@ -13,14 +14,56 @@ from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
 from backend.scrapers.page_fallback import headless_browser_installed, render_headless
 from backend.services.track_info_service import TrackInfoService
-from backend.tests.test_track_meeting import (
-    BABA_KYOTO,
-    BABA_TOKYO,
-    _baba,
-    _Gets,
-    _http_error,
-    _tokyo_measured,
-)
+
+BABA_TOKYO = "https://www.jra.go.jp/keiba/baba/index.html"
+BABA_KYOTO = "https://www.jra.go.jp/keiba/baba/index2.html"
+
+def _http_error(status: int) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError(f"http {status}")
+    error.response = response
+    return error
+
+
+class _Gets:
+    """GET map. Raises the stored error, otherwise returns the body."""
+
+    def __init__(self, gets: dict | None = None, errors: dict | None = None):
+        self.gets = gets or {}
+        self.errors = errors or {}
+        self.urls: list[str] = []
+        self.encodings: list[str | None] = []
+
+    def get(self, url, params=None, headers=None, encoding=None):
+        self.urls.append(url)
+        self.encodings.append(encoding)
+        if url in self.errors:
+            raise self.errors[url]
+        return self.gets.get(url, "")
+
+
+def _baba(venue: str, body: str = "") -> str:
+    return (
+        "<html><head><title>馬場情報（"
+        f"{venue}競馬場）　JRA</title></head><body>{body}</body></html>"
+    )
+
+
+def _tokyo_measured() -> str:
+    return _baba(
+        "東京",
+        """
+        <nav>函館競馬場 京都競馬場 札幌競馬場</nav>
+        <p>クッション値 9.8</p>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>12.1</td><td>11.4</td></tr>
+          <tr><td>ダート</td><td>8.2</td><td>9.0</td></tr>
+        </table>
+        """,
+    )
+
 
 TOKYO = timezone(timedelta(hours=9))
 PINNED = datetime(2026, 10, 12, 9, 0, tzinfo=TOKYO)
