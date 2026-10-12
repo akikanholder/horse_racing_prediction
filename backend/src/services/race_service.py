@@ -2,8 +2,10 @@
 
 import logging
 from datetime import date, datetime
+from pathlib import Path
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
+from backend.models.historical import HistoricalBatch, HistoricalExport
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import (
     ODDS_ENCODING,
@@ -38,6 +40,7 @@ from backend.scrapers.runner_status import (
     merge_non_runners,
 )
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
+from backend.services.historical_service import HistoricalService
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +247,47 @@ class RaceService:
             Settled race result from the netkeiba result page
         """
         return self.netkeiba_scraper.get_settled_race_result(race_id)
+
+    def get_historical_races(
+        self,
+        *,
+        race_id: str | None = None,
+        on_date: date | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        venues: list[str] | None = None,
+        flat_only: bool = True,
+        priority_venues: bool = False,
+        delay_seconds: float = 1.5,
+        resume_from: str | None = None,
+    ) -> HistoricalBatch:
+        """Past flat races for an EV backtest.
+
+        ``race_id`` loads one race. ``on_date`` or ``date_from``/``date_to``
+        loads each race in order, with a delay, from 2025 onward. Final odds
+        are kept only when the page says 確定オッズ or the page is post-race.
+        Live odds are not copied.
+        """
+        with HistoricalService(delay_seconds=delay_seconds) as service:
+            return service.get(
+                race_id=race_id,
+                on_date=on_date,
+                date_from=date_from,
+                date_to=date_to,
+                venues=venues,
+                flat_only=flat_only,
+                priority_venues=priority_venues,
+                resume_from=resume_from,
+            )
+
+    @staticmethod
+    def export_historical_races(
+        batch: HistoricalBatch,
+        directory: str,
+        fmt: str,
+    ) -> HistoricalExport:
+        """Write JSONL or per-surface CSV. Out-of-scope races are left out."""
+        return HistoricalService.export(batch, Path(directory), fmt)
 
     def get_race_odds(
         self,

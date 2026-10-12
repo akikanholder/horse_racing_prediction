@@ -2,6 +2,7 @@
 
 能力指標とは別物。期待値は RaceEntry.odds ではなく、この OddsQuote を読む。
 単勝、馬連、三連複は odds（単一価格）。ワイドは odds_min と odds_max（範囲の片側から価格は作らない）。
+複勝（place）は過去レースの確定オッズだけで使う。単一価格か、ページが範囲を印字したときの odds_min / odds_max。
 """
 
 import re
@@ -10,9 +11,18 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
-OddsSource = Literal["netkeiba_yoso", "netkeiba_live", "jradb"]
+OddsSource = Literal[
+    "netkeiba_yoso",
+    "netkeiba_live",
+    "jradb",
+    "jra_html",
+    "jra_js",
+    "netkeiba_html",
+    "netkeiba_js",
+    "headless",
+]
 OddsKind = Literal["yoso", "live"]
-BetType = Literal["win", "wide", "umaren", "sanrenpuku"]
+BetType = Literal["win", "wide", "umaren", "sanrenpuku", "place"]
 OddsStatus = Literal["live", "yoso", "unavailable"]
 OddsPrefer = Literal["live", "yoso"]
 NonRunnerStatus = Literal["scratched", "excluded", "unknown"]
@@ -60,16 +70,33 @@ class OddsQuote(BaseModel):
     race_id: str = Field(..., description="レースID")
     bet_type: BetType = Field(
         "win",
-        description="馬券種。win（単勝）、wide（ワイド）、umaren（馬連）、sanrenpuku（三連複）",
+        description=(
+            "馬券種。win（単勝）、place（複勝。過去の確定オッズだけ）、"
+            "wide（ワイド）、umaren（馬連）、sanrenpuku（三連複）"
+        ),
     )
     combination: str = Field(
         ...,
         description="単勝は馬番。ワイドと馬連は 3-7、三連複は 1-2-5 のように馬番の小さい順",
     )
-    odds: float | None = Field(None, description="単勝・馬連・三連複のオッズ。ワイドでは空", gt=0)
-    odds_min: float | None = Field(None, description="ワイドの下限オッズ。馬連・三連複では空", gt=0)
-    odds_max: float | None = Field(None, description="ワイドの上限オッズ。馬連・三連複では空", gt=0)
-    source: OddsSource = Field(..., description="取得元")
+    odds: float | None = Field(
+        None,
+        description="単勝・馬連・三連複のオッズ。複勝が単一価格のときもここ。ワイドでは空",
+        gt=0,
+    )
+    odds_min: float | None = Field(
+        None, description="ワイド、または複勝の範囲の下限。馬連・三連複では空", gt=0
+    )
+    odds_max: float | None = Field(
+        None, description="ワイド、または複勝の範囲の上限。馬連・三連複では空", gt=0
+    )
+    source: OddsSource = Field(
+        ...,
+        description=(
+            "取得元。発売中の引用は netkeiba_yoso / netkeiba_live。"
+            "過去の確定オッズはページの jra_html / jra_js / netkeiba_html / netkeiba_js / headless もあり得る"
+        ),
+    )
     kind: OddsKind = Field(..., description="yoso=発売前の予想、live=発売後の市場")
     fetched_at: datetime = Field(..., description="取得日時")
     market_updated_at: datetime | None = Field(None, description="ページが示すオッズ更新日時")
@@ -91,6 +118,8 @@ class OddsQuote(BaseModel):
             raise ValueError("kind=live cannot use source=netkeiba_yoso")
         if self.bet_type == "win":
             self._check_win()
+        elif self.bet_type == "place":
+            self._check_place()
         elif self.bet_type == "wide":
             self._check_wide()
         elif self.bet_type == "umaren":
@@ -98,6 +127,24 @@ class OddsQuote(BaseModel):
         else:
             self._check_sanrenpuku()
         return self
+
+    def _check_place(self) -> None:
+        """Place is a horse number. A printed range uses both ends. A single price stays in odds."""
+        if _HORSE_NUMBER.fullmatch(self.combination) is None:
+            raise ValueError("place combination must be a horse number")
+        has_range = self.odds_min is not None or self.odds_max is not None
+        if self.withheld:
+            if self.odds is not None or has_range:
+                raise ValueError("withheld place odds stay null")
+            return
+        if self.odds is not None and has_range:
+            raise ValueError("place odds are either a single price or a range")
+        if self.odds is not None:
+            return
+        if self.odds_min is None or self.odds_max is None:
+            raise ValueError("place range requires odds_min and odds_max")
+        if self.odds_min > self.odds_max:
+            raise ValueError("odds_min cannot exceed odds_max")
 
     def _check_win(self) -> None:
         if _HORSE_NUMBER.fullmatch(self.combination) is None:

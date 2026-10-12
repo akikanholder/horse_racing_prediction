@@ -7,7 +7,9 @@ import logging
 import sys
 from collections.abc import Sequence
 from datetime import date
+from pathlib import Path
 
+from backend.models.historical import HistoricalBatch, HistoricalRace
 from backend.models.horse import Horse, HorsePerformance, PedigreeHorse
 from backend.models.odds import OddsQuote
 from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, TrackBias
@@ -545,6 +547,93 @@ def _format_payout(payout: RacePayout) -> str:
     return f"{payout.bet_type} {payout.combination} {payout.payout}円{popularity}"
 
 
+def cmd_history(args):
+    """Past flat races: final odds, payouts, and the full finish order."""
+    if not args.race_id and not args.date and not args.date_from:
+        print("race_id か --date か --from を指定してください")
+        sys.exit(1)
+    with RaceService() as service:
+        batch = service.get_historical_races(
+            race_id=args.race_id,
+            on_date=_cli_date(args.date),
+            date_from=_cli_date(args.date_from),
+            date_to=_cli_date(args.date_to),
+            venues=args.venue,
+            flat_only=args.flat_only,
+            priority_venues=args.priority_venues,
+            delay_seconds=args.delay,
+            resume_from=args.resume_from,
+        )
+        if args.export:
+            output = Path(args.output) if args.output else _default_history_dir()
+            written = service.export_historical_races(batch, str(output), args.export)
+            logger.info("historical export: %s", ", ".join(written.paths))
+
+    if args.json:
+        print_json(batch)
+        return
+    _print_history(batch)
+
+
+def _cli_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
+
+
+def _default_history_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "csv_output" / "historical"
+
+
+def _print_history(batch: HistoricalBatch) -> None:
+    print("\n=== 過去レース（バックテスト。予想の入力ではない） ===")
+    span = ""
+    if batch.date_from:
+        span = f"{batch.date_from} から {batch.date_to}"
+    print(f"範囲: {span or 'レースID'}")
+    print(f"件数: {len(batch.races)}（範囲外 {batch.skipped}）")
+    if batch.venues:
+        print(f"競馬場: {'、'.join(batch.venues)}")
+    print(f"平地のみ: {'はい' if batch.flat_only else 'いいえ'}")
+    if batch.warning:
+        print(f"警告: {batch.warning}")
+    if batch.stopped_at_race_id or batch.remaining_race_ids:
+        print(f"停止: {batch.stopped_at_race_id or 'レースIDなし'}")
+        print(f"完了: {', '.join(batch.completed_race_ids) or 'なし'}")
+        print(f"残り: {', '.join(batch.remaining_race_ids) or 'なし'}")
+    for race in batch.races:
+        _print_historical_race(race)
+
+
+def _print_historical_race(race: HistoricalRace) -> None:
+    settled = race.result
+    name = settled.race_name or race.race_id
+    surface = race.surface or "面不明"
+    distance = f"{race.distance}m" if race.distance is not None else "距離不明"
+    going = race.going or "馬場不明"
+    race_class = race.race_class or "クラス不明"
+    field = f"{race.field_size}頭" if race.field_size is not None else "頭数不明"
+    print(
+        f"\n--- {settled.race_date or '日付不明'} {settled.venue or '場不明'} "
+        f"{name} ({surface}{distance} {race_class} {going} {field}) ---"
+    )
+    print(f"範囲内: {'はい' if race.in_scope else 'いいえ'}")
+    print(f"確定オッズ: {'あり' if race.odds_final else 'なし'}")
+    if race.warning:
+        print(f"警告: {race.warning}")
+    if not settled.results:
+        print("着順: なし")
+    for finisher in settled.results:
+        print(_format_finisher(finisher))
+    if settled.payouts:
+        print("払戻: " + " / ".join(_format_payout(payout) for payout in settled.payouts))
+    if settled.refunds:
+        horses = "、".join(
+            f"{number}番" for refund in settled.refunds for number in refund.horse_numbers
+        )
+        print(f"返還: {horses or '印字なし'}")
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with RaceService() as service:
@@ -672,6 +761,65 @@ def main():
     )
     odds_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     odds_parser.set_defaults(func=cmd_odds)
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="過去の平地レースの確定オッズ・払戻・全着順を取得する",
+        description=(
+            "EV のバックテスト用。2025年以降の JRA 平地が対象。"
+            "race_id、または --date / --from と --to。"
+            "確定オッズはページが確定オッズと出すか、レース後のページのときだけ。"
+            "発売中のオッズは確定にしない。欠測は null と警告。"
+            "日付の範囲は1レースずつ、間隔を空け、ページはローカルにキャッシュする。"
+            "結果ページか開催一覧の 403 とログイン画面で止める。同じ実行では再試行しない。"
+            "再実行はキャッシュ済みのレースを取り直さず、止めたレースから続ける。"
+            "--resume-from はそれより前をキャッシュだけにする。"
+            "--venue で競馬場を絞る。--priority-venues は東京・京都・中山・阪神。"
+            "--flat-only が既定。障害は --no-flat-only。"
+            "--export jsonl か csv は芝・ダートで校正できる形。"
+        ),
+    )
+    history_parser.add_argument("race_id", nargs="?", help="レースID")
+    history_parser.add_argument("--date", help="その日だけ。YYYY-MM-DD")
+    history_parser.add_argument("--from", dest="date_from", help="開始日 YYYY-MM-DD")
+    history_parser.add_argument("--to", dest="date_to", help="終了日 YYYY-MM-DD")
+    history_parser.add_argument(
+        "--venue",
+        action="append",
+        help="競馬場。繰り返す。優先は東京、京都、中山、阪神",
+    )
+    history_parser.add_argument(
+        "--priority-venues",
+        action="store_true",
+        help="東京・京都・中山・阪神だけ",
+    )
+    history_parser.add_argument(
+        "--flat-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="障害を除く（既定）。--no-flat-only で障害も残す",
+    )
+    history_parser.add_argument(
+        "--resume-from",
+        help="このレースIDからネットワークを開く。それより前はキャッシュだけ",
+    )
+    history_parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.5,
+        help="日付範囲でレースとレースのあいだに待つ秒数",
+    )
+    history_parser.add_argument(
+        "--export",
+        choices=["jsonl", "csv"],
+        help="jsonl は1レース1行。csv は馬ごとの行と、芝・ダート別のファイル",
+    )
+    history_parser.add_argument(
+        "--output",
+        help="書き出し先。既定は backend/csv_output/historical",
+    )
+    history_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    history_parser.set_defaults(func=cmd_history)
 
     args = parser.parse_args()
 

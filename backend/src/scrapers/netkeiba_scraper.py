@@ -47,7 +47,12 @@ from backend.scrapers.jra_payout import (
     OfficialRefund,
     cross_check_payouts,
 )
-from backend.scrapers.page_fallback import FetchedBody, PageFallback
+from backend.scrapers.page_fallback import (
+    AccessBlocked,
+    FetchedBody,
+    PageFallback,
+    looks_like_login_wall,
+)
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
     NETKEIBA_SHUTUBA_FORBIDDEN,
@@ -947,10 +952,48 @@ def _result_block_warning(warning: str | None) -> str:
 
 def _phase_label(text: str) -> str | None:
     compact = _compact(text)
-    if compact in {"結果確定前", "未確定", "暫定", "provisional"}:
+    if compact in {"確定前", "結果確定前", "未確定", "暫定", "provisional"}:
         return "provisional"
     if compact in {"結果確定", "確定", "confirmed"}:
         return "confirmed"
+    return None
+
+
+_CLASS_LABELS = (
+    "新馬",
+    "未勝利",
+    "1勝クラス",
+    "2勝クラス",
+    "3勝クラス",
+    "１勝クラス",
+    "２勝クラス",
+    "３勝クラス",
+    "オープン",
+    "リステッド",
+    "L",
+    "G1",
+    "G2",
+    "G3",
+    "ＧⅠ",
+    "ＧⅡ",
+    "ＧⅢ",
+    "Jpn1",
+    "Jpn2",
+    "Jpn3",
+    "500万下",
+    "1000万下",
+    "1600万下",
+)
+
+
+def _race_class_on_page(data02: Tag) -> str | None:
+    """Class printed in its own span. The race name and age condition are not a class."""
+    for span in data02.find_all("span"):
+        if not isinstance(span, Tag):
+            continue
+        text = _compact(span.get_text())
+        if text in _CLASS_LABELS:
+            return text
     return None
 
 
@@ -1192,6 +1235,7 @@ class _SettledHeader:
     track_type: str | None = None
     track_condition: str | None = None
     weather: str | None = None
+    race_class: str | None = None
     entry_count: int | None = None
     kai: int | None = None
     meeting_day: int | None = None
@@ -1305,6 +1349,8 @@ class NetkeibaScraper(BaseScraper):
                 f"{self.BASE_URL}/top/race_list.html",
                 params={"kaisai_date": date_str},
             )
+            if looks_like_login_wall(str(soup)):
+                raise AccessBlocked(401, "requires login")
             containers = soup.find_all(
                 ["div", "table", "section"],
                 class_=re.compile(r"RaceList|race_list|RaceData"),
@@ -1334,6 +1380,9 @@ class NetkeibaScraper(BaseScraper):
                         )
                     )
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if isinstance(e, AccessBlocked) or status in {401, 403}:
+                raise
             logger.error(f"Failed to fetch races for {target_date}: {e}")
 
         unique_races = {race.race_id: race for race in races}
@@ -1504,6 +1553,8 @@ class NetkeibaScraper(BaseScraper):
             track_type=identity.track_type,
             track_condition=identity.track_condition,
             weather=identity.weather,
+            race_class=identity.race_class,
+            entry_count=identity.entry_count,
             fetched_at=fetched_at,
             source=None,
             complete=False,
@@ -1573,6 +1624,7 @@ class NetkeibaScraper(BaseScraper):
                 header.meeting_day = int(day_match.group(1))
             if count_match:
                 header.entry_count = int(count_match.group(1))
+            header.race_class = _race_class_on_page(data02)
         header.race_number = _race_number_on_page(soup)
         header.result_phase = _result_phase_on_page(soup)
         data01 = soup.select_one(".RaceData01")
@@ -1975,6 +2027,8 @@ class NetkeibaScraper(BaseScraper):
             track_type=header.track_type,
             track_condition=header.track_condition,
             weather=header.weather,
+            race_class=header.race_class,
+            entry_count=header.entry_count,
             fetched_at=fetched_at,
             source=_race_source(results, payouts),
             complete=complete,
@@ -2393,9 +2447,7 @@ class NetkeibaScraper(BaseScraper):
         soup = BeautifulSoup(html, "lxml")
         if self._find_shutuba_table(soup) is None:
             return False
-        entries = self._parse_race_entries(
-            soup, source="netkeiba_html", fetched_at=datetime.min
-        )
+        entries = self._parse_race_entries(soup, source="netkeiba_html", fetched_at=datetime.min)
         if not entries:
             return True
         return any(entry.status is None for entry in entries)
@@ -2403,7 +2455,9 @@ class NetkeibaScraper(BaseScraper):
     def _shutuba_pages_incomplete(self, pages: list[FetchedBody], race_id: str) -> bool:
         card = self._card_from_shutuba_pages(pages, race_id)
         if card is None or not card.entries:
-            return bool(card is None or self._find_shutuba_table(BeautifulSoup(pages[0].body, "lxml")))
+            return bool(
+                card is None or self._find_shutuba_table(BeautifulSoup(pages[0].body, "lxml"))
+            )
         return any(entry.status is None for entry in card.entries)
 
     def _card_from_shutuba_pages(self, pages: list[FetchedBody], race_id: str) -> RaceCard | None:
@@ -2414,9 +2468,7 @@ class NetkeibaScraper(BaseScraper):
             if not page.body.lstrip().startswith(("{", "[")):
                 soup = BeautifulSoup(page.body, "lxml")
                 race = self._parse_race_info(soup, race_id)
-                entries = self._parse_race_entries(
-                    soup, source=source, fetched_at=page.fetched_at
-                )
+                entries = self._parse_race_entries(soup, source=source, fetched_at=page.fetched_at)
                 if race is not None and card is None:
                     card = RaceCard(race=race, entries=entries)
                 elif card is not None and entries:
@@ -2444,7 +2496,9 @@ class NetkeibaScraper(BaseScraper):
                 )
         return card
 
-    def _shutuba_warning(self, card: RaceCard, chain_warning: str | None, status: str) -> str | None:
+    def _shutuba_warning(
+        self, card: RaceCard, chain_warning: str | None, status: str
+    ) -> str | None:
         """A printed status for every starter drops the fallback warning."""
         if card.entries and all(entry.status is not None for entry in card.entries):
             return None
@@ -2486,9 +2540,7 @@ class NetkeibaScraper(BaseScraper):
                 continue
 
             try:
-                entry = self._parse_entry_row(
-                    row, cols, source=page_source, fetched_at=fetched
-                )
+                entry = self._parse_entry_row(row, cols, source=page_source, fetched_at=fetched)
                 if entry:
                     entries.append(entry)
             except Exception as e:

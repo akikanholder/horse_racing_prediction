@@ -80,6 +80,7 @@ WIN_ODDS_KEY = "1"
 WIDE_ODDS_KEY = "5"
 UMAREN_ODDS_KEY = "4"
 SANRENPUKU_ODDS_KEY = "7"
+PLACE_ODDS_KEY = "2"
 _LIVE_STATUSES = frozenset({"result", "middle"})
 _MARKET_UPDATED_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
@@ -92,6 +93,8 @@ _ODDS_REQUESTS: dict[BetType, tuple[str, str, str]] = {
     "wide": ("5", "b5", WIDE_ODDS_KEY),
     "umaren": ("4", "b4", UMAREN_ODDS_KEY),
     "sanrenpuku": ("7", "b7", SANRENPUKU_ODDS_KEY),
+    # 複勝は過去の確定オッズだけが読む。発売中の odds コマンドは要求しない。
+    "place": ("2", "b2", PLACE_ODDS_KEY),
 }
 
 
@@ -166,6 +169,14 @@ class NetkeibaOddsScraper(BaseScraper):
         """
         return self._get_odds(race_id, "sanrenpuku", fetched_at=fetched_at)
 
+    def get_place_odds(self, race_id: str, *, fetched_at: datetime | None = None) -> RaceOdds:
+        """Fetch place odds. Historical final odds are the only caller.
+
+        The live odds command does not request place. A pre-race payload is
+        still parsed here; the caller drops it unless race_phase is post.
+        """
+        return self._get_odds(race_id, "place", fetched_at=fetched_at)
+
     def _get_odds(
         self,
         race_id: str,
@@ -213,6 +224,8 @@ class NetkeibaOddsScraper(BaseScraper):
             return parse_netkeiba_umaren_odds(payload, race_id, fetched_at=fetched)
         if bet_type == "sanrenpuku":
             return parse_netkeiba_sanrenpuku_odds(payload, race_id, fetched_at=fetched)
+        if bet_type == "place":
+            return parse_netkeiba_place_odds(payload, race_id, fetched_at=fetched)
         return parse_netkeiba_win_odds(payload, race_id, fetched_at=fetched)
 
 
@@ -256,6 +269,56 @@ def parse_netkeiba_win_odds(
     return RaceOdds(
         race_id=race_id,
         bet_types=["win"],
+        prefer="live",
+        status=snapshot_status,
+        reason=None,
+        encoding=ODDS_ENCODING,
+        race_phase=race_phase,
+        quotes=quotes,
+        non_runners=runners,
+        fetched_at=fetched_at,
+    )
+
+
+def parse_netkeiba_place_odds(
+    payload: object,
+    race_id: str,
+    *,
+    fetched_at: datetime,
+) -> RaceOdds:
+    """Turn an api_get_jra_odds type=2 response into place quotes.
+
+    A list is a range (``odds_min`` / ``odds_max``), the same shape as wide.
+    A single number stays in ``odds``. One end of a range drops the row.
+    Callers that need final odds keep this only when ``race_phase`` is post.
+    """
+    opened = _read_market(
+        payload,
+        race_id,
+        fetched_at,
+        odds_key=PLACE_ODDS_KEY,
+        bet_type="place",
+    )
+    if isinstance(opened, RaceOdds):
+        return opened
+    place_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    quotes, runners = _quotes_from_place_map(
+        place_map,
+        race_id=race_id,
+        source=source,
+        kind=kind,
+        fetched_at=fetched_at,
+        market_updated_at=market_updated_at,
+    )
+    runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
+    if not quotes:
+        empty = _unavailable(
+            race_id, fetched_at, reason or "odds unavailable", "place", race_phase=race_phase
+        )
+        return empty.model_copy(update={"non_runners": runners})
+    return RaceOdds(
+        race_id=race_id,
+        bet_types=["place"],
         prefer="live",
         status=snapshot_status,
         reason=None,
@@ -554,6 +617,85 @@ def _quotes_from_win_map(
         )
     runners = non_runners_from_cells(priced, source="netkeiba_js", fetched_at=fetched_at)
     return quotes, runners
+
+
+def _quotes_from_place_map(
+    place_map: dict[Any, Any],
+    *,
+    race_id: str,
+    source: OddsSource,
+    kind: OddsKind,
+    fetched_at: datetime,
+    market_updated_at: datetime | None,
+) -> tuple[list[OddsQuote], list[NonRunner]]:
+    """One place quote per horse. A list is a range. A scalar is a single price."""
+    quotes: list[OddsQuote] = []
+    seen: set[str] = set()
+    priced: list[tuple[str, PriceCell]] = []
+    for key in sorted(place_map, key=_sort_key):
+        combination = _combination(key)
+        if combination is None or combination in seen:
+            continue
+        raw = place_map[key]
+        if isinstance(raw, list | tuple) and len(raw) >= 2 and not _place_list_is_single(raw):
+            span = read_range_cell(raw)
+            if span is None:
+                continue
+            seen.add(combination)
+            quotes.append(
+                OddsQuote(
+                    race_id=race_id,
+                    bet_type="place",
+                    combination=combination,
+                    odds=None,
+                    odds_min=span.odds_min,
+                    odds_max=span.odds_max,
+                    source=source,
+                    kind=kind,
+                    fetched_at=fetched_at,
+                    market_updated_at=market_updated_at,
+                    non_runner=span.non_runner,
+                    withheld=span.withheld,
+                )
+            )
+            continue
+        cell = read_price_cell(raw)
+        if cell is None:
+            continue
+        seen.add(combination)
+        priced.append((combination, cell))
+        quotes.append(
+            OddsQuote(
+                race_id=race_id,
+                bet_type="place",
+                combination=combination,
+                odds=None if cell.withheld else cell.odds,
+                source=source,
+                kind=kind,
+                fetched_at=fetched_at,
+                market_updated_at=market_updated_at,
+                non_runner=cell.non_runner,
+                withheld=cell.withheld,
+            )
+        )
+    runners = non_runners_from_cells(priced, source="netkeiba_js", fetched_at=fetched_at)
+    return quotes, runners
+
+
+def _place_list_is_single(raw: list | tuple) -> bool:
+    """Win-shaped ``[odds, change, popularity]`` is not a place range.
+
+    A place range is two prices. A change of ``0`` or ``0.0`` next to one
+    price is the win/umaren shape and is read as a single price.
+    """
+    if len(raw) < 2:
+        return True
+    second = raw[1]
+    if isinstance(second, str) and second.strip() in {"", "0", "0.0", "0.00"}:
+        return True
+    if isinstance(second, int | float) and not isinstance(second, bool) and float(second) == 0:
+        return True
+    return False
 
 
 def _quotes_from_wide_map(
