@@ -95,11 +95,14 @@ def cmd_race_card(args):
             print_json(race_card)
         else:
             for entry in race_card.entries:
+                label = f" {entry.status_label}" if entry.status_label else ""
                 print(
                     f"{entry.bracket_number}枠 {entry.horse_number}番 "
                     f"{entry.horse_name} ({entry.sex}{entry.age}) "
-                    f"[{entry.jockey_name}]"
+                    f"[{entry.jockey_name}]{label}"
                 )
+            if race_card.warning:
+                print(f"警告: {race_card.warning}")
 
 
 def cmd_horse(args):
@@ -386,6 +389,16 @@ def cmd_odds(args):
     print(f"文字コード: {snapshot.encoding}")
     if snapshot.reason:
         print(f"理由: {snapshot.reason}")
+    if snapshot.non_runners:
+        marks = "、".join(
+            f"{runner.horse_number}番{runner.status_label or runner.status}"
+            for runner in snapshot.non_runners
+        )
+        print(f"取消・除外: {marks}")
+    elif snapshot.non_runners is None and snapshot.warning:
+        print("取消・除外: 不明")
+    if snapshot.warning:
+        print(f"警告: {snapshot.warning}")
     print(f"取得時刻: {snapshot.fetched_at}")
     if not snapshot.quotes:
         return
@@ -421,13 +434,22 @@ def _odds_title(bet_types: Sequence[str]) -> str:
 
 def _format_odds_quote(quote: OddsQuote) -> str:
     tag = f"[{quote.source} / {quote.kind}]"
+    mark = ""
+    if quote.non_runner:
+        mark = " 取消・除外"
+    elif quote.withheld:
+        mark = " ----"
     if quote.bet_type == "wide":
-        return f"ワイド {quote.combination} {quote.odds_min}-{quote.odds_max} {tag}"
+        price = "----" if quote.withheld else f"{quote.odds_min}-{quote.odds_max}"
+        return f"ワイド {quote.combination} {price} {tag}{mark}"
     if quote.bet_type == "umaren":
-        return f"馬連 {quote.combination} {quote.odds} {tag}"
+        price = "----" if quote.withheld else str(quote.odds)
+        return f"馬連 {quote.combination} {price} {tag}{mark}"
     if quote.bet_type == "sanrenpuku":
-        return f"三連複 {quote.combination} {quote.odds} {tag}"
-    return f"{quote.combination}番 {quote.odds} {tag}"
+        price = "----" if quote.withheld else str(quote.odds)
+        return f"三連複 {quote.combination} {price} {tag}{mark}"
+    price = "----" if quote.withheld else str(quote.odds)
+    return f"{quote.combination}番 {price} {tag}{mark}"
 
 
 def cmd_result(args):
@@ -559,6 +581,8 @@ def main():
             "出馬表。race.track_bias はページにある競馬場・芝/ダート・距離・馬場状態を写す。"
             "内外とペースは accessD/JRADB と JRA 馬場情報にそのラベルがあるときだけ。"
             "外回り・使用コース・芝の傷み・オッズからは作らず、無いときは null。"
+            "各馬の status は entered / scratched（取消）/ excluded（除外）/ unknown。"
+            "status_label はページの文字のまま。JRA を優先し、無ければ netkeiba。"
         ),
     )
     card_parser.add_argument("race_id", help="レースID")
@@ -625,7 +649,8 @@ def main():
             "race_phase は pre（API status の yoso と middle。レース前）か "
             "post（API status の result。レース後の確定）。"
             "HTTP 400、空の確定オッズ、壊れた JSON は quotes を空にし reason を返す。"
-            "価格は作らない。prefer は kind を書き換えない。"
+            "価格は作らない。ページが ---- または 取消 の行は odds を null のまま残す。"
+            "取消・除外の馬番は non_runners。prefer は kind を書き換えない。"
             "prefer=live で市場が無いとき yoso へは自動で切り替えない。"
         ),
     )

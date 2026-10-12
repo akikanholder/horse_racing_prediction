@@ -17,7 +17,7 @@ EV（競馬予想）が CLI と HTTP JSON を読む契約は [docs/ev-contract.m
   - コース情報
 - **JRA出馬表** (https://www.jra.go.jp/JRADB/accessD.html)
   - レース詳細（レース条件、発走時刻、本賞金）
-  - 出走馬（枠番、馬番、騎手、調教師、馬体重、単勝オッズ）
+  - 出走馬（枠番、馬番、騎手、調教師、馬体重、単勝オッズ、取消・除外）
 - **JRA馬場情報** (https://www.jra.go.jp/keiba/baba/index.html)
   - 馬場状態（芝/ダート）
   - クッション値
@@ -103,7 +103,7 @@ API ドキュメント: http://localhost:8000/docs
 # 今週のレース一覧
 python -m backend.cli races
 
-# 出馬表を取得
+# 出馬表を取得（取消・除外は status と印字どおりの status_label。JRA を優先）
 python -m backend.cli card <race_id>
 
 # 競走馬の近走・血統・脚質・調教（確定したレース結果ではない。当日バイアスは null）
@@ -195,9 +195,10 @@ with TrackInfoService() as service:
 期待値は `RaceEntry.odds` ではなく、ここで返す `OddsQuote` を使う。
 
 - `bet_types` は `win`（単勝）、`wide`（ワイド）、`umaren`（馬連）、`sanrenpuku`（三連複）。カンマ区切りで同時に取れる。既定は `win`。
-- 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。
-- 馬連の組み合わせも `3-7`（馬番の小さい順）。価格は単勝と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。
-- 三連複の組み合わせは `1-2-5`（馬番3つの小さい順）。価格は馬連と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。
+- 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。ページが `----` または `取消` の行は残し、価格は null、`withheld` を true。
+- 馬連の組み合わせも `3-7`（馬番の小さい順）。価格は単勝と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。`----` と `取消` は残して価格は null。
+- 三連複の組み合わせは `1-2-5`（馬番3つの小さい順）。価格は馬連と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。`----` と `取消` は残して価格は null。
+- `non_runners` は取消・除外の馬番。`status` は `scratched` / `excluded` / `unknown`。`status_label` はページの文字。JRA を優先し、403 のときは netkeiba。馬番は作らない。組がページに無いときはその組を作らない。
 - `source` は `netkeiba_live` / `netkeiba_yoso` / `jradb`。`kind` は `live` または `yoso`。CLI を `source` には入れない。
 - `fetched_at` は必須。市場の更新時刻があるときだけ `market_updated_at` を入れる。
 - `encoding` は常に `utf-8`。オッズ API（`api_get_jra_odds.html`、`compress=0`）の JSON を UTF-8 で読む。`combination` は ASCII の馬番（単勝 `1`、ワイド・馬連 `3-7`、三連複 `1-2-5`）。馬成績ページの EUC-JP では読まない。呼び出し側で文字コードを推測しない。

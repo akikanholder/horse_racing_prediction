@@ -48,6 +48,21 @@ from backend.scrapers.jra_payout import (
     cross_check_payouts,
 )
 from backend.scrapers.page_fallback import FetchedBody, PageFallback
+from backend.scrapers.runner_status import (
+    HEADLESS_UNAVAILABLE,
+    NETKEIBA_SHUTUBA_FORBIDDEN,
+    NETKEIBA_SHUTUBA_LOGIN,
+    SCRATCH_STATUS_MISSING,
+    apply_records,
+    as_page_source,
+    join_warnings,
+    records_from_entries,
+    row_status,
+    same_site_status_urls,
+)
+from backend.scrapers.runner_status import (
+    page_records as _page_records,
+)
 from backend.utils.date_utils import (
     get_current_week_dates,
     parse_japanese_date,
@@ -1336,21 +1351,39 @@ class NetkeibaScraper(BaseScraper):
         Returns:
             RaceCard with entries or None
         """
+        fetched = tokyo_now()
+        fallback = PageFallback(
+            self.http_client,
+            site="netkeiba",
+            headless_render=self._headless_render,
+            url_finder=same_site_status_urls,
+        )
+        loaded = fallback.load(
+            url=f"{self.BASE_URL}/race/shutuba.html",
+            params={"race_id": race_id},
+            headers={**self.BROWSER_HEADERS, "Referer": f"{self.BASE_URL}/top/"},
+            encoding=self.ENCODING,
+            fetched_at=fetched,
+            should_fallback=self._shutuba_needs_fallback,
+            still_incomplete=lambda pages: self._shutuba_pages_incomplete(pages, race_id),
+        )
+        if loaded.status == "blocked" and not loaded.pages:
+            logger.warning("Netkeiba shutuba blocked for %s: %s", race_id, loaded.warning)
+            return None
+        if loaded.status == "failed" or not loaded.pages:
+            logger.error("Failed to fetch race card for %s", race_id)
+            return None
         try:
-            url = f"{self.BASE_URL}/race/shutuba.html"
-            soup = self.fetch_page(url, params={"race_id": race_id})
-
-            race = self._parse_race_info(soup, race_id)
-            if not race:
-                return None
-
-            entries = self._parse_race_entries(soup)
-
-            return RaceCard(race=race, entries=entries)
-
+            card = self._card_from_shutuba_pages(loaded.pages, race_id)
         except Exception as e:
             logger.error(f"Failed to fetch race card for {race_id}: {e}")
             return None
+        if card is None:
+            return None
+        warning = self._shutuba_warning(card, loaded.warning, loaded.status)
+        if warning != card.warning:
+            card = card.model_copy(update={"warning": warning})
+        return card
 
     def get_race_result(self, race_id: str) -> list[RaceResult] | None:
         """Get race result rows for CSV export.
@@ -2347,24 +2380,115 @@ class NetkeibaScraper(BaseScraper):
             return project_code, self.VENUE_CODES[project_code]
         return None, None
 
-    def _parse_race_entries(self, soup: BeautifulSoup) -> list[RaceEntry]:
+    def _find_shutuba_table(self, soup: BeautifulSoup) -> Tag | None:
+        """Starter table. A results table is not the card."""
+        table = soup.find("table", class_=re.compile(r"Shutuba|shutuba|race_table"))
+        if not isinstance(table, Tag):
+            found = soup.find("table", id=re.compile(r"shutuba"))
+            table = found if isinstance(found, Tag) else None
+        return table
+
+    def _shutuba_needs_fallback(self, html: str) -> bool:
+        """True when the starter table is there but status was not on it."""
+        soup = BeautifulSoup(html, "lxml")
+        if self._find_shutuba_table(soup) is None:
+            return False
+        entries = self._parse_race_entries(
+            soup, source="netkeiba_html", fetched_at=datetime.min
+        )
+        if not entries:
+            return True
+        return any(entry.status is None for entry in entries)
+
+    def _shutuba_pages_incomplete(self, pages: list[FetchedBody], race_id: str) -> bool:
+        card = self._card_from_shutuba_pages(pages, race_id)
+        if card is None or not card.entries:
+            return bool(card is None or self._find_shutuba_table(BeautifulSoup(pages[0].body, "lxml")))
+        return any(entry.status is None for entry in card.entries)
+
+    def _card_from_shutuba_pages(self, pages: list[FetchedBody], race_id: str) -> RaceCard | None:
+        """Merge the shutuba table with later JSON. Missing status stays null."""
+        card: RaceCard | None = None
+        for page in pages:
+            source = as_page_source(page.source)
+            if not page.body.lstrip().startswith(("{", "[")):
+                soup = BeautifulSoup(page.body, "lxml")
+                race = self._parse_race_info(soup, race_id)
+                entries = self._parse_race_entries(
+                    soup, source=source, fetched_at=page.fetched_at
+                )
+                if race is not None and card is None:
+                    card = RaceCard(race=race, entries=entries)
+                elif card is not None and entries:
+                    card = card.model_copy(
+                        update={
+                            "entries": apply_records(
+                                card.entries,
+                                records_from_entries(entries),
+                                source=page.source,
+                                fetched_at=page.fetched_at,
+                            )
+                        }
+                    )
+            records = _page_records(page.body)
+            if card is not None and records:
+                card = card.model_copy(
+                    update={
+                        "entries": apply_records(
+                            card.entries,
+                            records,
+                            source=page.source,
+                            fetched_at=page.fetched_at,
+                        )
+                    }
+                )
+        return card
+
+    def _shutuba_warning(self, card: RaceCard, chain_warning: str | None, status: str) -> str | None:
+        """A printed status for every starter drops the fallback warning."""
+        if card.entries and all(entry.status is not None for entry in card.entries):
+            return None
+        blocked = None
+        if status == "blocked":
+            blocked = (
+                NETKEIBA_SHUTUBA_FORBIDDEN
+                if chain_warning and "403" in chain_warning
+                else NETKEIBA_SHUTUBA_LOGIN
+            )
+        headless = HEADLESS_UNAVAILABLE if chain_warning == HEADLESS_UNAVAILABLE else None
+        if not card.entries and blocked is None and headless is None:
+            return None
+        missing = SCRATCH_STATUS_MISSING if card.entries else None
+        return join_warnings(blocked, headless, missing)
+
+    def _parse_race_entries(
+        self,
+        soup: BeautifulSoup,
+        *,
+        source: str = "netkeiba_html",
+        fetched_at: datetime | None = None,
+    ) -> list[RaceEntry]:
         """Parse race entries from shutuba page."""
         entries = []
+        fetched = fetched_at or tokyo_now()
+        page_source = as_page_source(source)
 
-        table = soup.find("table", class_=re.compile(r"Shutuba|shutuba|race_table"))
-        if not table:
-            table = soup.find("table", id=re.compile(r"shutuba"))
+        table = self._find_shutuba_table(soup)
         if not table:
             return entries
 
         rows = table.find_all("tr")
         for row in rows:
+            if not isinstance(row, Tag):
+                continue
             cols = row.find_all(["td", "th"])
             if len(cols) < 4:
                 continue
 
             try:
-                entry = self._parse_entry_row(cols)
+                entry = self._parse_entry_row(
+                    row, cols, source=page_source, fetched_at=fetched
+                )
                 if entry:
                     entries.append(entry)
             except Exception as e:
@@ -2372,7 +2496,14 @@ class NetkeibaScraper(BaseScraper):
 
         return entries
 
-    def _parse_entry_row(self, cols: list[Tag]) -> RaceEntry | None:
+    def _parse_entry_row(
+        self,
+        row: Tag,
+        cols: list[Tag],
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> RaceEntry | None:
         """Parse a single entry row."""
         try:
             bracket_text = self.clean_text(cols[0].get_text())
@@ -2435,6 +2566,9 @@ class NetkeibaScraper(BaseScraper):
                     if match:
                         trainer_id = match.group(1)
 
+            printed = row_status(row)
+            status = printed[0] if printed is not None else "entered"
+            status_label = printed[1] if printed is not None else None
             return RaceEntry(
                 bracket_number=bracket_number,
                 horse_number=horse_number,
@@ -2447,6 +2581,10 @@ class NetkeibaScraper(BaseScraper):
                 jockey_id=jockey_id,
                 trainer_name=trainer_name,
                 trainer_id=trainer_id,
+                status=status,
+                status_label=status_label,
+                source=as_page_source(source),
+                fetched_at=fetched_at,
             )
 
         except Exception as e:

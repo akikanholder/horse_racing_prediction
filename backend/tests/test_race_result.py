@@ -1109,9 +1109,18 @@ def test_refund_horse_mismatch_keeps_the_netkeiba_numbers():
 
 
 def test_pre_race_models_do_not_carry_result_fields():
+    """Race and Horse stay free of settlement fields.
+
+    RaceEntry carries the pre-race status (entered / scratched / excluded /
+    unknown) and the printed label. demoted, complete, and result_phase stay
+    on the settled result.
+    """
     banned = {"status", "status_label", "demoted", "complete", "result_phase", "refunds"}
-    for model in (Race, RaceEntry, Horse):
+    for model in (Race, Horse):
         assert banned.isdisjoint(model.model_fields)
+    settlement_only = {"demoted", "complete", "result_phase", "refunds"}
+    assert settlement_only.isdisjoint(RaceEntry.model_fields)
+    assert {"status", "status_label", "source", "fetched_at"} <= set(RaceEntry.model_fields)
 
 
 @pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")
