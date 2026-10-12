@@ -130,10 +130,11 @@ class RunningStyleDefinition(BaseModel):
     """How a runner in one race was labeled. Thresholds are the formulas, not a fit."""
 
     basis: str = Field(..., description="passing_order_first_call")
-    position: str = Field(..., description="どの通過順を使うか")
-    escape: str = Field(..., description="逃げの条件")
-    front_end: str = Field(..., description="先行の上限")
-    mid_end: str = Field(..., description="差しの上限。それより後ろは追込")
+    position: str = Field(..., description="どの通過順を使うか。4区分")
+    escape: str = Field(..., description="逃げ。最初の通過順位が 1")
+    front_end: str = Field(..., description="先行。1 以外で ceil(field_size / 3) まで")
+    mid_end: str = Field(..., description="差し。1 以外で ceil(field_size * 2 / 3) まで")
+    closer: str = Field(..., description="追込。差しの上限より後ろ")
     unusable: str = Field(..., description="ラベルにしない走と、少ない標本の扱い")
 
 
@@ -237,19 +238,27 @@ class RaceTrendReport(BaseModel):
 
 
 def running_style_definition() -> RunningStyleDefinition:
-    """The classifier used for one race. The 4th-corner call is not read."""
+    """Four labels from the first passing call. The 4th-corner call is not read.
+
+    Position 1 is always 逃げ. Every other horse is 先行, 差し, or 追込 at
+    ``ceil(field_size / 3)`` and ``ceil(field_size * 2 / 3)``.
+    """
     return RunningStyleDefinition(
         basis=STYLE_BASIS,
         position=(
-            "通過順の最初の数字（最初に記録されたコーナー）。"
+            "4区分（逃げ・先行・差し・追込）。"
+            "使うのは通過順の最初の数字。"
             "13-12-12-7 の初角は 13。最後の数字（4コーナー）は使わない"
         ),
-        escape="最初の数字が 1 のとき逃げ",
-        front_end="ceil(field_size / 3)。1 以外でこの順位までは先行",
-        mid_end="ceil(field_size * 2 / 3)。この順位までは差し。それより後ろは追込",
+        escape="最初の通過順位が 1 の馬は逃げ。この馬は三等分に入れない",
+        front_end=(
+            "1 以外の馬は ceil(field_size / 3) までが先行。この上限が 1 のときは先行は 0 頭"
+        ),
+        mid_end=("1 以外で ceil(field_size / 3) より後ろ、ceil(field_size * 2 / 3) までは差し"),
+        closer="1 以外で ceil(field_size * 2 / 3) より後ろは追込",
         unusable=(
             "頭数はレースの field_size（ページの N頭）。"
             "通過順が読めない、頭数が無い、順位が頭数を超える走はラベルにしない。"
-            "1頭の区分も sample_size 付きで残し、少ないからといって落とさない"
+            "0頭や1頭の区分も sample_size 付きで残し、少ないからといって落とさない"
         ),
     )

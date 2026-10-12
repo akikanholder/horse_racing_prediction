@@ -195,7 +195,7 @@ with TrackInfoService() as service:
 
 ## レース傾向
 
-`GET /api/races/trends` と `python -m backend.cli trends` は、確定した過去レースの勝率・連対率・複勝率と、単勝・複勝の ROI を返す。人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分ける。脚質の定義（通過順の最初の数字と閾値）も返す。少ない標本は頭数付きで残す。計算できない値は null と warning。403 とログインは再試行しない。詳細は [docs/ev-contract.md](docs/ev-contract.md)。
+`GET /api/races/trends` と `python -m backend.cli trends` は、確定した過去レースの勝率・連対率・複勝率と、単勝・複勝の ROI を返す。人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分ける。脚質は4区分で、最初の通過順位が 1 なら逃げ、それ以外は `ceil(頭数/3)` と `ceil(頭数*2/3)` で先行・差し・追込に分ける。その定義も返す。少ない標本は頭数付きで残す。計算できない値は null と warning。403 とログインは再試行しない。詳細は [docs/ev-contract.md](docs/ev-contract.md)。
 
 ## オッズ
 

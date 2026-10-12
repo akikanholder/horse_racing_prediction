@@ -689,6 +689,7 @@ def _print_trends(report: RaceTrendReport) -> None:
     print(f"  逃げ: {report.running_style_definition.escape}")
     print(f"  先行: {report.running_style_definition.front_end}")
     print(f"  差し: {report.running_style_definition.mid_end}")
+    print(f"  追込: {report.running_style_definition.closer}")
     _print_trend_rows("脚質", report.by_running_style, lambda row: row.label)
     _print_trend_rows(
         "騎手",

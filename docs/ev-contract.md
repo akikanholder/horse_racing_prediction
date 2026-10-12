@@ -568,7 +568,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 複勝は、出走が8頭以上なら3着まで、5頭以上7頭以下なら2着まで。4頭以下は `place_roi` を null にし、`place betting is not sold when fewer than 5 horses start`。入着馬の回収は複勝払戻。単一の確定複勝オッズは、払戻が無いときだけオッズ×100。範囲（`odds_min` / `odds_max`）の中央値は作らず、`place odds are a range and were not used`。
 
-脚質は1レースの通過順。定義は `running_style_definition`。`basis` は `passing_order_first_call`。使うのは最初の数字（`13-12-12-7` の 13）。4コーナー（最後の数字）は使わない。1 は逃げ。`front_end = ceil(field_size / 3)` までが先行、`mid_end = ceil(field_size * 2 / 3)` までが差し、残りは追込。頭数はページの `field_size`。読めない走はラベルにしない。
+脚質は1レースの通過順で、4区分（逃げ・先行・差し・追込）。定義は `running_style_definition`。`basis` は `passing_order_first_call`。使うのは最初の数字（`13-12-12-7` の 13）。4コーナー（最後の数字）は使わない。最初の通過順位が 1 の馬は逃げで、三等分に入れない。それ以外の馬は `ceil(field_size / 3)` までが先行、`ceil(field_size * 2 / 3)` までが差し、それより後ろが追込。`ceil(field_size / 3)` が 1 のときは先行は 0 頭。頭数はページの `field_size`。読めない走はラベルにしない。0頭や1頭の区分も `sample_size` 付きで残す。
 
 父は履歴の着順に無い。馬IDがある馬だけ、既存の血統（`/horse/ped/{horse_id}/`）を1回読む。キャッシュにあれば開き直さない。父が無いときはその行を作らず、`runner_omissions` に血統の `warning`。403（`pedigree returned 403`）かログイン画面のあとは、残りの馬の血統を開かない。
 

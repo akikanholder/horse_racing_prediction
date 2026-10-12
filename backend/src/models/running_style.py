@@ -92,16 +92,17 @@ def empty_counts() -> dict[str, int]:
 def classify_early_call(position: int, field_size: int) -> StyleLabel | None:
     """Map the first passing position to one style.
 
-    通過の最初の数字がそのレースで最初に記録されたコーナー順位。
-    1 は逃げ。それ以外は頭数を三等分する。
+    4区分。通過の最初の数字がそのレースで最初に記録されたコーナー順位。
+    1 は逃げで、三等分には入れない。残りの馬だけを頭数の閾値で分ける。
 
     - ``front_end = ceil(field_size / 3)``
     - ``mid_end = ceil(field_size * 2 / 3)``
-    - 先行: ``position <= front_end``（1 はすでに逃げ）
-    - 差し: ``position <= mid_end``
-    - 追込: それより後ろ
+    - 逃げ: ``position == 1``
+    - 先行: ``1 < position <= front_end``
+    - 差し: ``front_end < position <= mid_end``
+    - 追込: ``position > mid_end``
 
-    頭数より大きい順位、0 以下はラベルにしない。
+    ``front_end`` が 1 のときは先行は空。頭数より大きい順位、0 以下はラベルにしない。
     """
     if field_size < 1 or position < 1 or position > field_size:
         return None

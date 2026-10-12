@@ -317,22 +317,53 @@ def test_gate_and_frame_keep_a_single_runner():
 
 
 def test_running_style_uses_the_first_call_and_keeps_small_samples():
-    # 8-1: first call 8 is 差し in a field of 12. The 4th-corner 1 is not 逃げ.
-    runner = _finisher(1, rank=1, odds=2.0, popularity=1, passing="8-1", bracket=1)
-    report = _report([_race(runners=[runner], field_size=12)])
+    # Field of 12: front_end = 4, mid_end = 8.
+    # 4-1 is 先行. The 4th-corner 1 is not 逃げ.
+    runners = [
+        _finisher(1, rank=1, odds=2.0, popularity=1, passing="1-9"),
+        _finisher(4, rank=2, odds=3.0, popularity=2, passing="4-1"),
+        _finisher(5, rank=3, odds=4.0, popularity=3, passing="5-5"),
+        _finisher(8, rank=4, odds=8.0, popularity=4, passing="8-8"),
+        _finisher(9, rank=5, odds=12.0, popularity=5, passing="9-9"),
+    ]
+    report = _report([_race(runners=runners, field_size=12)])
     definition = report.running_style_definition
     assert definition.basis == STYLE_BASIS
+    assert "4区分" in definition.position
     assert "4コーナー" in definition.position
+    assert "1" in definition.escape
+    assert "逃げ" in definition.escape
     assert "ceil(field_size / 3)" in definition.front_end
+    assert "先行" in definition.front_end
     assert "ceil(field_size * 2 / 3)" in definition.mid_end
+    assert "差し" in definition.mid_end
+    assert "ceil(field_size * 2 / 3)" in definition.closer
+    assert "追込" in definition.closer
     styles = {row.label: row for row in report.by_running_style}
     assert list(styles) == ["逃げ", "先行", "差し", "追込"]
-    assert styles["差し"].sample_size == 1
-    assert styles["差し"].win_rate == 1.0
-    assert styles["逃げ"].sample_size == 0
-    assert styles["逃げ"].win_rate is None
-    assert styles["逃げ"].warning == EMPTY_RUNNING_STYLE
+    assert styles["逃げ"].sample_size == 1
+    assert styles["先行"].sample_size == 1
+    assert styles["差し"].sample_size == 2
+    assert styles["追込"].sample_size == 1
+    assert styles["逃げ"].win_rate == 1.0
     assert "落とさない" in definition.unusable
+
+
+def test_running_style_leaves_front_empty_when_the_third_starts_at_one():
+    # Field of 3: front_end = 1, so the leader is 逃げ and position 2 is 差し.
+    runners = [
+        _finisher(1, rank=1, odds=2.0, popularity=1, passing="1-1"),
+        _finisher(2, rank=2, odds=3.0, popularity=2, passing="2-2"),
+        _finisher(3, rank=3, odds=4.0, popularity=3, passing="3-3"),
+    ]
+    report = _report([_race(runners=runners, field_size=3)])
+    styles = {row.label: row for row in report.by_running_style}
+    assert styles["逃げ"].sample_size == 1
+    assert styles["先行"].sample_size == 0
+    assert styles["先行"].win_rate is None
+    assert styles["先行"].warning == EMPTY_RUNNING_STYLE
+    assert styles["差し"].sample_size == 1
+    assert styles["追込"].sample_size == 1
 
 
 def test_scratched_runner_is_outside_the_sample():
