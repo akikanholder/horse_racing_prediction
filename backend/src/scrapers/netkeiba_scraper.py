@@ -954,6 +954,44 @@ def _phase_label(text: str) -> str | None:
     return None
 
 
+_CLASS_LABELS = (
+    "新馬",
+    "未勝利",
+    "1勝クラス",
+    "2勝クラス",
+    "3勝クラス",
+    "１勝クラス",
+    "２勝クラス",
+    "３勝クラス",
+    "オープン",
+    "リステッド",
+    "L",
+    "G1",
+    "G2",
+    "G3",
+    "ＧⅠ",
+    "ＧⅡ",
+    "ＧⅢ",
+    "Jpn1",
+    "Jpn2",
+    "Jpn3",
+    "500万下",
+    "1000万下",
+    "1600万下",
+)
+
+
+def _race_class_on_page(data02: Tag) -> str | None:
+    """Class printed in its own span. The race name and age condition are not a class."""
+    for span in data02.find_all("span"):
+        if not isinstance(span, Tag):
+            continue
+        text = _compact(span.get_text())
+        if text in _CLASS_LABELS:
+            return text
+    return None
+
+
 def _result_phase_on_page(soup: BeautifulSoup) -> str | None:
     """Phase only from a status label on the race header, not from nav or meta text."""
     for node in soup.select(".RaceResultState, [data-result-phase]"):
@@ -1192,6 +1230,7 @@ class _SettledHeader:
     track_type: str | None = None
     track_condition: str | None = None
     weather: str | None = None
+    race_class: str | None = None
     entry_count: int | None = None
     kai: int | None = None
     meeting_day: int | None = None
@@ -1504,6 +1543,8 @@ class NetkeibaScraper(BaseScraper):
             track_type=identity.track_type,
             track_condition=identity.track_condition,
             weather=identity.weather,
+            race_class=identity.race_class,
+            entry_count=identity.entry_count,
             fetched_at=fetched_at,
             source=None,
             complete=False,
@@ -1573,6 +1614,7 @@ class NetkeibaScraper(BaseScraper):
                 header.meeting_day = int(day_match.group(1))
             if count_match:
                 header.entry_count = int(count_match.group(1))
+            header.race_class = _race_class_on_page(data02)
         header.race_number = _race_number_on_page(soup)
         header.result_phase = _result_phase_on_page(soup)
         data01 = soup.select_one(".RaceData01")
@@ -1975,6 +2017,8 @@ class NetkeibaScraper(BaseScraper):
             track_type=header.track_type,
             track_condition=header.track_condition,
             weather=header.weather,
+            race_class=header.race_class,
+            entry_count=header.entry_count,
             fetched_at=fetched_at,
             source=_race_source(results, payouts),
             complete=complete,

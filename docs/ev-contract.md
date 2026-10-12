@@ -55,7 +55,7 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 
 | サブコマンド | `--json` の標準出力 |
 |---|---|
-| `odds` `result` `track` | JSON だけ |
+| `odds` `result` `history` `track` | JSON だけ |
 | `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
 
 混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
@@ -74,6 +74,9 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli horse <horse_id> --json` | `GET /api/horses/{horse_id}` | `Horse`。近走は全走。当日バイアスは null |
 | （CLI なし。HTTP のみ） | `GET /api/races/{race_id}/horses` | `HorseBasicInfo` の配列。近走は最大5走 |
 | `python -m backend.cli result <race_id> --json` | `GET /api/races/{race_id}/result` | `SettledRaceResult`。予想の入力にしない |
+| `python -m backend.cli history <race_id> --json` | `GET /api/races/{race_id}/history` | `HistoricalBatch`。2025年以降の平地のバックテスト。予想の入力にしない |
+| `python -m backend.cli history --date 2025-01-05 --venue 東京 --json` | `GET /api/races/history?date=2025-01-05&venue=東京` | その日の範囲内レース。日付範囲は `--from` `--to` と `date_from` `date_to` |
+| `python -m backend.cli history --date 2025-01-05 --export csv` | `POST /api/races/history/export?date=2025-01-05&format=csv` | 芝・ダートで分けられる CSV。`format=jsonl` は1レース1行 |
 | `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds` |
 | `python -m backend.cli courses --json` | `GET /api/courses` | `Course` の配列 |
 | `python -m backend.cli courses --venue 東京 --json` | `GET /api/courses/{venue}` | `Course` |
@@ -227,6 +230,8 @@ python -m backend.cli result 202605030811 --json
 | `race_id` | レースID | 必須 |
 | `race_name` / `race_date` / `venue` | ページの見出しと `kaisai_date`。日付はレースIDの桁からは作らない | 無いとき null |
 | `distance` / `track_type` / `track_condition` / `weather` | 結果ページに書いてあるときだけ | 無いとき null。`稍` は `稍重` |
+| `race_class` | `RaceData02` のクラスの span（`オープン`、`未勝利`、`1勝クラス` など） | 印字が無ければ null。レース名からは作らない |
+| `entry_count` | ページの `N頭` | 印字が無ければ null |
 | `fetched_at` | 取得時刻 | 必須 |
 | `source` | 着順を得た方法。`netkeiba_html` / `netkeiba_js` / `headless`。混ざるときは `netkeiba_html+netkeiba_js` | 失敗時 null |
 | `complete` | 返した頭数がページの `N頭` と一致し、各馬に `status` があるときだけ true | 失敗時 false |
@@ -425,7 +430,80 @@ python -m backend.cli result 202605030811 --json
 
 ワイドの引用は `combination: "3-7"`、`odds: null`、`odds_min` と `odds_max` に価格。馬連は `combination: "3-7"` と単一の `odds`。三連複は `combination: "1-2-5"` と単一の `odds`。
 
-オッズ API に無い馬券種（複勝、枠連、馬単、三連単）は取らない。確定結果の払戻表にそれらの名前が出ても、オッズ面の `bet_type` にはならない。
+オッズ API のこのコマンドに無い馬券種（複勝、枠連、馬単、三連単）は、発売中の `odds` では取らない。複勝の確定オッズだけは過去レースが、ページに印字があるとき `bet_type=place` で持つ。確定結果の払戻表にそれらの名前が出ても、発売中のオッズ面の `bet_type` にはならない。
+
+## 過去レース `HistoricalBatch`
+
+バックテスト用。予想の入力に混ぜない。着順・払戻・返還は「確定結果」と同じパーサ（`status`、`status_label`、`complete`、`result_phase`、`refunds`）。確定オッズは「オッズ」の `OddsQuote`（`withheld`、`non_runner`）と `non_runners`。同じ形をここには書き直さない。
+
+```bash
+python -m backend.cli history 202505030811 --json
+python -m backend.cli history --date 2025-01-05 --venue 東京 --priority-venues --json
+python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --flat-only --export jsonl
+python -m backend.cli history --date 2025-01-05 --export csv --output backend/csv_output/historical
+```
+
+対象は 2025-01-01 以降。それより前の日は取りにいかない。`warning` は `historical races start in 2025`。`race_id` を直接指定してページの日付が 2025 より前のときは、レコードは返るが `in_scope` は false。日付はレースIDの桁からは作らない。
+
+平地だけが既定（`--flat-only` / `flat_only=true`）。`track_type` が障害のレースは日付の一覧から落とす。`race_id` で障害を直接開いたときは `flat` が false、`in_scope` が false、`warning` に `jump races are excluded`。`--no-flat-only` で残す。
+
+`--venue` は繰り返す。`--priority-venues` は東京、京都、中山、阪神。指定が無い日付の一覧は全場。場が違う `race_id` は `in_scope` false と `venue is outside the filter`。
+
+1レースのフィールド:
+
+| フィールド | 意味 | null |
+|---|---|---|
+| `surface` | 芝 / ダート | 障害、または印字が無いとき null |
+| `distance` | メートル | 印字が無いとき null |
+| `race_class` | 結果ページのクラス | 印字が無いとき null。`race class was not on the page` |
+| `field_size` | `N頭`。印字が無く着順があるときはその頭数 | 両方無いとき null |
+| `going` | 良 / 稍重 / 重 / 不良 | 印字が無いとき null |
+| `flat` | 芝・ダートは true、障害は false | 面が読めないとき null |
+| `in_scope` | 2025年以降、平地（指定時）、指定場 | 範囲外は false |
+| `result` | `SettledRaceResult`。全着順、払戻、返還 | 失敗時は空の着順と `warning` |
+| `final_odds` | 確定の `OddsQuote`。単勝・複勝、ページにあれば馬連・ワイド（`odds_min` / `odds_max`）・三連複 | 確定と言えないときは null。空配列にはしない |
+| `non_runners` | 取消・除外 | 結果ページが読めないときは null。読んで無いときは `[]` |
+| `odds_final` | `final_odds` を確定として載せたときだけ true | |
+| `source` / `fetched_at` | 着順とオッズの取得元。各馬・各引用・各払戻・各返還も自分の `source` と `fetched_at` を持つ | |
+
+確定オッズにするのは次だけ。
+
+- ページに `確定オッズ` と印字がある。
+- またはレース後のページ（着順表がある。`result_phase` が `provisional` のときは含めない）。netkeiba オッズ API は `race_phase=post`（API の `status=result`）のときだけ。
+
+発売中（`middle` / `yoso` / `race_phase=pre`）の数字は確定オッズにしない。`final_odds` は null、`warning` は `final odds were not confirmed`。結果ページに単勝が印字されていれば、それはレース後のページなので単勝の確定オッズにしてよい。複勝と組み合わせは、そのページに価格が無いときは作らない。払戻からオッズは作らない。
+
+優先は JRA の公開オッズ、次が netkeiba。取り方は HTML、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、任意のヘッドレス。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いヘッドレス段は `headless browser is not installed`。JRA が 403 のあとは netkeiba に進んでよい。JRA の次のページは開かない。
+
+複勝は `bet_type=place`。範囲なら `odds_min` / `odds_max`、単一価格なら `odds`。発売中の `odds` コマンドは複勝を取りにいかない。ワイドは従来どおり範囲。馬連・三連複は単一価格。`----` と `取消` は残し、価格は null、`withheld` は true。取消・除外は `non_runner` と `non_runners`。
+
+ページに無い市場は null ではなく、その引用が無い。`warning` の例:
+
+- `final odds were not confirmed`
+- `final odds were not on the page`
+- `final win odds were not on the page`
+- `place odds were not on the page`
+- `combination odds were not on the page: umaren, wide, sanrenpuku`
+- `race class was not on the page`
+- `field size was not on the page`
+- `going was not on the page`
+- `surface was not on the page`
+- `jump races are excluded`
+- `venue is outside the filter`
+- `historical races start in 2025`
+- `JRA odds returned 403`
+- `headless browser is not installed`
+
+単勝の確定オッズと、単勝・ワイド・馬連・三連複の払戻が揃えばバックテストに足りる。組み合わせの確定オッズはページにあるときだけ。
+
+日付範囲はレースを順に取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、同じ URL は開き直さない。403 とログイン画面はキャッシュしない。
+
+書き出しは範囲内（`in_scope`）だけ。
+
+| 形式 | 中身 |
+|---|---|
+| `jsonl` | `historical.jsonl`。1レース1行。`surface` で分ける |
+| `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻 |
 
 ## 血統 `pedigree`
 

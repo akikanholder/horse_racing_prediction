@@ -3,6 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import date
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.export import DailyRaceCsvExport
+from backend.models.historical import HistoricalBatch, HistoricalExport
 from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
@@ -71,6 +73,9 @@ async def root():
             "race_detail": "/api/races/{race_id}",
             "race_card": "/api/races/{race_id}/card",
             "race_result": "/api/races/{race_id}/result",
+            "race_history": "/api/races/{race_id}/history",
+            "race_history_dates": "/api/races/history?date=YYYY-MM-DD",
+            "race_history_export": "/api/races/history/export?date=YYYY-MM-DD&format=jsonl",
             "race_odds": (
                 "/api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live"
             ),
@@ -102,6 +107,84 @@ async def get_weekly_races():
     except Exception as e:
         logger.error(f"Failed to get weekly races: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _history_output_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "csv_output" / "historical"
+
+
+@app.get("/api/races/history", response_model=HistoricalBatch, tags=["Races"])
+async def get_race_history_span(
+    on_date: Annotated[date | None, Query(alias="date", description="その日だけ YYYY-MM-DD")] = None,
+    date_from: Annotated[date | None, Query(description="開始日。2025年より前は取りにいかない")] = None,
+    date_to: Annotated[date | None, Query(description="終了日。含む")] = None,
+    venue: Annotated[
+        list[str] | None,
+        Query(description="競馬場。繰り返す。優先は東京、京都、中山、阪神"),
+    ] = None,
+    flat_only: Annotated[bool, Query(description="障害を除く。既定は true")] = True,
+    priority_venues: Annotated[
+        bool, Query(description="東京・京都・中山・阪神だけ")
+    ] = False,
+):
+    """2025年以降の平地レースを、日付または日付範囲で返す。
+
+    1レースずつ、間隔を空けて取る。ページはローカルにキャッシュする。
+    確定オッズは、ページが確定オッズと出すかレース後のページのときだけ。
+    発売中のオッズは確定にしない。欠測は null と warning。
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    if on_date is None and date_from is None:
+        raise HTTPException(status_code=400, detail="date or date_from is required")
+    try:
+        return race_service.get_historical_races(
+            on_date=on_date,
+            date_from=date_from,
+            date_to=date_to,
+            venues=venue,
+            flat_only=flat_only,
+            priority_venues=priority_venues,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get historical races: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/races/history/export", response_model=HistoricalExport, tags=["Races"])
+async def export_race_history(
+    on_date: Annotated[date | None, Query(alias="date")] = None,
+    date_from: Annotated[date | None, Query()] = None,
+    date_to: Annotated[date | None, Query()] = None,
+    venue: Annotated[list[str] | None, Query()] = None,
+    flat_only: Annotated[bool, Query()] = True,
+    priority_venues: Annotated[bool, Query()] = False,
+    export_format: Annotated[
+        Literal["jsonl", "csv"],
+        Query(alias="format", description="jsonl は1レース1行。csv は馬の行と芝・ダート別"),
+    ] = "jsonl",
+):
+    """範囲内のレースを、面で校正できる JSONL または CSV に書く。
+
+    範囲外のレースはファイルに入れない。
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    if on_date is None and date_from is None:
+        raise HTTPException(status_code=400, detail="date or date_from is required")
+    try:
+        batch = race_service.get_historical_races(
+            on_date=on_date,
+            date_from=date_from,
+            date_to=date_to,
+            venues=venue,
+            flat_only=flat_only,
+            priority_venues=priority_venues,
+        )
+        return race_service.export_historical_races(batch, str(_history_output_dir()), export_format)
+    except Exception as e:
+        logger.error(f"Failed to export historical races: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/races/{race_id}", response_model=Race, tags=["Races"])
@@ -180,6 +263,32 @@ async def get_race_result(race_id: str):
         return race_service.get_settled_race_result(race_id)
     except Exception as e:
         logger.error(f"Failed to get race result for {race_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/races/{race_id}/history", response_model=HistoricalBatch, tags=["Races"])
+async def get_race_history(
+    race_id: str,
+    venue: Annotated[list[str] | None, Query()] = None,
+    flat_only: Annotated[bool, Query()] = True,
+    priority_venues: Annotated[bool, Query()] = False,
+):
+    """1レースの確定着順、払戻、返還、確定オッズ。
+
+    2025年より前や障害でもレコードは返す。``in_scope`` が false で warning が付く。
+    確定オッズがページに無いときは ``final_odds`` は null。
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        return race_service.get_historical_races(
+            race_id=race_id,
+            venues=venue,
+            flat_only=flat_only,
+            priority_venues=priority_venues,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get historical race {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

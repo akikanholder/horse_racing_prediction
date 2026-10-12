@@ -361,6 +361,10 @@ class SettledRaceResult(BaseModel):
     track_type: str | None = Field(None, description="コース種別 (芝/ダート/障害)")
     track_condition: str | None = Field(None, description="馬場状態 (良/稍重/重/不良)")
     weather: str | None = Field(None, description="天候")
+    race_class: str | None = Field(
+        None, description="クラス。結果ページに印字されたときだけ。レース名からは作らない"
+    )
+    entry_count: int | None = Field(None, description="ページの N頭。印字が無ければ null")
     fetched_at: datetime = Field(..., description="取得日時")
     source: str | None = Field(
         None,

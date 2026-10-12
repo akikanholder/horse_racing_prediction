@@ -13,6 +13,11 @@ from bs4 import BeautifulSoup, Tag
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.race import Race, RaceCard, RaceEntry, RaceSchedule
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.final_odds import (
+    PublicOddsPages,
+    final_odds_need_fallback,
+    same_site_odds_urls,
+)
 from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
@@ -832,6 +837,79 @@ class JRAScraper(BaseScraper):
         if looks_like_login_wall(odds_html):
             return ScratchPage(None, set(), JRA_ODDS_LOGIN, True)
         return self._odds_page_marks(odds_html, odds_cname, fetched)
+
+    def fetch_odds_pages(
+        self, race_id: str, *, fetched_at: datetime | None = None
+    ) -> PublicOddsPages:
+        """Public JRA odds documents for one race.
+
+        HTML, then JSON the page embeds or calls, then headless. A 403 or a
+        login wall stops the chain. Prices are left for the final-odds parser.
+        This does not copy live numbers onto a quote.
+        """
+        fetched = fetched_at or tokyo_now()
+        lookup = self._lookup_from_race_id(race_id)
+        if lookup is None:
+            return PublicOddsPages([], "JRA odds page was not on the card", False)
+        try:
+            cname = self._find_race_cname(lookup)
+        except Exception as exc:
+            blocked = self._odds_block(exc)
+            return PublicOddsPages([], blocked.warning, blocked.blocked)
+        if cname is None:
+            return PublicOddsPages([], "JRA odds page was not on the card", False)
+        try:
+            shutuba = self._fetch_access_d(cname.cname)
+        except Exception as exc:
+            blocked = self._odds_block(exc)
+            return PublicOddsPages([], blocked.warning, blocked.blocked)
+        if looks_like_login_wall(shutuba):
+            return PublicOddsPages([], JRA_ODDS_LOGIN, True)
+        odds_cname = self._odds_cname(shutuba)
+        if odds_cname is None:
+            return PublicOddsPages([], "JRA odds page was not on the card", False)
+        try:
+            odds_html = self.http_client.post(
+                self.ACCESS_O_URL,
+                data={"cname": odds_cname},
+                encoding=self.ACCESS_D_ENCODING,
+            )
+        except Exception as exc:
+            blocked = self._odds_block(exc)
+            return PublicOddsPages([], blocked.warning, blocked.blocked)
+        if looks_like_login_wall(odds_html):
+            return PublicOddsPages([], JRA_ODDS_LOGIN, True)
+        page_url = f"{self.ACCESS_O_URL}?CNAME={quote(odds_cname, safe='')}"
+        first = FetchedBody(
+            body=odds_html, source="jra_html", fetched_at=fetched, url=page_url
+        )
+        if not final_odds_need_fallback(odds_html):
+            return PublicOddsPages([first], None, False)
+        fallback = PageFallback(
+            self.http_client,
+            site="jra",
+            headless_render=self._headless_render,
+            url_finder=same_site_odds_urls,
+        )
+        loaded = fallback.load(
+            url=page_url,
+            params=None,
+            headers=None,
+            encoding=self.ACCESS_D_ENCODING,
+            fetched_at=fetched,
+            should_fallback=final_odds_need_fallback,
+            still_incomplete=lambda pages: all(final_odds_need_fallback(page.body) for page in pages),
+            html_body=odds_html,
+        )
+        warning = loaded.warning
+        blocked = loaded.status == "blocked"
+        if blocked:
+            warning = (
+                JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
+            )
+        elif loaded.warning == HEADLESS_UNAVAILABLE:
+            warning = HEADLESS_UNAVAILABLE
+        return PublicOddsPages(loaded.pages, warning, blocked)
 
     def _odds_block(self, exc: Exception) -> ScratchPage:
         """A refused odds page is not parsed, and the next JRA page is not opened."""

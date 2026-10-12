@@ -219,4 +219,8 @@ __marimo__/
 
 # Generated race CSV exports (date/venue directories and CSV files)
 *.csv
+*.jsonl
 backend/csv_output/
+
+# Cached public pages for historical date ranges
+backend/.cache/
