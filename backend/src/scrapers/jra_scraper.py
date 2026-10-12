@@ -902,14 +902,14 @@ class JRAScraper(BaseScraper):
             html_body=odds_html,
         )
         warning = loaded.warning
-        blocked = loaded.status == "blocked"
-        if blocked:
+        refused = loaded.status == "blocked"
+        if refused:
             warning = (
                 JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
             )
         elif loaded.warning == HEADLESS_UNAVAILABLE:
             warning = HEADLESS_UNAVAILABLE
-        return PublicOddsPages(loaded.pages, warning, blocked)
+        return PublicOddsPages(loaded.pages, warning, refused)
 
     def _odds_block(self, exc: Exception) -> ScratchPage:
         """A refused odds page is not parsed, and the next JRA page is not opened."""

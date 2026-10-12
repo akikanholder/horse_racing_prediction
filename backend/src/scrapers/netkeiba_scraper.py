@@ -947,7 +947,7 @@ def _result_block_warning(warning: str | None) -> str:
 
 def _phase_label(text: str) -> str | None:
     compact = _compact(text)
-    if compact in {"結果確定前", "未確定", "暫定", "provisional"}:
+    if compact in {"確定前", "結果確定前", "未確定", "暫定", "provisional"}:
         return "provisional"
     if compact in {"結果確定", "確定", "confirmed"}:
         return "confirmed"

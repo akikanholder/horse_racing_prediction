@@ -53,20 +53,25 @@ class HistoricalRace(BaseModel):
         description="取消・除外。ページを読んで無いときは空。結果ページが読めないときは null",
     )
     odds_final: bool = Field(
-        False, description="final_odds を確定として載せたときだけ true。発売中の数字では true にしない"
+        False,
+        description="final_odds を確定として載せたときだけ true。発売中の数字では true にしない",
     )
     source: str | None = Field(
         None,
         description="着順と確定オッズを得た方法。混ざるときは + でつなぐ",
     )
-    fetched_at: datetime = Field(..., description="このレコードを組み立てた時刻。各値の fetched_at は別")
+    fetched_at: datetime = Field(
+        ..., description="このレコードを組み立てた時刻。各値の fetched_at は別"
+    )
     warning: str | None = Field(None, description="欠測や範囲外の理由。複数は ; でつなぐ")
 
 
 class HistoricalBatch(BaseModel):
     """Races collected for one id or one date span."""
 
-    races: list[HistoricalRace] = Field(default_factory=list, description="レース。日付指定では範囲内だけ")
+    races: list[HistoricalRace] = Field(
+        default_factory=list, description="レース。日付指定では範囲内だけ"
+    )
     skipped: int = Field(0, description="日付の列挙で範囲外として落とした件数")
     flat_only: bool = Field(True, description="障害を落とすとき true")
     venues: list[str] = Field(default_factory=list, description="指定した競馬場。空は全場")

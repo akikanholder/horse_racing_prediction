@@ -24,11 +24,10 @@ from backend.models.historical import (
     HistoricalExport,
     HistoricalRace,
 )
-from backend.models.odds import BetType, NonRunner, OddsQuote, RaceOdds
+from backend.models.odds import ODDS_ENCODING, BetType, NonRunner, OddsQuote, RaceOdds
 from backend.models.race import Race, SettledRaceResult
 from backend.scrapers.final_odds import (
     FINAL_ODDS_NOT_CONFIRMED,
-    PLACE_ODDS_MISSING,
     FinalOddsParse,
     missing_market_warning,
     non_runners_from_finishers,
@@ -57,6 +56,7 @@ _RUNNER_FIELDS = [
     "field_size",
     "going",
     "horse_number",
+    "horse_name",
     "rank",
     "status",
     "status_label",
@@ -125,7 +125,7 @@ class HistoricalService:
     def __enter__(self) -> HistoricalService:
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
         self.close()
         return False
 
@@ -157,6 +157,8 @@ class HistoricalService:
                 skipped=0,
                 flat_only=flat_only,
                 venues=list(selected),
+                date_from=None,
+                date_to=None,
                 fetched_at=fetched_at,
                 warning=warning,
             )
@@ -165,8 +167,11 @@ class HistoricalService:
         if start is None or end is None:
             return HistoricalBatch(
                 races=[],
+                skipped=0,
                 flat_only=flat_only,
                 venues=list(selected),
+                date_from=None,
+                date_to=None,
                 fetched_at=fetched_at,
                 warning=range_warning or "historical races start in 2025",
             )
@@ -218,7 +223,11 @@ class HistoricalService:
         """Write in-scope races as JSONL or as CSV split by surface."""
         directory.mkdir(parents=True, exist_ok=True)
         chosen = [race for race in batch.races if race.in_scope]
-        surfaces = sorted({race.surface for race in chosen if race.surface})
+        present = {race.surface for race in chosen if race.surface}
+        surfaces: list[str] = []
+        for surface in ("芝", "ダート"):
+            if surface in present:
+                surfaces.append(surface)
         if fmt == "jsonl":
             path = directory / "historical.jsonl"
             with path.open("w", encoding="utf-8") as handle:
@@ -256,10 +265,14 @@ class HistoricalService:
         )
         runners = merge_non_runners(
             [
-                None if settled.warning in {
+                None
+                if settled.warning
+                in {
                     "race result fetch failed",
                     "race result not found",
-                } and not settled.results else non_runners_from_finishers(settled.results),
+                }
+                and not settled.results
+                else non_runners_from_finishers(settled.results),
                 odds_runners,
             ]
         )
@@ -357,7 +370,7 @@ class HistoricalService:
             if win.quotes or win.race_phase == "pre":
                 return [], [], None, FINAL_ODDS_NOT_CONFIRMED
             return [], [], None, win.reason
-        quotes = [quote for quote in win.quotes]
+        quotes = list(win.quotes)
         runners: list[NonRunner] = list(win.non_runners or [])
         for bet_type in _POST_BET_TYPES:
             if bet_type == "win":
@@ -390,7 +403,11 @@ class HistoricalService:
                 prefer="live",
                 status="unavailable",
                 reason="fetch failed",
+                encoding=ODDS_ENCODING,
+                race_phase=None,
                 quotes=[],
+                non_runners=None,
+                warning=None,
                 fetched_at=fetched_at,
             )
 
@@ -414,10 +431,13 @@ def _resolve_span(
     date_from: date | None,
     date_to: date | None,
 ) -> tuple[date | None, date | None, str | None]:
+    start: date | None
+    end: date | None
     if on_date is not None:
         start = end = on_date
     else:
-        start, end = date_from, date_to or date_from
+        start = date_from
+        end = date_to or date_from
     if start is None or end is None:
         return None, None, "a date or date range is required"
     if end < start:
@@ -506,9 +526,7 @@ def _join_source(*parts: str | None) -> str | None:
 
 def _runner_row(race: HistoricalRace) -> list[dict[str, str]]:
     win_quotes = {
-        quote.combination: quote
-        for quote in race.final_odds or []
-        if quote.bet_type == "win"
+        quote.combination: quote for quote in race.final_odds or [] if quote.bet_type == "win"
     }
     payouts = race.result.payouts
     rows: list[dict[str, str]] = []
@@ -533,6 +551,7 @@ def _runner_row(race: HistoricalRace) -> list[dict[str, str]]:
                 "field_size": "" if race.field_size is None else str(race.field_size),
                 "going": race.going or "",
                 "horse_number": number,
+                "horse_name": finisher.horse_name or "",
                 "rank": "" if finisher.rank is None else str(finisher.rank),
                 "status": finisher.status or "",
                 "status_label": finisher.status_label or "",
@@ -553,11 +572,7 @@ def _runner_row(race: HistoricalRace) -> list[dict[str, str]]:
 
 def _payout_text(payouts: list, bet: str) -> str:
     label = _PAYOUT_NAMES[bet]
-    parts = [
-        f"{row.combination}:{row.payout}"
-        for row in payouts
-        if row.bet_type == label
-    ]
+    parts = [f"{row.combination}:{row.payout}" for row in payouts if row.bet_type == label]
     return ";".join(parts)
 
 

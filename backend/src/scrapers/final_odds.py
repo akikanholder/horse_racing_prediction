@@ -255,9 +255,7 @@ def missing_market_warning(quotes: list[OddsQuote] | None) -> str | None:
     return "; ".join(notes)
 
 
-def _parse_document(
-    page: FetchedBody, race_id: str
-) -> tuple[list[OddsQuote], list[NonRunner]]:
+def _parse_document(page: FetchedBody, race_id: str) -> tuple[list[OddsQuote], list[NonRunner]]:
     body = page.body.strip()
     if body.startswith("{") or body.startswith("["):
         return _parse_json_text(body, race_id, page.source, page.fetched_at)
@@ -297,9 +295,7 @@ def _parse_html_tables(
         rows = [row for row in table.find_all("tr") if isinstance(row, Tag)]
         if section == "win_place":
             for row in rows:
-                built, cell = _win_place_row(
-                    row, race_id, odds_source, fetched_at
-                )
+                built, cell = _win_place_row(row, race_id, odds_source, fetched_at)
                 quotes.extend(built)
                 if cell is not None:
                     priced.append(cell)
@@ -326,9 +322,7 @@ def _table_section(table: Tag) -> str | None:
     if "単勝" in blob and "複勝" in blob:
         return "win_place"
     header_cells = [
-        _compact(cell.get_text())
-        for cell in table.find_all("th")
-        if isinstance(cell, Tag)
+        _compact(cell.get_text()) for cell in table.find_all("th") if isinstance(cell, Tag)
     ]
     if "単勝" in header_cells and "複勝" in header_cells:
         return "win_place"
@@ -471,20 +465,20 @@ def _combination_row(
         return None
     if section == "wide":
         return _wide_quote(price_text, race_id, combination, source, fetched_at)
-    cell = read_price_cell(price_text)
-    if cell is None:
+    price = read_price_cell(price_text)
+    if price is None:
         return None
     return _quote(
         race_id=race_id,
         bet_type=section,  # type: ignore[arg-type]
         combination=combination,
-        odds=None if cell.withheld else cell.odds,
+        odds=None if price.withheld else price.odds,
         odds_min=None,
         odds_max=None,
         source=source,
         fetched_at=fetched_at,
-        non_runner=cell.non_runner,
-        withheld=cell.withheld,
+        non_runner=price.non_runner,
+        withheld=price.withheld,
     )
 
 
@@ -552,9 +546,7 @@ def _parse_json_text(
         if not isinstance(block, dict):
             continue
         for combo_key, value in block.items():
-            built, cell = _json_quote(
-                kind, str(combo_key), value, race_id, odds_source, fetched_at
-            )
+            built, cell = _json_quote(kind, str(combo_key), value, race_id, odds_source, fetched_at)
             if built is not None:
                 quotes.append(built)
             if cell is not None:

@@ -73,9 +73,7 @@ class CachingHTTPClient(HTTPClient):
         cached = self._body(key)
         if cached is not None:
             return cached
-        body = self._fetch(
-            "get", url, params=params, data=None, headers=headers, encoding=encoding
-        )
+        body = self._fetch("get", url, params=params, data=None, headers=headers, encoding=encoding)
         self._store(key, url, body)
         return body
 
@@ -90,9 +88,7 @@ class CachingHTTPClient(HTTPClient):
         cached = self._body(key)
         if cached is not None:
             return cached
-        body = self._fetch(
-            "post", url, params=None, data=data, headers=headers, encoding=encoding
-        )
+        body = self._fetch("post", url, params=None, data=data, headers=headers, encoding=encoding)
         self._store(key, url, body)
         return body
 

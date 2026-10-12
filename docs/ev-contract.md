@@ -243,7 +243,7 @@ python -m backend.cli result 202605030811 --json
 
 `results` はカードの全頭。着順表がページの `N頭` より短い、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
 
-`result_phase` は結果ヘッダの印字だけ（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が無ければ null と `result phase was not on the page`。複数の取得元が食い違うときは null と `result phase sources disagree`。
+`result_phase` は結果ヘッダの印字だけ（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `確定前` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が無ければ null と `result phase was not on the page`。複数の取得元が食い違うときは null と `result phase sources disagree`。
 
 `SettledFinisher`:
 
@@ -503,7 +503,7 @@ python -m backend.cli history --date 2025-01-05 --export csv --output backend/cs
 | 形式 | 中身 |
 |---|---|
 | `jsonl` | `historical.jsonl`。1レース1行。`surface` で分ける |
-| `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻 |
+| `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、馬番、馬名、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻 |
 
 ## 血統 `pedigree`
 

@@ -15,6 +15,7 @@ from backend.models.odds import RaceOdds
 from backend.models.race import Race
 from backend.scrapers.final_odds import (
     FINAL_ODDS_NOT_CONFIRMED,
+    PublicOddsPages,
     parse_confirmed_odds,
     result_is_post_race,
 )
@@ -23,7 +24,6 @@ from backend.scrapers.netkeiba_odds_scraper import parse_netkeiba_place_odds
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
 from backend.scrapers.page_fallback import FetchedBody, headless_browser_installed, render_headless
-from backend.scrapers.final_odds import PublicOddsPages
 from backend.services.historical_service import HistoricalService
 from backend.services.race_service import RaceService
 
@@ -37,7 +37,9 @@ def _load(name: str) -> str:
 
 
 def _page(body: str, source: str = "jra_html") -> FetchedBody:
-    return FetchedBody(body=body, source=source, fetched_at=FETCHED, url="https://www.jra.go.jp/odds")
+    return FetchedBody(
+        body=body, source=source, fetched_at=FETCHED, url="https://www.jra.go.jp/odds"
+    )
 
 
 class _QuietHTTP:
@@ -134,7 +136,9 @@ def _service(html: str, jra_html: str | None, odds: _Odds | None = None) -> Hist
     )
 
 
-def _result_html(rows: str, *, surface: str, going: str, race_class: str, venue: str, heads: int) -> str:
+def _result_html(
+    rows: str, *, surface: str, going: str, race_class: str, venue: str, heads: int
+) -> str:
     return f"""<!DOCTYPE html><html><head><title>テスト | 2025年2月2日 {venue}1R</title></head><body>
 <div class="RaceList_Date"><dl id="RaceList_DateList"><dd class="Active">
 <a href="../top/race_list.html?kaisai_date=20250202">2月2日</a></dd></dl></div>
@@ -214,7 +218,9 @@ def test_same_site_json_fills_a_final_shell():
     payload = _page(_load("jra_final_odds.json"), source="jra_js")
     parsed = parse_confirmed_odds([shell, payload], RACE_ID)
     assert parsed.confirmed is True
-    win = next(quote for quote in parsed.quotes if quote.bet_type == "win" and quote.combination == "1")
+    win = next(
+        quote for quote in parsed.quotes if quote.bet_type == "win" and quote.combination == "1"
+    )
     assert win.odds == 4.2
     assert win.source == "jra_js"
 
@@ -292,11 +298,13 @@ def test_dead_heat_keeps_order_and_payouts_and_uses_result_win_odds():
 def test_scratch_on_the_result_fixture_does_not_take_live_prices():
     html = _load("netkeiba_race_result.html")
     html = html.replace("20241222", "20250105").replace("2024年12月22日", "2025年1月5日")
-    html += "<table><tr><th>返還</th><td class='Result'><span>2</span></td><td>単勝</td></tr></table>"
+    html += (
+        "<table><tr><th>返還</th><td class='Result'><span>2</span></td><td>単勝</td></tr></table>"
+    )
     service = _service(html, _load("jra_live_odds.html"), _Odds(phase="pre", price=99.9))
     race = service.get(race_id="202406050811").races[0]
     assert race.result.race_date == date(2025, 1, 5)
-    assert race.venue if False else race.result.venue == "中山"
+    assert race.result.venue == "中山"
     assert race.surface == "芝"
     assert race.race_class == "オープン"
     assert race.field_size == 16

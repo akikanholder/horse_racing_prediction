@@ -5,8 +5,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
-from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.historical import HistoricalBatch, HistoricalExport
+from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import (
     ODDS_ENCODING,
     BetType,
@@ -28,7 +28,6 @@ from backend.models.race import (
 )
 from backend.models.training import TRAINING_FETCH_FAILED, unavailable_training
 from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publication
-from backend.services.historical_service import HistoricalService
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
@@ -41,6 +40,7 @@ from backend.scrapers.runner_status import (
     merge_non_runners,
 )
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
+from backend.services.historical_service import HistoricalService
 
 logger = logging.getLogger(__name__)
 

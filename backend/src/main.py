@@ -115,17 +115,19 @@ def _history_output_dir() -> Path:
 
 @app.get("/api/races/history", response_model=HistoricalBatch, tags=["Races"])
 async def get_race_history_span(
-    on_date: Annotated[date | None, Query(alias="date", description="その日だけ YYYY-MM-DD")] = None,
-    date_from: Annotated[date | None, Query(description="開始日。2025年より前は取りにいかない")] = None,
+    on_date: Annotated[
+        date | None, Query(alias="date", description="その日だけ YYYY-MM-DD")
+    ] = None,
+    date_from: Annotated[
+        date | None, Query(description="開始日。2025年より前は取りにいかない")
+    ] = None,
     date_to: Annotated[date | None, Query(description="終了日。含む")] = None,
     venue: Annotated[
         list[str] | None,
         Query(description="競馬場。繰り返す。優先は東京、京都、中山、阪神"),
     ] = None,
     flat_only: Annotated[bool, Query(description="障害を除く。既定は true")] = True,
-    priority_venues: Annotated[
-        bool, Query(description="東京・京都・中山・阪神だけ")
-    ] = False,
+    priority_venues: Annotated[bool, Query(description="東京・京都・中山・阪神だけ")] = False,
 ):
     """2025年以降の平地レースを、日付または日付範囲で返す。
 
@@ -181,7 +183,9 @@ async def export_race_history(
             flat_only=flat_only,
             priority_venues=priority_venues,
         )
-        return race_service.export_historical_races(batch, str(_history_output_dir()), export_format)
+        return race_service.export_historical_races(
+            batch, str(_history_output_dir()), export_format
+        )
     except Exception as e:
         logger.error(f"Failed to export historical races: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
