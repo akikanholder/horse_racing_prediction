@@ -235,9 +235,23 @@ python -m backend.cli result 202605030811 --json
 
 `unknown` は区分がある（`status` は null ではない）。印字が `取消` など以外で数字でもないとき、`status_label` はその文字、`rank` は null。
 
+同着は同じ `rank` を複数行に残す。着順欄の `1` と `1同着`、着差の `同着` は入着。着順はページの並びのまま。馬番や着順で並べ直さない。次の着順が飛んでも（1着同着の次が3着）、`complete` は頭数と `status` だけを見る。
+
+`refunds` は `payouts` の隣。各払戻行には混ぜない。結果ページか JRA の払戻ページに返還の印字があるときだけ入れる。印字が無いときは null。空のリストにはしない。金額は作らない。
+
+| フィールド | 意味 | 欠測 |
+|---|---|---|
+| `horse_numbers` | 返還馬番。ページの並び | 馬番が無く枠だけなら `[]` |
+| `bet_types` | 印字された馬券種（単勝、複勝、枠連など） | 書いていなければ null |
+| `bracket_numbers` | `返還同枠` の枠番 | 書いていなければ null |
+| `source` | `netkeiba_html` / `netkeiba_js` / `headless` / `jra_html`。両方なら `netkeiba_html+jra_html` | |
+| `fetched_at` | その返還を得た時刻 | |
+
+馬番が取消（`scratched`）か除外（`excluded`）と一致するときは、返還があること自体では `warning` を足さない。入着馬や中止・失格の馬番が返還に出たら `refund horses are not scratched or excluded: 2`。netkeiba と JRA の馬番が違うときは netkeiba を残し、`JRA refund mismatch: netkeibaのみ: 2番; JRAのみ: 5番`。JRA にしか印字が無いときは `source` は `jra_html`。ページに無い馬番は作らない。
+
 `RacePayout`: `bet_type` はページの表記（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）。`combination` はページの並び（馬単・3連単は着順どおり）。`payout` は円。`popularity` が無いときは null。ページに無い馬券種は要素にしない。各要素に `source`（`netkeiba_html` / `netkeiba_js` / `headless`）と `fetched_at`。
 
-払戻があるとき、結果ページに印字された競馬場・回・日・レース番号・開催日から JRA の公開払戻（`accessH`、メニューに印刷された cname）を突き合わせる。金額は置き換えない。不一致は `JRA payout mismatch: netkeibaのみ: …; JRAのみ: …`。ページが取れない、開催が一つに決まらないときは `JRA official payout was not reachable`。401/403 は `JRA payout returned 403` で止め、次のページは開かない。金額は作らない。
+払戻があるとき、結果ページに印字された競馬場・回・日・レース番号・開催日から JRA の公開払戻（`accessH`、メニューに印刷された cname）を突き合わせる。金額は置き換えない。同じ馬券種の行は全部残す（1着同着の単勝が2行、複勝やワイドが増える）。行の順番が違うこと、片方だけ人気が空であることは不一致にしない。金額か組み合わせが違うときは `JRA payout mismatch: netkeibaのみ: …; JRAのみ: …`。ページが取れない、開催が一つに決まらないときは `JRA official payout was not reachable`。401/403 は `JRA payout returned 403` で止め、次のページは開かない。金額は作らない。
 
 `warning`（取得そのものが失敗したときは、この文だけ。確定印や払戻の注記は足さない）:
 
@@ -260,6 +274,8 @@ python -m backend.cli result 202605030811 --json
 - `JRA official payout was not reachable`
 - `JRA payout returned 403`
 - `JRA payout mismatch: …`
+- `refund horses are not scratched or excluded: …`
+- `JRA refund mismatch: …`
 
 ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は後から馬場・調教でも使える。この契約の馬場・調教の中身は変えていない。
 

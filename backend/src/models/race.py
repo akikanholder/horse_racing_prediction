@@ -229,7 +229,9 @@ class SettledFinisher(BaseModel):
         None,
         description="ページに印字された区分。取消、除外、中止、競走中止、失格など。入着は null",
     )
-    demoted: bool = Field(False, description="降着。ページに印字があるときだけ true。着順は公式の順位")
+    demoted: bool = Field(
+        False, description="降着。ページに印字があるときだけ true。着順は公式の順位"
+    )
     bracket_number: int | None = Field(None, description="枠番")
     horse_number: int | None = Field(None, description="馬番")
     horse_name: str | None = Field(None, description="馬名")
@@ -254,6 +256,24 @@ class SettledFinisher(BaseModel):
         if self.status in _NON_FINISH and self.rank is not None:
             raise ValueError("non-finisher rank must be null")
         return self
+
+
+class RaceRefund(BaseModel):
+    """返還 printed on the result page or the official payout page.
+
+    印字が無いレースでは要素を作らない。金額は作らない。
+    """
+
+    horse_numbers: list[int] = Field(
+        default_factory=list, description="返還馬番。ページに印字された並び"
+    )
+    bet_types: list[str] | None = Field(None, description="印字された馬券種。書いていなければ null")
+    bracket_numbers: list[int] | None = Field(None, description="返還同枠。書いていなければ null")
+    source: str | None = Field(
+        None,
+        description="netkeiba_html / netkeiba_js / headless / jra_html。両方なら + でつなぐ",
+    )
+    fetched_at: datetime | None = Field(None, description="この返還を得た時刻")
 
 
 class RacePayout(BaseModel):
@@ -315,6 +335,13 @@ class SettledRaceResult(BaseModel):
     payouts: list[RacePayout] = Field(
         default_factory=list,
         description="結果ページの払戻。金額が無い馬券種は入れない",
+    )
+    refunds: list[RaceRefund] | None = Field(
+        None,
+        description=(
+            "返還。払戻リストの隣。ページに印字が無いときは null。"
+            "馬番と、印字されていれば馬券種。金額は作らない"
+        ),
     )
     payout_note: str | None = Field(
         None,

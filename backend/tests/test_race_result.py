@@ -18,6 +18,7 @@ from backend.scrapers.jra_payout import (
     JRA_PAYOUT_FORBIDDEN,
     JRA_PAYOUT_MISMATCH,
     JRA_PAYOUT_UNREACHABLE,
+    JRA_REFUND_MISMATCH,
 )
 from backend.scrapers.netkeiba_scraper import (
     RACE_RESULT_EMPTY,
@@ -32,6 +33,7 @@ from backend.scrapers.netkeiba_scraper import (
     RACE_RESULT_PAYOUT_UNPAIRED,
     RACE_RESULT_PHASE_UNKNOWN,
     RACE_RESULT_TABLE_MALFORMED,
+    REFUND_NOT_NON_RUNNER,
     NetkeibaScraper,
 )
 from backend.scrapers.page_fallback import headless_browser_installed, render_headless
@@ -121,6 +123,7 @@ def test_arima_kinen_finish_and_payouts_come_from_the_result_page():
 
     assert settled.warning == f"{RACE_RESULT_PHASE_UNKNOWN}; {JRA_PAYOUT_UNREACHABLE}"
     assert settled.payout_note is None
+    assert settled.refunds is None
     assert settled.complete is True
     assert settled.result_phase is None
     assert settled.source == "netkeiba_html"
@@ -395,6 +398,7 @@ def test_result_api_returns_the_settled_payload(monkeypatch):
     assert body["results"][-1]["status_label"] == "取消"
     assert body["results"][-1]["rank"] is None
     assert body["payouts"][0]["source"] == "netkeiba_html"
+    assert body["refunds"] is None
     assert "performances" not in body
 
 
@@ -442,6 +446,7 @@ def test_cli_result_json(monkeypatch, capsys):
         "source": "netkeiba_html",
         "fetched_at": "2026-09-27T12:00:00",
     }
+    assert payload["refunds"] is None
     assert payload["results"][-1]["status"] == "scratched"
     assert payload["results"][-1]["status_label"] == "取消"
     assert payload["complete"] is True
@@ -560,7 +565,13 @@ _JRA_INDEX = (
 )
 
 
-def _jra_day(yen: str, *, umaren: str | None = None) -> str:
+def _jra_day(
+    yen: str,
+    *,
+    umaren: str | None = None,
+    tickets: str | None = None,
+    refund: str | None = None,
+) -> str:
     extra = ""
     if umaren is not None:
         extra = f"""<li><dl><dt>馬連</dt><dd>
@@ -568,14 +579,31 @@ def _jra_day(yen: str, *, umaren: str | None = None) -> str:
 <div class="yen">{umaren}<span class="unit">円</span></div>
 <div class="pop">2<span>番人気</span></div></div>
 </dd></dl></li>"""
-    return f"""<html><body>
-<img src="/JRADB/img/race_number_main/race_num_11.png" alt="11レース">
-<div class="refund_unit"><ul><li class="win"><dl><dt>単勝</dt><dd>
+    if tickets is None:
+        tickets = f"""<li class="win"><dl><dt>単勝</dt><dd>
 <div class="line"><div class="num">1</div>
 <div class="yen">{yen}<span class="unit">円</span></div>
 <div class="pop">1<span>番人気</span></div></div>
-</dd></dl></li>{extra}</ul></div>
+</dd></dl></li>{extra}"""
+    restoration = ""
+    if refund is not None:
+        restoration = f"""<div class="refund_unit restoration"><ul><li><dl><dt>返還</dt>
+<dd><p><strong class="red">{refund}</strong></p></dd></dl></li></ul></div>"""
+    return f"""<html><body>
+<img src="/JRADB/img/race_number_main/race_num_11.png" alt="11レース">
+<div class="refund_unit"><ul>{tickets}</ul></div>
+{restoration}
 </body></html>"""
+
+
+def _jra_ticket(bet: str, combination: str, yen: str, popularity: str | None) -> str:
+    pop = ""
+    if popularity is not None:
+        pop = f'<div class="pop">{popularity}<span>番人気</span></div>'
+    return f"""<li><dl><dt>{bet}</dt><dd>
+<div class="line"><div class="num">{combination}</div>
+<div class="yen">{yen}<span class="unit">円</span></div>{pop}</div>
+</dd></dl></li>"""
 
 
 def _runners_json(names: list[tuple[str, int, str]]) -> str:
@@ -835,8 +863,253 @@ def test_jra_payout_403_stops_and_keeps_the_netkeiba_price():
     assert all(call.get("params", {}).get("cname") != _JRA_CNAME for call in client.calls)
 
 
+def _place_table(rows: list[tuple[str, str, str, str]]) -> str:
+    """One payout table. Each row is bet type, combination html, yen html, popularity html."""
+    body = []
+    for bet, combination, yen, popularity in rows:
+        body.append(
+            f"<tr><th>{bet}</th><td class='Result'>{combination}</td>"
+            f"<td class='Payout'><span>{yen}</span></td>"
+            f"<td class='Ninki'>{popularity}</td></tr>"
+        )
+    return '<table class="Payout_Detail_Table">' + "".join(body) + "</table>"
+
+
+def test_dead_heat_for_first_keeps_page_order_and_every_payout_row():
+    html = _result_html(
+        [
+            _row("1", 8, "アルファ"),
+            _row("1同着", 1, "ベータ"),
+            _row("3", 5, "ガンマ"),
+        ],
+        heads=3,
+        phase="確定",
+        extra=_place_table(
+            [
+                (
+                    "単勝",
+                    "<div><span>8</span></div><div><span>1</span></div>",
+                    "150円<br />160円",
+                    "<span>2人気</span><span>1人気</span>",
+                ),
+                (
+                    "複勝",
+                    "<div><span>8</span></div><div><span>1</span></div><div><span>5</span></div>",
+                    "110円<br />120円<br />130円",
+                    "<span>2人気</span><span>1人気</span><span>3人気</span>",
+                ),
+                (
+                    "ワイド",
+                    "<ul><li><span>1</span></li><li><span>8</span></li></ul>"
+                    "<ul><li><span>5</span></li><li><span>8</span></li></ul>"
+                    "<ul><li><span>1</span></li><li><span>5</span></li></ul>",
+                    "200円<br />210円<br />220円",
+                    "<span>1人気</span><span>2人気</span><span>3人気</span>",
+                ),
+            ]
+        ),
+    )
+    tickets = "".join(
+        [
+            _jra_ticket("単勝", "1", "160", "1"),
+            _jra_ticket("単勝", "8", "150", None),
+            _jra_ticket("複勝", "8", "110", "2"),
+            _jra_ticket("複勝", "1", "120", "1"),
+            _jra_ticket("複勝", "5", "130", "3"),
+            _jra_ticket("ワイド", "1-8", "200", "1"),
+            _jra_ticket("ワイド", "5-8", "210", "2"),
+            _jra_ticket("ワイド", "1-5", "220", "3"),
+        ]
+    )
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("0", tickets=tickets)},
+    )
+    assert [(row.rank, row.horse_number, row.horse_name) for row in settled.results] == [
+        (1, 8, "アルファ"),
+        (1, 1, "ベータ"),
+        (3, 5, "ガンマ"),
+    ]
+    assert [row.status for row in settled.results] == ["finished", "finished", "finished"]
+    assert settled.complete is True
+    assert settled.warning is None
+    assert settled.refunds is None
+    wins = [payout for payout in settled.payouts if payout.bet_type == "単勝"]
+    assert [(payout.combination, payout.payout) for payout in wins] == [("8", 150), ("1", 160)]
+    assert [payout.bet_type for payout in settled.payouts].count("複勝") == 3
+    assert [payout.bet_type for payout in settled.payouts].count("ワイド") == 3
+    assert all(payout.source == "netkeiba_html" for payout in settled.payouts)
+    assert all(payout.fetched_at == FETCHED_AT for payout in settled.payouts)
+
+
+def test_dead_heat_for_third_keeps_the_printed_order():
+    html = _result_html(
+        [
+            _row("1", 4, "エー"),
+            _row("2", 7, "ビー"),
+            _row("3", 9, "シー"),
+            _row("同着", 2, "ディー"),
+        ],
+        heads=4,
+        phase="確定",
+        extra=_place_table(
+            [
+                ("単勝", "<div><span>4</span></div>", "100円", "<span>1人気</span>"),
+                (
+                    "複勝",
+                    "<div><span>4</span></div><div><span>7</span></div>"
+                    "<div><span>9</span></div><div><span>2</span></div>",
+                    "110円<br />120円<br />130円<br />140円",
+                    "<span>1人気</span><span>2人気</span><span>3人気</span><span>4人気</span>",
+                ),
+                (
+                    "ワイド",
+                    "<ul><li><span>4</span></li><li><span>7</span></li></ul>"
+                    "<ul><li><span>4</span></li><li><span>9</span></li></ul>"
+                    "<ul><li><span>4</span></li><li><span>2</span></li></ul>"
+                    "<ul><li><span>7</span></li><li><span>9</span></li></ul>",
+                    "200円<br />210円<br />220円<br />230円",
+                    "<span>1人気</span><span>2人気</span><span>3人気</span><span>4人気</span>",
+                ),
+            ]
+        ),
+    )
+    tickets = "".join(
+        [
+            _jra_ticket("単勝", "4", "100", "1"),
+            _jra_ticket("複勝", "4", "110", "1"),
+            _jra_ticket("複勝", "7", "120", "2"),
+            _jra_ticket("複勝", "9", "130", "3"),
+            _jra_ticket("複勝", "2", "140", "4"),
+            _jra_ticket("ワイド", "4-7", "200", "1"),
+            _jra_ticket("ワイド", "4-9", "210", "2"),
+            _jra_ticket("ワイド", "4-2", "220", "3"),
+            _jra_ticket("ワイド", "7-9", "230", "4"),
+        ]
+    )
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("0", tickets=tickets)},
+    )
+    assert [(row.rank, row.horse_number) for row in settled.results] == [
+        (1, 4),
+        (2, 7),
+        (3, 9),
+        (3, 2),
+    ]
+    assert settled.complete is True
+    assert settled.warning is None
+    assert [payout.combination for payout in settled.payouts if payout.bet_type == "複勝"] == [
+        "4",
+        "7",
+        "9",
+        "2",
+    ]
+    assert len([payout for payout in settled.payouts if payout.bet_type == "ワイド"]) == 4
+
+
+def _refund_table(numbers: list[int], bets: str) -> str:
+    spans = "".join(f"<div><span>{number}</span></div>" for number in numbers)
+    return (
+        '<table class="Payout_Detail_Table"><tr><th>返還</th>'
+        f"<td class='Result'>{spans}</td><td>{bets}</td></tr></table>"
+    )
+
+
+def test_printed_refund_matches_a_scratch_without_a_warning():
+    html = _result_html(
+        [_row("1", 1, "イチ"), _row("取消", 2, "ニ")],
+        heads=2,
+        phase="確定",
+        extra=_WIN_PAYOUT + _refund_table([2], "単勝・複勝"),
+    )
+    settled, _client = _settled(
+        html,
+        posts={
+            "pw01hli00/03": _JRA_INDEX,
+            _JRA_CNAME: _jra_day("100", refund="返還馬番　2番"),
+        },
+    )
+    assert settled.warning is None
+    assert settled.complete is True
+    assert settled.results[1].status == "scratched"
+    assert settled.refunds is not None
+    assert len(settled.refunds) == 1
+    refund = settled.refunds[0]
+    assert refund.horse_numbers == [2]
+    assert refund.bet_types == ["単勝", "複勝"]
+    assert refund.bracket_numbers is None
+    assert refund.source == "netkeiba_html"
+    assert refund.fetched_at == FETCHED_AT
+    assert settled.payouts[0].payout == 100
+
+
+def test_jra_refund_fills_the_field_when_netkeiba_prints_none():
+    html = _result_html(
+        [_row("1", 1, "イチ"), _row("除外", 10, "ジュウ")],
+        heads=2,
+        phase="確定",
+        extra=_WIN_PAYOUT,
+    )
+    settled, _client = _settled(
+        html,
+        posts={
+            "pw01hli00/03": _JRA_INDEX,
+            _JRA_CNAME: _jra_day("100", refund="返還馬番　10番　返還同枠　7枠"),
+        },
+    )
+    assert settled.warning is None
+    assert settled.results[1].status == "excluded"
+    assert settled.refunds is not None
+    refund = settled.refunds[0]
+    assert refund.horse_numbers == [10]
+    assert refund.bet_types is None
+    assert refund.bracket_numbers == [7]
+    assert refund.source == "jra_html"
+    assert refund.fetched_at == FETCHED_AT
+
+
+def test_refund_for_a_finisher_warns_and_is_not_invented_beyond_the_page():
+    html = _result_html(
+        [_row("1", 1, "イチ")],
+        heads=1,
+        phase="確定",
+        extra=_WIN_PAYOUT + _refund_table([1], "単勝"),
+    )
+    settled, _client = _settled(
+        html,
+        posts={
+            "pw01hli00/03": _JRA_INDEX,
+            _JRA_CNAME: _jra_day("100", refund="返還馬番　1番"),
+        },
+    )
+    assert settled.refunds is not None
+    assert settled.refunds[0].horse_numbers == [1]
+    assert settled.warning == f"{REFUND_NOT_NON_RUNNER}: 1"
+
+
+def test_refund_horse_mismatch_keeps_the_netkeiba_numbers():
+    html = _result_html(
+        [_row("1", 1, "イチ"), _row("取消", 2, "ニ"), _row("除外", 5, "ゴ")],
+        heads=3,
+        phase="確定",
+        extra=_WIN_PAYOUT + _refund_table([2], "単勝"),
+    )
+    settled, _client = _settled(
+        html,
+        posts={
+            "pw01hli00/03": _JRA_INDEX,
+            _JRA_CNAME: _jra_day("100", refund="返還馬番　5番"),
+        },
+    )
+    assert settled.refunds is not None
+    assert settled.refunds[0].horse_numbers == [2]
+    assert settled.refunds[0].source == "netkeiba_html"
+    assert settled.warning == f"{JRA_REFUND_MISMATCH}: netkeibaのみ: 2番; JRAのみ: 5番"
+
+
 def test_pre_race_models_do_not_carry_result_fields():
-    banned = {"status", "status_label", "demoted", "complete", "result_phase"}
+    banned = {"status", "status_label", "demoted", "complete", "result_phase", "refunds"}
     for model in (Race, RaceEntry, Horse):
         assert banned.isdisjoint(model.model_fields)
 

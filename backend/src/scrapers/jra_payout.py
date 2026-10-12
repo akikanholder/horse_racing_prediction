@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 JRA_PAYOUT_UNREACHABLE = "JRA official payout was not reachable"
 JRA_PAYOUT_FORBIDDEN = "JRA payout returned 403"
 JRA_PAYOUT_MISMATCH = "JRA payout mismatch"
+JRA_REFUND_MISMATCH = "JRA refund mismatch"
 
 ACCESS_H_URL = "https://www.jra.go.jp/JRADB/accessH.html"
 PAYOUT_INDEX_CNAME = "pw01hli00/03"
@@ -52,37 +53,51 @@ class _Ticket:
     popularity: int | None
 
 
+@dataclass(frozen=True)
+class OfficialRefund:
+    """返還 block on one race of the JRA payout page. Prices are not included."""
+
+    horse_numbers: tuple[int, ...]
+    bet_types: tuple[str, ...] | None
+    bracket_numbers: tuple[int, ...] | None
+
+
 def cross_check_payouts(
     http_client: object,
     key: OfficialPayoutKey | None,
     payouts: list[tuple[str, str, int, int | None]],
-) -> str | None:
-    """Return a warning when official payouts are missing or disagree.
+) -> tuple[str | None, list[OfficialRefund] | None]:
+    """Return a payout warning and any 返還 block printed for this race.
 
     ``payouts`` is the netkeiba list. This function does not invent replacements.
+    Several rows of one bet type are kept. A missing popularity on one side is
+    not a mismatch. ``None`` refunds means the page printed no 返還 block.
     """
-    if key is None or not payouts:
-        return None
+    if key is None:
+        return JRA_PAYOUT_UNREACHABLE, None
     post = getattr(http_client, "post", None)
     if not callable(post):
-        return JRA_PAYOUT_UNREACHABLE
+        return JRA_PAYOUT_UNREACHABLE, None
     try:
         index = _post(post, PAYOUT_INDEX_CNAME)
     except Exception as exc:
         logger.warning("JRA payout index was not reachable: %s", exc)
-        return _failure_warning(exc)
+        return _failure_warning(exc), None
     cname = _meeting_cname(index, key)
     if cname is None:
-        return JRA_PAYOUT_UNREACHABLE
+        return JRA_PAYOUT_UNREACHABLE, None
     try:
         day_html = _post(post, cname)
     except Exception as exc:
         logger.warning("JRA payout day page was not reachable: %s", exc)
-        return _failure_warning(exc)
+        return _failure_warning(exc), None
+    refunds = _race_refunds(day_html, key.race_number)
+    if not payouts:
+        return None, refunds
     official = _race_tickets(day_html, key.race_number)
     if official is None:
-        return JRA_PAYOUT_UNREACHABLE
-    return _mismatch(payouts, official)
+        return JRA_PAYOUT_UNREACHABLE, refunds
+    return _mismatch(payouts, official), refunds
 
 
 def _failure_warning(exc: BaseException) -> str:
@@ -125,15 +140,20 @@ def _meeting_cname(html: str, key: OfficialPayoutKey) -> str | None:
 
 
 def _race_tickets(html: str, race_number: int) -> list[_Ticket] | None:
-    marker = f"race_number_main/race_num_{race_number}.png"
-    start = html.find(marker)
-    if start < 0:
+    block = _race_block(html, race_number)
+    if block is None:
         return None
-    nxt = html.find("race_number_main/race_num_", start + len(marker))
-    block = html[start:] if nxt < 0 else html[start:nxt]
     soup = BeautifulSoup(block, "lxml")
-    unit = soup.select_one(".refund_unit")
-    if not isinstance(unit, Tag):
+    unit: Tag | None = None
+    for candidate in soup.select(".refund_unit"):
+        if not isinstance(candidate, Tag):
+            continue
+        classes = candidate.get("class") or []
+        if "restoration" in classes:
+            continue
+        unit = candidate
+        break
+    if unit is None:
         return None
     tickets: list[_Ticket] = []
     for item in unit.find_all("li"):
@@ -164,6 +184,60 @@ def _race_tickets(html: str, race_number: int) -> list[_Ticket] | None:
     return tickets
 
 
+def _race_block(html: str, race_number: int) -> str | None:
+    marker = f"race_number_main/race_num_{race_number}.png"
+    start = html.find(marker)
+    if start < 0:
+        return None
+    nxt = html.find("race_number_main/race_num_", start + len(marker))
+    return html[start:] if nxt < 0 else html[start:nxt]
+
+
+def _race_refunds(html: str, race_number: int) -> list[OfficialRefund] | None:
+    """返還 inside this race. The nav link and the payout ``refund_unit`` are not it."""
+    block = _race_block(html, race_number)
+    if block is None:
+        return None
+    soup = BeautifulSoup(block, "lxml")
+    found: list[OfficialRefund] = []
+    for unit in soup.select(".restoration"):
+        if not isinstance(unit, Tag):
+            continue
+        refund = _refund_from_text(unit.get_text(" ", strip=True))
+        if refund is not None:
+            found.append(refund)
+    if not found:
+        return None
+    return found
+
+
+_REFUND_BETS = ("単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単")
+
+
+def _refund_from_text(text: str) -> OfficialRefund | None:
+    compact = re.sub(r"\s+", "", text).replace("三連複", "3連複").replace("三連単", "3連単")
+    if "返還" not in compact:
+        return None
+    horses: list[int] = []
+    if "返還馬番" in compact:
+        head = compact.split("返還馬番", 1)[1].split("返還同枠", 1)[0]
+        horses = [int(number) for number in re.findall(r"\d+", head)]
+    brackets = [int(number) for number in re.findall(r"返還同枠(\d+)枠", compact)]
+    bets = [
+        name
+        for index, name in sorted(
+            (compact.find(name), name) for name in _REFUND_BETS if name in compact
+        )
+    ]
+    if not horses and not brackets:
+        return None
+    return OfficialRefund(
+        tuple(horses),
+        tuple(bets) if bets else None,
+        tuple(brackets) if brackets else None,
+    )
+
+
 def _yen(text: str) -> int | None:
     compact = text.replace(",", "").replace("，", "")
     match = _YEN.search(compact.replace(" ", ""))
@@ -191,19 +265,58 @@ def _ticket_order(ticket: _Ticket) -> tuple[str, str, int, int]:
     return (ticket.bet_type, ticket.combination, ticket.payout, popularity)
 
 
+def _core(ticket: _Ticket) -> tuple[str, str, int]:
+    return (ticket.bet_type, ticket.combination, ticket.payout)
+
+
+def _pop_groups(tickets: list[_Ticket]) -> dict[tuple[str, str, int], list[int | None]]:
+    groups: dict[tuple[str, str, int], list[int | None]] = {}
+    for ticket in tickets:
+        groups.setdefault(_core(ticket), []).append(ticket.popularity)
+    return groups
+
+
+def _popularities_compatible(left: list[_Ticket], right: list[_Ticket]) -> bool:
+    """Same money rows. A blank popularity does not disagree with a printed one."""
+    left_groups = _pop_groups(left)
+    right_groups = _pop_groups(right)
+    if set(left_groups) != set(right_groups):
+        return False
+    for key, pops in left_groups.items():
+        if not _pop_counts_fit(pops, right_groups[key]):
+            return False
+    return True
+
+
+def _pop_counts_fit(left: list[int | None], right: list[int | None]) -> bool:
+    left_known = [value for value in left if value is not None]
+    right_known = [value for value in right if value is not None]
+    extra_left = len(left_known)
+    extra_right = len(right_known)
+    for value in set(left_known) & set(right_known):
+        shared = min(left_known.count(value), right_known.count(value))
+        extra_left -= shared
+        extra_right -= shared
+    return extra_left <= right.count(None) and extra_right <= left.count(None)
+
+
 def _mismatch(
     netkeiba: list[tuple[str, str, int, int | None]],
     official: list[_Ticket],
 ) -> str | None:
-    left_sorted = sorted(
-        (_Ticket(bet, combo, payout, pop) for bet, combo, payout, pop in netkeiba),
-        key=_ticket_order,
-    )
-    right = sorted(official, key=_ticket_order)
-    if left_sorted == right:
+    left = [_Ticket(bet, combo, payout, pop) for bet, combo, payout, pop in netkeiba]
+    right = list(official)
+    left_cores = sorted(_core(ticket) for ticket in left)
+    right_cores = sorted(_core(ticket) for ticket in right)
+    if left_cores == right_cores and _popularities_compatible(left, right):
         return None
-    only_net = [ticket for ticket in left_sorted if ticket not in right]
-    only_jra = [ticket for ticket in right if ticket not in left_sorted]
+    left_sorted = sorted(left, key=_ticket_order)
+    right_sorted = sorted(right, key=_ticket_order)
+    only_net = [ticket for ticket in left_sorted if _core(ticket) not in right_cores]
+    only_jra = [ticket for ticket in right_sorted if _core(ticket) not in left_cores]
+    if left_cores == right_cores:
+        only_net = left_sorted
+        only_jra = right_sorted
     parts: list[str] = []
     if only_net:
         parts.append("netkeibaのみ: " + "、".join(_fmt(ticket) for ticket in only_net))

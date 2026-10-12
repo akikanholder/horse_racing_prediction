@@ -328,8 +328,7 @@ def cmd_track(args):
             cushion = ""
             if info.turf.cushion and info.turf.cushion.value is not None:
                 cushion = (
-                    f" クッション値: {info.turf.cushion.value}"
-                    f" ({info.turf.cushion.hardness_level})"
+                    f" クッション値: {info.turf.cushion.value} ({info.turf.cushion.hardness_level})"
                 )
             print(f"  芝: {info.turf.condition.value}{cushion}")
         if info.dirt:
@@ -443,6 +442,16 @@ def _print_settled_result(settled: SettledRaceResult) -> None:
         print(_format_payout(payout))
     if settled.payout_note:
         print(f"注記: {settled.payout_note}")
+    if settled.refunds:
+        print("\n--- 返還 ---")
+        for refund in settled.refunds:
+            horses = "、".join(f"{number}番" for number in refund.horse_numbers) or "馬番の印字なし"
+            bets = "" if not refund.bet_types else " " + " ".join(refund.bet_types)
+            brackets = ""
+            if refund.bracket_numbers:
+                brackets = " 同枠" + "、".join(f"{number}枠" for number in refund.bracket_numbers)
+            origin = f" [{refund.source}]" if refund.source else ""
+            print(f"{horses}{brackets}{bets}{origin}")
 
 
 def _settled_course(settled: SettledRaceResult) -> str:

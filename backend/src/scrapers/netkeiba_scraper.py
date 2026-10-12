@@ -30,6 +30,7 @@ from backend.models.race import (
     RaceCard,
     RaceEntry,
     RacePayout,
+    RaceRefund,
     RaceResult,
     RaceSchedule,
     ResultPhase,
@@ -41,7 +42,9 @@ from backend.models.race import (
 from backend.scrapers.base_scraper import BaseScraper
 from backend.scrapers.jra_payout import (
     JRA_PAYOUT_UNREACHABLE,
+    JRA_REFUND_MISMATCH,
     OfficialPayoutKey,
+    OfficialRefund,
     cross_check_payouts,
 )
 from backend.scrapers.page_fallback import FetchedBody, PageFallback
@@ -71,6 +74,7 @@ RACE_RESULT_LOGIN = "race result requires login"
 RACE_RESULT_PHASE_UNKNOWN = "result phase was not on the page"
 RACE_RESULT_PHASE_DISAGREE = "result phase sources disagree"
 RACE_RESULT_HEADLESS_UNAVAILABLE = "headless browser is not installed"
+REFUND_NOT_NON_RUNNER = "refund horses are not scratched or excluded"
 
 _STATUS_BY_LABEL = {
     "取消": "scratched",
@@ -677,6 +681,223 @@ def _join_warnings(*parts: str | None) -> str | None:
     return "; ".join(items)
 
 
+_REFUND_BET_NAMES = ("単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単")
+
+
+def _refund_bits(text: str) -> tuple[list[int], list[int], list[str]]:
+    """Horse numbers, brackets, and bet types printed in one 返還 block."""
+    compact = _compact(text).replace("三連複", "3連複").replace("三連単", "3連単")
+    horses: list[int] = []
+    if "返還馬番" in compact:
+        head = compact.split("返還馬番", 1)[1].split("返還同枠", 1)[0]
+        horses = [int(number) for number in re.findall(r"\d+", head)]
+    brackets = [int(number) for number in re.findall(r"返還同枠(\d+)枠", compact)]
+    bets = [
+        name
+        for index, name in sorted(
+            (compact.find(name), name) for name in _REFUND_BET_NAMES if name in compact
+        )
+    ]
+    return horses, brackets, bets
+
+
+def _html_refunds(
+    soup: BeautifulSoup, source: str, fetched_at: datetime
+) -> list[RaceRefund] | None:
+    """返還 rows on a netkeiba result page. A page with none returns null."""
+    records: list[RaceRefund] = []
+    seen: set[str] = set()
+    nodes: list[Tag] = []
+    for row in soup.find_all("tr"):
+        if not isinstance(row, Tag):
+            continue
+        label = row.find("th")
+        if isinstance(label, Tag) and _compact(label.get_text()) == "返還":
+            nodes.append(row)
+    for unit in soup.select(".restoration"):
+        if isinstance(unit, Tag):
+            nodes.append(unit)
+    for node in nodes:
+        horses, brackets, bets = _refund_bits(node.get_text(" ", strip=True))
+        if not horses:
+            result = node.find("td", class_="Result")
+            if isinstance(result, Tag):
+                horses = [
+                    int(token)
+                    for token in (
+                        _number_token(span.get_text()) for span in result.find_all("span")
+                    )
+                    if token
+                ]
+                if not horses:
+                    horses = [
+                        int(number) for number in re.findall(r"\d+", _compact(result.get_text()))
+                    ]
+        if not horses and not brackets:
+            continue
+        record = RaceRefund(
+            horse_numbers=horses,
+            bet_types=bets or None,
+            bracket_numbers=brackets or None,
+            source=source,
+            fetched_at=fetched_at,
+        )
+        key = f"{horses}|{bets}|{brackets}"
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(record)
+    if not records:
+        return None
+    return records
+
+
+def _refunds_from_payload(
+    payload: dict[str, object], source: str, fetched_at: datetime
+) -> list[RaceRefund] | None:
+    raw = payload.get("refunds")
+    if not isinstance(raw, list) or not raw:
+        return None
+    records: list[RaceRefund] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        numbers = item.get("horse_numbers", item.get("馬番"))
+        if isinstance(numbers, int):
+            numbers = [numbers]
+        if not isinstance(numbers, list):
+            continue
+        horses = [int(number) for number in numbers if isinstance(number, int)]
+        bets_raw = item.get("bet_types")
+        bets = [str(bet) for bet in bets_raw] if isinstance(bets_raw, list) and bets_raw else None
+        brackets_raw = item.get("bracket_numbers")
+        brackets = (
+            [int(number) for number in brackets_raw if isinstance(number, int)]
+            if isinstance(brackets_raw, list)
+            else None
+        )
+        if not horses and not brackets:
+            continue
+        records.append(
+            RaceRefund(
+                horse_numbers=horses,
+                bet_types=bets,
+                bracket_numbers=brackets or None,
+                source=source,
+                fetched_at=fetched_at,
+            )
+        )
+    if not records:
+        return None
+    return records
+
+
+def _refund_horses(refunds: list[RaceRefund] | list[OfficialRefund] | None) -> set[int]:
+    if not refunds:
+        return set()
+    numbers: set[int] = set()
+    for refund in refunds:
+        numbers.update(refund.horse_numbers)
+    return numbers
+
+
+def _refund_bets(refunds: list[RaceRefund] | list[OfficialRefund] | None) -> set[str] | None:
+    if not refunds:
+        return None
+    found: set[str] = set()
+    printed = False
+    for refund in refunds:
+        if refund.bet_types:
+            printed = True
+            found.update(refund.bet_types)
+    if not printed:
+        return None
+    return found
+
+
+def _merge_refunds(
+    netkeiba: list[RaceRefund] | None,
+    official: list[OfficialRefund] | None,
+    fetched_at: datetime,
+) -> tuple[list[RaceRefund] | None, str | None]:
+    """Keep the printed refund. Do not invent horses the page did not name."""
+    if not official:
+        return netkeiba, None
+    jra_records = [
+        RaceRefund(
+            horse_numbers=list(item.horse_numbers),
+            bet_types=list(item.bet_types) if item.bet_types else None,
+            bracket_numbers=list(item.bracket_numbers) if item.bracket_numbers else None,
+            source="jra_html",
+            fetched_at=fetched_at,
+        )
+        for item in official
+    ]
+    if not netkeiba:
+        return jra_records, None
+    if _refund_horses(netkeiba) != _refund_horses(jra_records):
+        return netkeiba, _refund_mismatch_text(netkeiba, jra_records)
+    net_bets = _refund_bets(netkeiba)
+    jra_bets = _refund_bets(jra_records)
+    bet_warning = (
+        JRA_REFUND_MISMATCH
+        if net_bets is not None and jra_bets is not None and net_bets != jra_bets
+        else None
+    )
+    jra_brackets = [
+        number for item in jra_records if item.bracket_numbers for number in item.bracket_numbers
+    ]
+    merged: list[RaceRefund] = []
+    for record in netkeiba:
+        update: dict[str, object] = {}
+        if record.bet_types is None and jra_bets:
+            update["bet_types"] = sorted(jra_bets)
+        if record.bracket_numbers is None and jra_brackets:
+            update["bracket_numbers"] = jra_brackets
+            update["source"] = "+".join(part for part in (record.source, "jra_html") if part)
+        if update:
+            record = record.model_copy(update=update)
+        merged.append(record)
+    return merged, bet_warning
+
+
+def _refund_mismatch_text(netkeiba: list[RaceRefund], official: list[RaceRefund]) -> str:
+    only_net = sorted(_refund_horses(netkeiba) - _refund_horses(official))
+    only_jra = sorted(_refund_horses(official) - _refund_horses(netkeiba))
+    parts: list[str] = []
+    if only_net:
+        parts.append("netkeibaのみ: " + "、".join(f"{number}番" for number in only_net))
+    if only_jra:
+        parts.append("JRAのみ: " + "、".join(f"{number}番" for number in only_jra))
+    if not parts:
+        return JRA_REFUND_MISMATCH
+    return f"{JRA_REFUND_MISMATCH}: " + "; ".join(parts)
+
+
+def _refund_status_warning(
+    results: list[SettledFinisher], refunds: list[RaceRefund] | None
+) -> str | None:
+    """A printed refund for a horse that was not 取消 or 除外 is a warning."""
+    if not refunds:
+        return None
+    allowed = {
+        row.horse_number
+        for row in results
+        if row.status in {"scratched", "excluded"} and row.horse_number is not None
+    }
+    bad: list[str] = []
+    seen: set[int] = set()
+    for refund in refunds:
+        for number in refund.horse_numbers:
+            if number in allowed or number in seen:
+                continue
+            seen.add(number)
+            bad.append(str(number))
+    if not bad:
+        return None
+    return f"{REFUND_NOT_NON_RUNNER}: " + "、".join(bad)
+
+
 def _as_status(value: str | None) -> ResultRunnerStatus | None:
     if value in {"finished", "scratched", "excluded", "did_not_finish", "disqualified", "unknown"}:
         return cast(ResultRunnerStatus, value)
@@ -763,8 +984,9 @@ def _finish_status(rank_text: str) -> tuple[int | None, str | None, str | None, 
     """
     demoted = "降着" in rank_text
     compact = _compact(rank_text.replace("降着", ""))
-    if re.fullmatch(r"\d+", compact):
-        return int(compact), "finished", None, demoted
+    dead_heat = re.fullmatch(r"(\d+)(?:同着|（同着）|\(同着\)|同)?", compact)
+    if dead_heat is not None:
+        return int(dead_heat.group(1)), "finished", None, demoted
     code = _STATUS_BY_LABEL.get(compact)
     if code is not None:
         return None, code, compact, demoted
@@ -1291,6 +1513,7 @@ class NetkeibaScraper(BaseScraper):
             results,
             payouts,
             payout_note,
+            refunds=_html_refunds(soup, source, fetched_at),
         )
 
     def _settled_header(self, soup: BeautifulSoup) -> _SettledHeader:
@@ -1392,6 +1615,7 @@ class NetkeibaScraper(BaseScraper):
         fetched_at: datetime,
     ) -> list[SettledFinisher]:
         finishers: list[SettledFinisher] = []
+        previous_rank: int | None = None
         for row in table.find_all("tr")[1:]:
             if not isinstance(row, Tag):
                 continue
@@ -1401,8 +1625,17 @@ class NetkeibaScraper(BaseScraper):
             finisher = self._settled_finisher(
                 cols, columns, row=row, source=source, fetched_at=fetched_at
             )
-            if finisher is not None:
-                finishers.append(finisher)
+            if finisher is None:
+                continue
+            rank_text = _compact(_cell_text(cols, columns, "rank"))
+            if finisher.rank is None and rank_text in {"同着", "（同着）", "(同着)"}:
+                if previous_rank is not None:
+                    finisher = finisher.model_copy(
+                        update={"rank": previous_rank, "status": "finished", "status_label": None}
+                    )
+            if finisher.rank is not None:
+                previous_rank = finisher.rank
+            finishers.append(finisher)
         return finishers
 
     def _settled_finisher(
@@ -1474,7 +1707,7 @@ class NetkeibaScraper(BaseScraper):
                 if not isinstance(label_cell, Tag):
                     continue
                 label = _clean(label_cell.get_text())
-                if not label:
+                if not label or _compact(label) == "返還":
                     continue
                 result_cell = row.find("td", class_="Result")
                 payout_cell = row.find("td", class_="Payout")
@@ -1591,8 +1824,9 @@ class NetkeibaScraper(BaseScraper):
         entry_count = header.entry_count
         payouts = list(base.payouts)
         payout_note = base.payout_note
+        refunds = base.refunds
         for page in pages[1:]:
-            extra_runners, extra_phase, extra_count, extra_payouts, extra_note = (
+            extra_runners, extra_phase, extra_count, extra_payouts, extra_note, extra_refunds = (
                 self._supplement_from_page(page, race_id)
             )
             if extra_runners:
@@ -1604,6 +1838,8 @@ class NetkeibaScraper(BaseScraper):
             if extra_payouts and not payouts:
                 payouts = extra_payouts
                 payout_note = extra_note
+            if extra_refunds and refunds is None:
+                refunds = extra_refunds
         if not runners:
             return base
         header.entry_count = entry_count
@@ -1615,6 +1851,7 @@ class NetkeibaScraper(BaseScraper):
             runners,
             payouts,
             payout_note,
+            refunds=refunds,
             phase_disagree=phase_disagree,
         )
 
@@ -1626,14 +1863,15 @@ class NetkeibaScraper(BaseScraper):
         int | None,
         list[RacePayout],
         str | None,
+        list[RaceRefund] | None,
     ]:
         text = page.body.lstrip()
         source = _result_source(page.source)
         if not text.startswith("<"):
-            runners, phase, entry_count = self._runners_from_json(
+            runners, phase, entry_count, refunds = self._runners_from_json(
                 page.body, source, page.fetched_at
             )
-            return runners, phase, entry_count, [], None
+            return runners, phase, entry_count, [], None, refunds
         soup = BeautifulSoup(page.body, "lxml")
         parsed = self._parse_settled_race_result(soup, race_id, page.fetched_at, source=source)
         header = self._settled_header(soup)
@@ -1643,17 +1881,18 @@ class NetkeibaScraper(BaseScraper):
             header.entry_count,
             list(parsed.payouts),
             parsed.payout_note,
+            parsed.refunds,
         )
 
     def _runners_from_json(
         self, body: str, source: str, fetched_at: datetime
-    ) -> tuple[list[SettledFinisher], str | None, int | None]:
+    ) -> tuple[list[SettledFinisher], str | None, int | None, list[RaceRefund] | None]:
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
-            return [], None, None
+            return [], None, None, None
         if not isinstance(payload, dict):
-            return [], None, None
+            return [], None, None, None
         raw_rows: list[object] | None = None
         for key in _RUNNER_LIST_KEYS:
             value = payload.get(key)
@@ -1671,7 +1910,7 @@ class NetkeibaScraper(BaseScraper):
         phase = _phase_label(str(payload.get("result_phase") or ""))
         count = payload.get("entry_count")
         entry_count = count if isinstance(count, int) else None
-        return runners, phase, entry_count
+        return runners, phase, entry_count, _refunds_from_payload(payload, source, fetched_at)
 
     def _result_from_parts(
         self,
@@ -1682,6 +1921,7 @@ class NetkeibaScraper(BaseScraper):
         payouts: list[RacePayout],
         payout_note: str | None,
         *,
+        refunds: list[RaceRefund] | None = None,
         phase_disagree: bool = False,
     ) -> SettledRaceResult:
         complete, incomplete = _assess_complete(results, header.entry_count)
@@ -1706,6 +1946,7 @@ class NetkeibaScraper(BaseScraper):
             result_phase=_as_phase(phase),
             results=results,
             payouts=payouts,
+            refunds=refunds,
             payout_note=payout_note,
             warning=_join_warnings(incomplete, phase_warning),
         )
@@ -1714,23 +1955,32 @@ class NetkeibaScraper(BaseScraper):
         self, settled: SettledRaceResult, header: _SettledHeader
     ) -> SettledRaceResult:
         """Warn when JRA's public payout list is missing or disagrees. Do not invent prices."""
-        if not settled.payouts or settled.warning in _HARD_RESULT_WARNINGS:
+        if settled.warning in _HARD_RESULT_WARNINGS:
             return settled
-        key = _official_payout_key(header, self.VENUE_CODES)
-        if key is None:
-            note: str | None = JRA_PAYOUT_UNREACHABLE
-        else:
-            note = cross_check_payouts(
-                self.http_client,
-                key,
-                [
-                    (payout.bet_type, payout.combination, payout.payout, payout.popularity)
-                    for payout in settled.payouts
-                ],
-            )
-        if note is None:
+        refunds = settled.refunds
+        notes: list[str | None] = []
+        if settled.payouts or settled.refunds:
+            key = _official_payout_key(header, self.VENUE_CODES)
+            if key is None:
+                notes.append(JRA_PAYOUT_UNREACHABLE)
+                official: list[OfficialRefund] | None = None
+            else:
+                payout_note, official = cross_check_payouts(
+                    self.http_client,
+                    key,
+                    [
+                        (payout.bet_type, payout.combination, payout.payout, payout.popularity)
+                        for payout in settled.payouts
+                    ],
+                )
+                notes.append(payout_note)
+            refunds, refund_note = _merge_refunds(settled.refunds, official, settled.fetched_at)
+            notes.append(refund_note)
+        notes.append(_refund_status_warning(settled.results, refunds))
+        warning = _join_warnings(settled.warning, *notes)
+        if warning == settled.warning and refunds == settled.refunds:
             return settled
-        return settled.model_copy(update={"warning": _join_warnings(settled.warning, note)})
+        return settled.model_copy(update={"warning": warning, "refunds": refunds})
 
     def get_horse_info(self, horse_id: str, *, fetched_at: datetime | None = None) -> Horse | None:
         """Get horse identity and near-run history.
