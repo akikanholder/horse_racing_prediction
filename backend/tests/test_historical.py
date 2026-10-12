@@ -736,7 +736,8 @@ def test_date_range_stops_on_403_and_does_not_retry_or_open_later_races(tmp_path
     assert seen == ids[:2]
     assert seen.count(ids[1]) == 1
     assert jra.calls == [ids[0]]
-    assert odds.calls == []
+    # The completed race checks the post-race odds API once. The blocked race does not.
+    assert odds.calls == ["win"]
     assert batch.stopped_at_race_id == ids[1]
     assert batch.completed_race_ids == [ids[0]]
     assert batch.remaining_race_ids == ids[1:]
