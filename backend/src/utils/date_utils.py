@@ -2,6 +2,9 @@
 
 import re
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TOKYO = ZoneInfo("Asia/Tokyo")
 
 
 def get_current_week_dates() -> tuple[date, date]:
@@ -159,3 +162,66 @@ def get_race_id_date(race_id: str) -> date | None:
         except ValueError:
             pass
     return None
+
+
+def tokyo_now() -> datetime:
+    """Current time in Asia/Tokyo."""
+    return datetime.now(TOKYO)
+
+
+def format_tokyo_clock(hour: int, minute: int) -> str | None:
+    """Clock as printed, with the Asia/Tokyo offset. Invalid clocks stay unset."""
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return f"{hour:02d}:{minute:02d}+09:00"
+
+
+def normalize_tokyo_clock(value: str) -> str:
+    """Turn ``15:30`` into ``15:30+09:00``. Other text is left as printed."""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\+09:00)?", value.strip())
+    if match is None:
+        return value.strip()
+    clock = format_tokyo_clock(int(match.group(1)), int(match.group(2)))
+    return clock if clock is not None else value.strip()
+
+
+def parse_post_time(text: str) -> str | None:
+    """発走時刻 only. A measurement clock without 発走 is not a post time."""
+    patterns = (
+        r"(\d{1,2})\s*[:：]\s*(\d{2})\s*発走",
+        r"発走時刻\s*[：:]\s*(\d{1,2})\s*時\s*(\d{1,2})\s*分",
+        r"(\d{1,2})\s*時\s*(\d{1,2})\s*分\s*発走",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match is not None:
+            return format_tokyo_clock(int(match.group(1)), int(match.group(2)))
+    return None
+
+
+def parse_measurement_time(text: str, year: int | None) -> datetime | None:
+    """Measurement clock printed next to a reading. A missing year stays unset."""
+    dated = re.search(
+        r"(\d{4})\s*[/\-]\s*(\d{1,2})\s*[/\-]\s*(\d{1,2})\s+(\d{1,2})\s*[:：]\s*(\d{2})",
+        text,
+    )
+    if dated is not None:
+        return datetime(
+            int(dated.group(1)),
+            int(dated.group(2)),
+            int(dated.group(3)),
+            int(dated.group(4)),
+            int(dated.group(5)),
+            tzinfo=TOKYO,
+        )
+    partial = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日.*?(\d{1,2})\s*時\s*(\d{1,2})\s*分", text)
+    if partial is None or year is None:
+        return None
+    return datetime(
+        year,
+        int(partial.group(1)),
+        int(partial.group(2)),
+        int(partial.group(3)),
+        int(partial.group(4)),
+        tzinfo=TOKYO,
+    )

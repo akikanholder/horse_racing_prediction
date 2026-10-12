@@ -3,7 +3,9 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from backend.utils.date_utils import normalize_tokyo_clock
 
 TRACK_BIAS_UNAVAILABLE = "day-of track bias unavailable without a race card"
 TRACK_BIAS_NOT_LOADED = "day-of track bias not loaded from accessD/JRADB"
@@ -138,8 +140,23 @@ class Race(BaseModel):
     race_name: str = Field(..., description="レース名")
     race_number: int = Field(..., description="レース番号", ge=1, le=12)
     race_date: date = Field(..., description="開催日")
-    post_time: str | None = Field(None, description="発走時刻")
+    post_time: str | None = Field(
+        None, description="発走時刻。印字どおり Asia/Tokyo（15:30+09:00）。無ければ null"
+    )
+    post_time_source: str | None = Field(
+        None,
+        description="発走時刻を得た方法。jra_html / netkeiba_html / headless。無ければ null",
+    )
+    post_time_fetched_at: datetime | None = Field(None, description="発走時刻を得た時刻")
     venue: str = Field(..., description="開催場所")
+
+    @field_validator("post_time", mode="before")
+    @classmethod
+    def _post_time_has_tokyo_offset(cls, value: object) -> object:
+        """Store a printed clock with the Asia/Tokyo offset."""
+        if isinstance(value, str):
+            return normalize_tokyo_clock(value)
+        return value
     venue_code: str | None = Field(None, description="競馬場コード")
     round_number: int | None = Field(None, description="開催回次")
     day_number: int | None = Field(None, description="開催日次")

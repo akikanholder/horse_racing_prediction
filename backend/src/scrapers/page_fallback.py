@@ -180,10 +180,12 @@ class PageFallback:
         *,
         site: str = "netkeiba",
         headless_render: Callable[[str], str] | Literal["auto", "off"] = "auto",
+        url_finder: Callable[[str, str], list[str]] | None = None,
     ):
         self.http_client = http_client
         self.site = site
         self._headless_render = headless_render
+        self._url_finder = url_finder or same_site_result_urls
 
     def load(
         self,
@@ -195,20 +197,27 @@ class PageFallback:
         fetched_at: datetime,
         should_fallback: Callable[[str], bool],
         still_incomplete: Callable[[list[FetchedBody]], bool] | None = None,
+        html_body: str | None = None,
     ) -> FallbackFetch:
         """GET ``url``. On 403 or a login wall, return no further documents.
 
+        ``html_body`` skips that GET when the caller already has the document.
         ``should_fallback`` looks at the first HTML body. When it is true, JSON
-        already in the page and same-site result URLs the page calls are read
-        next. Headless runs only when ``still_incomplete`` is still true.
+        already in the page and same-site URLs the page calls are read next.
+        Headless runs only when ``still_incomplete`` is still true.
         """
-        try:
-            html = self._get(url, params=params, headers=headers, encoding=encoding)
-        except AccessBlocked as blocked:
-            return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, blocked))
-        except Exception as exc:
-            logger.error("Page fetch failed for %s: %s", url, exc)
-            return FallbackFetch(status="failed", warning=None)
+        if html_body is None:
+            try:
+                html = self._get(url, params=params, headers=headers, encoding=encoding)
+            except AccessBlocked as blocked:
+                return FallbackFetch(
+                    status="blocked", warning=_blocked_warning(self.site, blocked)
+                )
+            except Exception as exc:
+                logger.error("Page fetch failed for %s: %s", url, exc)
+                return FallbackFetch(status="failed", warning=None)
+        else:
+            html = html_body
 
         if looks_like_login_wall(html):
             login = AccessBlocked(401, PAGE_LOGIN)
@@ -235,7 +244,15 @@ class PageFallback:
                     url=page_url,
                 )
             )
-        for endpoint in same_site_result_urls(html, page_url):
+        try:
+            endpoints = list(self._url_finder(html, page_url))
+        except AccessBlocked as blocked:
+            return FallbackFetch(
+                status="blocked",
+                pages=pages,
+                warning=_blocked_warning(self.site, blocked),
+            )
+        for endpoint in endpoints:
             try:
                 body = self._get(endpoint, params=None, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:

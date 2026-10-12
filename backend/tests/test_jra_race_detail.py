@@ -161,7 +161,11 @@ def test_shutuba_page_fills_race_and_entries():
     assert race.venue == "中山"
     assert race.round_number == 4
     assert race.day_number == 8
-    assert race.post_time == "15:30"
+    assert race.post_time == "15:30+09:00"
+    assert race.post_time_source == "jra_html"
+    assert race.post_time_fetched_at is not None
+    assert race.post_time_fetched_at.utcoffset() is not None
+    assert race.post_time_fetched_at.utcoffset().total_seconds() == 9 * 3600
     assert race.distance == 1600
     assert race.track_type == "芝"
     assert race.direction == "右"
@@ -269,6 +273,7 @@ def test_race_service_merges_cards_and_keeps_netkeiba_ids():
         race=_race(
             race_name="秋風ステークス",
             post_time="15:30",
+            post_time_source="jra_html",
             prize_money=1870,
             weight_condition="定量",
         ),
@@ -305,7 +310,8 @@ def test_race_service_merges_cards_and_keeps_netkeiba_ids():
     card = service.get_race_card("202609260611")
     assert card is not None
     assert card.race.race_name == "秋風ステークス"
-    assert card.race.post_time == "15:30"
+    assert card.race.post_time == "15:30+09:00"
+    assert card.race.post_time_source == "jra_html"
     assert card.race.prize_money == 1870
     assert card.race.weight_condition == "定量"
     assert [entry.horse_number for entry in card.entries] == [1, 2]
@@ -342,7 +348,10 @@ def test_race_service_uses_the_source_that_succeeds():
 
     class NetkeibaOnly:
         def get_race_card(self, race_id: str) -> RaceCard:
-            return RaceCard(race=_race(post_time="15:30"), entries=[_entry(horse_id="123")])
+            return RaceCard(
+                race=_race(post_time="15:30", post_time_source="netkeiba_html"),
+                entries=[_entry(horse_id="123")],
+            )
 
     class JraDown:
         def get_race_card(self, race_id: str) -> RaceCard:
@@ -353,7 +362,8 @@ def test_race_service_uses_the_source_that_succeeds():
     card = service.get_race_card("202609260611")
     assert card is not None
     assert card.entries[0].horse_id == "123"
-    assert card.race.post_time == "15:30"
+    assert card.race.post_time == "15:30+09:00"
+    assert card.race.post_time_source == "netkeiba_html"
 
 
 def test_live_accessd_cname_shape_parses():
