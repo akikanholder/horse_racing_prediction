@@ -51,6 +51,8 @@ from backend.scrapers.page_fallback import FetchedBody, PageFallback
 from backend.utils.date_utils import (
     get_current_week_dates,
     parse_japanese_date,
+    parse_post_time,
+    tokyo_now,
 )
 from backend.utils.http_client import HTTPClient
 
@@ -2262,10 +2264,7 @@ class NetkeibaScraper(BaseScraper):
                     if w in race_data_text:
                         weather = w
                         break
-                post_time = None
-                time_match = re.search(r"(\d{1,2}:\d{2})", race_data_text)
-                if time_match:
-                    post_time = time_match.group(1)
+                post_time = parse_post_time(race_data_text)
 
             return Race(
                 race_id=race_id,
@@ -2279,6 +2278,8 @@ class NetkeibaScraper(BaseScraper):
                 track_condition=track_condition,
                 weather=weather,
                 post_time=post_time,
+                post_time_source="netkeiba_html" if post_time else None,
+                post_time_fetched_at=tokyo_now() if post_time else None,
             )
 
         except Exception as e:

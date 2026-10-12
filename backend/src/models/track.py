@@ -3,7 +3,9 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from backend.utils.date_utils import normalize_tokyo_clock
 
 
 class TrackCondition(str, Enum):
@@ -80,33 +82,39 @@ class Weather(str, Enum):
 
 
 class MoistureContent(BaseModel):
-    """含水率 (Moisture content)."""
+    """含水率 (Moisture content).
 
-    goal_front: float | None = Field(None, description="ゴール前の含水率")
-    fourth_corner: float | None = Field(None, description="4コーナーの含水率")
-    measured_at: datetime | None = Field(None, description="測定時刻")
+    ``goal_front`` と ``fourth_corner`` は印字された数値のまま。
+    馬場状態や目盛からは作らない。
+    """
+
+    goal_front: float | None = Field(None, description="ゴール前の含水率。印字が無ければ null")
+    fourth_corner: float | None = Field(None, description="4コーナーの含水率。印字が無ければ null")
+    measured_at: datetime | None = Field(None, description="測定時刻。印字が無ければ null")
+    source: str | None = Field(
+        None,
+        description="jra_html / jra_js / netkeiba_html / netkeiba_js / headless。無いときは null",
+    )
+    fetched_at: datetime | None = Field(None, description="この含水率を得た時刻")
 
 
 class CushionValue(BaseModel):
-    """クッション値 (Cushion value)."""
+    """クッション値 (Cushion value).
 
-    value: float | None = Field(None, description="クッション値")
-    measured_at: datetime | None = Field(None, description="測定時刻")
+    ``value`` は印字された数値。硬度目盛（12・10・8・7）や「硬め」は入れない。
+    ``grade`` は同じ欄に印字された区分だけ。数値から区分は作らない。
+    """
 
-    @property
-    def hardness_level(self) -> str:
-        """クッション値の硬さレベルを判定."""
-        if self.value is None:
-            return "不明"
-        if self.value >= 12:
-            return "硬め"
-        if self.value >= 10:
-            return "やや硬め"
-        if self.value >= 8:
-            return "標準"
-        if self.value >= 7:
-            return "やや軟らか"
-        return "軟らか"
+    value: float | None = Field(None, description="クッション値。印字された数値。無ければ null")
+    grade: str | None = Field(
+        None, description="印字された硬さ（硬め、やや硬め、標準など）。無ければ null"
+    )
+    measured_at: datetime | None = Field(None, description="測定時刻。印字が無ければ null")
+    source: str | None = Field(
+        None,
+        description="jra_html / jra_js / netkeiba_html / netkeiba_js / headless。無いときは null",
+    )
+    fetched_at: datetime | None = Field(None, description="このクッション値を得た時刻")
 
 
 class CourseInfo(BaseModel):
@@ -116,6 +124,10 @@ class CourseInfo(BaseModel):
     condition: TrackCondition = Field(
         default=TrackCondition.UNKNOWN, description="馬場状態"
     )
+    condition_source: str | None = Field(
+        None, description="馬場状態を得た方法。印字が無ければ null"
+    )
+    condition_fetched_at: datetime | None = Field(None, description="馬場状態を得た時刻")
     moisture: MoistureContent | None = Field(None, description="含水率情報")
     cushion: CushionValue | None = Field(None, description="クッション値 (芝コースのみ)")
 
@@ -154,6 +166,8 @@ class TrackInfo(BaseModel):
     )
     date: datetime | None = Field(None, description="開催日。ページに無ければ null")
     weather: Weather = Field(default=Weather.UNKNOWN, description="天候")
+    weather_source: str | None = Field(None, description="天候を得た方法。印字が無ければ null")
+    weather_fetched_at: datetime | None = Field(None, description="天候を得た時刻")
     turf: CourseInfo | None = Field(None, description="芝コース情報")
     dirt: CourseInfo | None = Field(None, description="ダートコース情報")
     grass_info: GrassInfo | None = Field(None, description="芝丈・コース情報")
@@ -164,9 +178,22 @@ class TrackInfo(BaseModel):
     warning: str | None = Field(
         None, description="取得できない理由。取れたときは null"
     )
+    post_time: str | None = Field(
+        None, description="発走時刻。印字どおり Asia/Tokyo（15:30+09:00）。無ければ null"
+    )
+    post_time_source: str | None = Field(None, description="発走時刻を得た方法。無ければ null")
+    post_time_fetched_at: datetime | None = Field(None, description="発走時刻を得た時刻")
     scraped_at: datetime = Field(
         default_factory=datetime.now, description="スクレイピング時刻"
     )
+
+    @field_validator("post_time", mode="before")
+    @classmethod
+    def _post_time_has_tokyo_offset(cls, value: object) -> object:
+        """Store a printed clock with the Asia/Tokyo offset."""
+        if isinstance(value, str):
+            return normalize_tokyo_clock(value)
+        return value
 
     model_config = ConfigDict(
         ser_json_timedelta="iso8601",

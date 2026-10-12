@@ -182,6 +182,7 @@ def test_export_splits_date_and_venue_directories(tmp_path: Path):
     assert tracks[0]["racecourse"] == "東京"
     assert tracks[0]["turf_condition"] == "良"
     assert tracks[0]["turf_cushion"] == "9.5"
+    assert tracks[0]["turf_cushion_hardness"] == ""
     assert tracks[0]["weather"] == "晴"
 
 
@@ -250,7 +251,7 @@ def test_get_races_for_date_filters_and_merges():
     by_id = {race.race_id: race for race in races}
     assert set(by_id) == {"202609270501", "202609270502"}
     assert by_id["202609270501"].race_name == "詳細なレース名"
-    assert by_id["202609270501"].post_time == "15:40"
+    assert by_id["202609270501"].post_time == "15:40+09:00"
 
 
 def test_netkeiba_races_by_date_uses_requested_date(monkeypatch):

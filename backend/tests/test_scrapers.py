@@ -67,29 +67,24 @@ class TestWeather:
 class TestCushionValue:
     """Tests for CushionValue model."""
 
-    def test_hardness_level_hard(self):
+    def test_number_does_not_invent_a_grade(self):
+        cushion = CushionValue(value=9.6)
+        assert cushion.value == 9.6
+        assert cushion.grade is None
+
+    def test_printed_grade_is_kept(self):
+        cushion = CushionValue(value=9.6, grade="標準")
+        assert cushion.value == 9.6
+        assert cushion.grade == "標準"
+
+    def test_scale_threshold_is_not_stored_as_a_grade(self):
         cushion = CushionValue(value=12.5)
-        assert cushion.hardness_level == "硬め"
+        assert cushion.grade is None
 
-    def test_hardness_level_slightly_hard(self):
-        cushion = CushionValue(value=11.0)
-        assert cushion.hardness_level == "やや硬め"
-
-    def test_hardness_level_standard(self):
-        cushion = CushionValue(value=9.0)
-        assert cushion.hardness_level == "標準"
-
-    def test_hardness_level_slightly_soft(self):
-        cushion = CushionValue(value=7.5)
-        assert cushion.hardness_level == "やや軟らか"
-
-    def test_hardness_level_soft(self):
-        cushion = CushionValue(value=6.0)
-        assert cushion.hardness_level == "軟らか"
-
-    def test_hardness_level_none(self):
+    def test_missing_number_stays_null(self):
         cushion = CushionValue(value=None)
-        assert cushion.hardness_level == "不明"
+        assert cushion.value is None
+        assert cushion.grade is None
 
 
 class TestMoistureContent:

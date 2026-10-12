@@ -11,7 +11,12 @@ from bs4 import BeautifulSoup, Tag
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.race import Race, RaceCard, RaceEntry, RaceSchedule
 from backend.scrapers.base_scraper import BaseScraper
-from backend.utils.date_utils import get_current_week_dates, parse_japanese_date
+from backend.utils.date_utils import (
+    get_current_week_dates,
+    parse_japanese_date,
+    parse_post_time,
+    tokyo_now,
+)
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
@@ -775,6 +780,8 @@ class JRAScraper(BaseScraper):
             race_number=race_number,
             race_date=race_date,
             post_time=post_time,
+            post_time_source="jra_html" if post_time else None,
+            post_time_fetched_at=tokyo_now() if post_time else None,
             venue=venue,
             venue_code=cname.venue_code,
             round_number=round_number or cname.kai,
@@ -873,13 +880,12 @@ class JRAScraper(BaseScraper):
         return int(match.group(1)), int(match.group(2))
 
     def _header_post_time(self, header: Tag) -> str | None:
-        """Convert ``15時30分`` to ``15:30``."""
+        """発走時刻 as printed, with the Asia/Tokyo offset.
+
+        A clock in the time cell is copied only when the cell says 発走.
+        """
         node = header.select_one(".cell.time")
-        text = self._node_text(node)
-        match = re.search(r"(\d{1,2})\s*時\s*(\d{1,2})\s*分", text)
-        if not match:
-            return None
-        return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+        return parse_post_time(self._node_text(node))
 
     def _header_course(self, header: Tag) -> tuple[int | None, str | None, str | None]:
         """Extract distance, surface and direction from the course cell."""

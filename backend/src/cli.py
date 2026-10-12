@@ -80,6 +80,11 @@ def cmd_race_card(args):
         print(f"\n=== 出馬表: {race_card.race.race_name} ===")
         print(f"開催日: {race_card.race.race_date}")
         print(f"競馬場: {race_card.race.venue}")
+        if race_card.race.post_time:
+            print(
+                f"発走: {race_card.race.post_time} "
+                f"({race_card.race.post_time_source}, {race_card.race.post_time_fetched_at})"
+            )
         print(f"コース: {race_card.race.track_type} {race_card.race.distance}m")
         print(f"出走頭数: {len(race_card.entries)}")
         if race_card.race.track_bias:
@@ -299,6 +304,26 @@ def cmd_courses(args):
                         )
 
 
+def _cushion_text(course) -> str:
+    """Printed cushion number and grade. A missing number is left off."""
+    cushion = course.cushion if course is not None else None
+    if cushion is None or cushion.value is None:
+        return ""
+    grade = f" {cushion.grade}" if cushion.grade else ""
+    return f" クッション値: {cushion.value}{grade} ({cushion.source}, {cushion.fetched_at})"
+
+
+def _moisture_text(moisture) -> str:
+    """Printed goal and corner moisture, with the source that supplied them."""
+    if moisture is None:
+        return ""
+    if moisture.goal_front is None and moisture.fourth_corner is None:
+        return ""
+    goal = "-" if moisture.goal_front is None else moisture.goal_front
+    corner = "-" if moisture.fourth_corner is None else moisture.fourth_corner
+    return f"ゴール前 {goal} / 4コーナー {corner} ({moisture.source}, {moisture.fetched_at})"
+
+
 def cmd_track(args):
     """Get detailed track (baba) information."""
     with TrackInfoService() as service:
@@ -320,19 +345,26 @@ def cmd_track(args):
     for source, info in results.items():
         place = info.racecourse or "不明"
         print(f"[{source}] {place} 天候: {info.weather.value}")
+        if info.weather_source:
+            print(f"  天候ソース: {info.weather_source} {info.weather_fetched_at}")
+        if info.post_time:
+            print(
+                f"  発走: {info.post_time} ({info.post_time_source}, {info.post_time_fetched_at})"
+            )
         if info.warning:
             print(f"  警告: {info.warning}")
         if info.warning and info.racecourse is None:
             continue
         if info.turf:
-            cushion = ""
-            if info.turf.cushion and info.turf.cushion.value is not None:
-                cushion = (
-                    f" クッション値: {info.turf.cushion.value} ({info.turf.cushion.hardness_level})"
-                )
-            print(f"  芝: {info.turf.condition.value}{cushion}")
+            print(f"  芝: {info.turf.condition.value}{_cushion_text(info.turf)}")
+            moisture = _moisture_text(info.turf.moisture)
+            if moisture:
+                print(f"  芝含水率: {moisture}")
         if info.dirt:
             print(f"  ダート: {info.dirt.condition.value}")
+            moisture = _moisture_text(info.dirt.moisture)
+            if moisture:
+                print(f"  ダート含水率: {moisture}")
 
 
 def cmd_odds(args):

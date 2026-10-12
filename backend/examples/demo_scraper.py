@@ -35,10 +35,11 @@ def demo_jra_scraper():
         if track_info.turf:
             print(f"\nTurf Track:")
             print(f"  Condition: {track_info.turf.condition.value}")
-            if track_info.turf.cushion:
+            if track_info.turf.cushion and track_info.turf.cushion.value is not None:
+                grade = track_info.turf.cushion.grade or "区分なし"
                 print(
                     f"  Cushion Value: {track_info.turf.cushion.value} "
-                    f"({track_info.turf.cushion.hardness_level})"
+                    f"({grade}, {track_info.turf.cushion.source})"
                 )
             if track_info.turf.moisture:
                 print(
@@ -87,10 +88,11 @@ def demo_netkeiba_scraper():
         if track_info.turf:
             print(f"\nTurf Track:")
             print(f"  Condition: {track_info.turf.condition.value}")
-            if track_info.turf.cushion:
+            if track_info.turf.cushion and track_info.turf.cushion.value is not None:
+                grade = track_info.turf.cushion.grade or "区分なし"
                 print(
                     f"  Cushion Value: {track_info.turf.cushion.value} "
-                    f"({track_info.turf.cushion.hardness_level})"
+                    f"({grade}, {track_info.turf.cushion.source})"
                 )
             if track_info.turf.moisture:
                 print(

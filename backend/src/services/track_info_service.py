@@ -125,7 +125,10 @@ class TrackInfoService:
                 errors["jra"] = str(e)
                 results["jra"] = empty_track_info("JRA", "JRA baba fetch failed")
 
-        if "netkeiba" in sources:
+        # JRA 403, a foreign tab, or a page with no cushion number falls back to
+        # netkeiba's public track page for the same venue and date. The JRA
+        # payload stays the failure. Values copied from netkeiba name that source.
+        if "netkeiba" in sources or _jra_needs_netkeiba(results.get("jra")):
             try:
                 results["netkeiba"] = self.get_track_info_from_netkeiba(
                     racecourse, date
@@ -221,17 +224,37 @@ class TrackInfoService:
         merged_turf = self._merge_course_info(jra_info.turf, netkeiba_info.turf)
         merged_dirt = self._merge_course_info(jra_info.dirt, netkeiba_info.dirt)
 
+        weather = jra_info.weather
+        weather_source = jra_info.weather_source
+        weather_fetched_at = jra_info.weather_fetched_at
+        if jra_info.weather.value == "不明":
+            weather = netkeiba_info.weather
+            weather_source = netkeiba_info.weather_source
+            weather_fetched_at = netkeiba_info.weather_fetched_at
+        post_time = jra_info.post_time or netkeiba_info.post_time
+        post_source = (
+            jra_info.post_time_source if jra_info.post_time else netkeiba_info.post_time_source
+        )
+        post_fetched = (
+            jra_info.post_time_fetched_at
+            if jra_info.post_time
+            else netkeiba_info.post_time_fetched_at
+        )
         return TrackInfo(
             racecourse=jra_info.racecourse or netkeiba_info.racecourse,
             date=jra_info.date or netkeiba_info.date,
-            weather=jra_info.weather
-            if jra_info.weather.value != "不明"
-            else netkeiba_info.weather,
+            weather=weather,
+            weather_source=weather_source,
+            weather_fetched_at=weather_fetched_at,
             turf=merged_turf,
             dirt=merged_dirt,
-            grass_info=jra_info.grass_info,
-            weekly_info=jra_info.weekly_info,
+            grass_info=jra_info.grass_info or netkeiba_info.grass_info,
+            weekly_info=jra_info.weekly_info or netkeiba_info.weekly_info,
             source="JRA+Netkeiba",
+            warning=join_track_warnings(jra_info.warning, netkeiba_info.warning),
+            post_time=post_time,
+            post_time_source=post_source,
+            post_time_fetched_at=post_fetched,
             scraped_at=datetime.now(),
         )
 
@@ -258,14 +281,22 @@ class TrackInfoService:
                 )
 
         merged_cushion = primary.cushion
-        if merged_cushion is None:
-            merged_cushion = secondary.cushion
+        if merged_cushion is None or merged_cushion.value is None:
+            if secondary.cushion is not None and secondary.cushion.value is not None:
+                merged_cushion = secondary.cushion
 
+        use_secondary_going = primary.condition.value == "不明"
         return CourseInfo(
             course_type=primary.course_type,
-            condition=primary.condition
-            if primary.condition.value != "不明"
-            else secondary.condition,
+            condition=secondary.condition if use_secondary_going else primary.condition,
+            condition_source=(
+                secondary.condition_source if use_secondary_going else primary.condition_source
+            ),
+            condition_fetched_at=(
+                secondary.condition_fetched_at
+                if use_secondary_going
+                else primary.condition_fetched_at
+            ),
             moisture=merged_moisture,
             cushion=merged_cushion,
         )
@@ -283,3 +314,19 @@ class TrackInfoService:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+
+def _jra_needs_netkeiba(info: TrackInfo | None) -> bool:
+    """True when JRA did not publish a cushion number for the requested meeting."""
+    if info is None or info.racecourse is None:
+        return True
+    cushion = info.turf.cushion if info.turf is not None else None
+    return cushion is None or cushion.value is None
+
+
+def join_track_warnings(*parts: str | None) -> str | None:
+    """Keep both reasons when a merged track still has a hole."""
+    items = [part for part in parts if part]
+    if not items:
+        return None
+    return "; ".join(dict.fromkeys(items))

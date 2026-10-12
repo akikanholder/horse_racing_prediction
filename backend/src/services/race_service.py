@@ -600,6 +600,12 @@ class RaceService:
             race_number=race1.race_number,
             race_date=race1.race_date,
             post_time=race2.post_time or race1.post_time,
+            post_time_source=(
+                race2.post_time_source if race2.post_time else race1.post_time_source
+            ),
+            post_time_fetched_at=(
+                race2.post_time_fetched_at if race2.post_time else race1.post_time_fetched_at
+            ),
             venue=race1.venue,
             venue_code=race1.venue_code or race2.venue_code,
             round_number=race1.round_number or race2.round_number,

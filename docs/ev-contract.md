@@ -101,7 +101,9 @@ python -m backend.cli odds 202605030811 --bet-types win --prefer yoso --json
 | `races` | `Race` の配列 | 空配列があり得る |
 | `fetched_at` | 取得時刻 | 必須 |
 
-`Race` の主なフィールド: `race_id`, `race_name`, `race_number`, `race_date`, `post_time`, `venue`, `venue_code`, `round_number`, `day_number`, `distance`, `track_type`（芝/ダート/障害）, `direction`, `track_condition`（良/稍重/重/不良）, `weather`, `race_class`, `race_grade`, `age_condition`, `sex_condition`, `weight_condition`, `prize_money`（1着、万円）, `entry_count`。
+`Race` の主なフィールド: `race_id`, `race_name`, `race_number`, `race_date`, `post_time`, `post_time_source`, `post_time_fetched_at`, `venue`, `venue_code`, `round_number`, `day_number`, `distance`, `track_type`（芝/ダート/障害）, `direction`, `track_condition`（良/稍重/重/不良）, `weather`, `race_class`, `race_grade`, `age_condition`, `sex_condition`, `weight_condition`, `prize_money`（1着、万円）, `entry_count`。
+
+`post_time` は印字された発走時刻。`15時30分` や `15:45発走` は `15:30+09:00` のように Asia/Tokyo のオフセット付きで持つ。発走の語が無い時計（測定の `7時00分` など）は入れない。無ければ null。`post_time_source` は `jra_html` または `netkeiba_html`。`post_time_fetched_at` はその値を得た時刻。
 
 週次一覧の `track_bias` は null。そこでは当日バイアスを判定しない。
 
@@ -633,11 +635,17 @@ python -m backend.cli result 202605030811 --json
 
 `WeeklyVenueSchedule`: `venue`, `venue_code`, `dates`, `round_number`, `conditions`, `fetched_at`。
 
-`TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` または `Netkeiba`。オッズの `source` とは別の語）, `warning`, `scraped_at`。
+`TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `weather_source`, `weather_fetched_at`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` / `Netkeiba` / `JRA+Netkeiba`。オッズの `source` とは別の語）, `warning`, `post_time`, `post_time_source`, `post_time_fetched_at`, `scraped_at`。
 
-芝/ダートの `condition` は 良/稍重/重/不良/不明。`moisture` は `goal_front` と `fourth_corner`。`cushion.value` が null のとき硬さは「不明」。`grass_info.course_name` は使用コース（A/B/C）。バイアスにはしない。`merge=true` のとき、場が取れたソースがある場合だけ統合結果はキー `merged`。
+芝/ダートの `condition` は 良/稍重/重/不良/不明。印字された馬場状態には `condition_source` と `condition_fetched_at` が付く。`moisture.goal_front` と `fourth_corner` は印字された含水率のまま。凡例や馬場状態からは作らない。`cushion.value` は印字されたクッション値の数値。硬度目盛の 12 / 10 / 8 / 7 や「硬め」は入れない。`cushion.grade` は同じ欄に印字された区分だけ。数値や目盛から区分は計算しない。印字が無ければ null。数値がページに無いときは `warning` に `cushion value was not on the page` を足す。`grass_info.course_name` は使用コース（A/B/C）。バイアスにはしない。`merge=true` のとき、場が取れたソースがある場合だけ統合結果はキー `merged`。
 
-JRA は個別の `/keiba/baba/{venue}.html` を見ない。当週の `index.html` と `index2.html`（cp932）だけ。タイトル `馬場情報（○○競馬場）` が依頼した場のタブだけを読む。403、タイトルの無い本文、別場のタブでは `racecourse` も `date` も null。`turf.cushion` と `turf.moisture` / `dirt.moisture` も null。`warning` は `JRA baba returned 403`、`JRA baba page is not the requested meeting`、`JRA baba page could not be parsed`、`JRA baba fetch failed` のいずれか。netkeiba の馬場も、選択中のタブが依頼した場のときだけ数値を写す。失敗しても HTTP は 200 で、この形の JSON を返す。`cli track --json` は見出しを混ぜず、このオブジェクトだけを出す。クッション値・含水率・馬場状態は 403 本文やレース名からは作らない。
+クッション値、含水率、馬場状態、天候、発走時刻の各値は、得た方法を `source`（`jra_html` / `jra_js` / `netkeiba_html` / `netkeiba_js` / `headless`）と `fetched_at` で持つ。`headless` は Playwright。ブラウザが無いときは `headless browser is not installed` を警告して、その段で止める。403 とログイン画面もそこで止め、User-Agent の差し替え、captcha、ログインはしない。
+
+JRA は個別の `/keiba/baba/{venue}.html` を見ない。当週の `index.html` と `index2.html`（cp932）だけ。タイトル `馬場情報（○○競馬場）` が依頼した場のタブだけを読む。HTML が取れて `#cushion_num` が空のときは、そのページ自身のスクリプトが呼ぶ同一サイトの `_data_cushion.html` を次に読む。`_data_moist.html` は、HTML の含水率欄が空のときだけ埋める。印字済みの含水率は上書きしない。目盛表 `#cushion_relation` は使わない。`/JRADB/accessJ.html` は追わない。403、タイトルの無い本文、別場のタブでは、その JRA オブジェクトの `racecourse` も `date` も null。`turf.cushion` と `turf.moisture` / `dirt.moisture` も null。`warning` は `JRA baba returned 403`、`JRA baba requires login`、`JRA baba page is not the requested meeting`、`JRA baba page could not be parsed`、`JRA baba fetch failed` のいずれか。
+
+JRA が 403、またはクッション値の数値が無いときは、同じ場・同じ日の netkeiba 公開ページへ戻る。`sources` が `jra` だけのときも `netkeiba` キーを足す。JRA 側のオブジェクトは 403 の null のまま。netkeiba も、選択中のタブが依頼した場のときだけ数値を写す。HTML、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、任意のヘッドレス描画の順。403 とログインは止め、`netkeiba track returned 403` または `netkeiba track requires login`。失敗しても HTTP は 200 で、この形の JSON を返す。`cli track --json` は見出しを混ぜず、このオブジェクトだけを出す。クッション値・含水率・馬場状態は 403 本文やレース名からは作らない。
+
+`post_time` は出馬表と同じく、印字された発走時刻を `15:40+09:00`（Asia/Tokyo）で持つ。`post_time_source` と `post_time_fetched_at` が付く。発走が印字されていなければ null。測定時刻は発走時刻にしない。
 
 掲載が無くソース自体が空のときの HTTP は 404。
 

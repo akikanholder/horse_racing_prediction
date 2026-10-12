@@ -120,7 +120,7 @@ python -m backend.cli courses --venue 東京
 # 開催競馬場を取得
 python -m backend.cli venues
 
-# 馬場情報を取得（--json は TrackInfo だけ。403 でも cushion / moisture は null）
+# 馬場情報を取得（--json は TrackInfo だけ。JRA が 403 のとき jra の cushion / moisture は null。同じ場・日は netkeiba の公開ページへ戻る）
 python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
 python -m backend.cli track --venue 東京 --json
@@ -271,7 +271,7 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 - 通信失敗: `day-of track bias fetch failed`
 - 片方だけ: `day-of pace bias not published` または `day-of inside/outside bias not published`
 
-認証用の環境変数は無い。accessD も馬場情報も公開ページ。403 は資格情報不足ではなく、Akamai がデータセンターの IP を止めたとき。個別の `/keiba/baba/{venue}.html` は 403 になることがあるので、当週の `index.html` / `index2.html` だけを見る。
+認証用の環境変数は無い。accessD も馬場情報も公開ページ。403 は資格情報不足ではなく、Akamai がデータセンターの IP を止めたとき。個別の `/keiba/baba/{venue}.html` は 403 になることがあるので、当週の `index.html` / `index2.html` だけを見る。馬場ページが 403 のときは、その JRA の値は null のまま、同じ場・日の netkeiba 公開ページ（クッション値、含水率、馬場、天候、発走時刻）へ戻る。403 の回避、captcha、ログインはしない。
 
 - 出馬表と `GET /api/races/{race_id}` の `race.track_bias` は、条件を写したうえで上記を取りにいく。
 - 出走馬一覧の各馬にも同じオブジェクトを載せる。

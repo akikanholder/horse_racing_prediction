@@ -422,7 +422,7 @@ def _track_row(info: TrackInfo) -> dict:
         "racecourse": info.racecourse,
         "date": info.date.date().isoformat()
         if isinstance(info.date, datetime)
-        else str(info.date),
+        else ("" if info.date is None else str(info.date)),
         "weather": info.weather.value,
         "source": info.source,
         "scraped_at": info.scraped_at.isoformat(),
@@ -432,7 +432,7 @@ def _track_row(info: TrackInfo) -> dict:
         if turf and turf.moisture
         else "",
         "turf_cushion": _cell(cushion.value) if cushion else "",
-        "turf_cushion_hardness": cushion.hardness_level if cushion else "",
+        "turf_cushion_hardness": (cushion.grade or "") if cushion else "",
         "dirt_condition": dirt.condition.value if dirt else "",
         "dirt_moisture_goal": _cell(dirt.moisture.goal_front) if dirt and dirt.moisture else "",
         "dirt_moisture_corner": _cell(dirt.moisture.fourth_corner)
