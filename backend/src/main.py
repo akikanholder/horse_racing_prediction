@@ -128,6 +128,10 @@ async def get_race_history_span(
     ] = None,
     flat_only: Annotated[bool, Query(description="障害を除く。既定は true")] = True,
     priority_venues: Annotated[bool, Query(description="東京・京都・中山・阪神だけ")] = False,
+    resume_from: Annotated[
+        str | None,
+        Query(description="このレースIDから再開する。それより前はキャッシュだけ"),
+    ] = None,
 ):
     """2025年以降の平地レースを、日付または日付範囲で返す。
 
@@ -147,6 +151,7 @@ async def get_race_history_span(
             venues=venue,
             flat_only=flat_only,
             priority_venues=priority_venues,
+            resume_from=resume_from,
         )
     except Exception as e:
         logger.error(f"Failed to get historical races: {e}")
@@ -161,6 +166,7 @@ async def export_race_history(
     venue: Annotated[list[str] | None, Query()] = None,
     flat_only: Annotated[bool, Query()] = True,
     priority_venues: Annotated[bool, Query()] = False,
+    resume_from: Annotated[str | None, Query()] = None,
     export_format: Annotated[
         Literal["jsonl", "csv"],
         Query(alias="format", description="jsonl は1レース1行。csv は馬の行と芝・ダート別"),
@@ -182,6 +188,7 @@ async def export_race_history(
             venues=venue,
             flat_only=flat_only,
             priority_venues=priority_venues,
+            resume_from=resume_from,
         )
         return race_service.export_historical_races(
             batch, str(_history_output_dir()), export_format

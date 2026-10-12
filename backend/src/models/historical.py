@@ -77,8 +77,22 @@ class HistoricalBatch(BaseModel):
     venues: list[str] = Field(default_factory=list, description="指定した競馬場。空は全場")
     date_from: date | None = Field(None, description="取得した最初の日。race_id だけのときは null")
     date_to: date | None = Field(None, description="取得した最後の日。race_id だけのときは null")
+    stopped_at_race_id: str | None = Field(
+        None,
+        description="403 またはログイン画面で止めたレースID。開催一覧で止めたとき、または止まっていないときは null",
+    )
+    completed_race_ids: list[str] = Field(
+        default_factory=list,
+        description="この実行で取り終えた範囲内のレースID。止めたレースは含めない",
+    )
+    remaining_race_ids: list[str] = Field(
+        default_factory=list,
+        description="まだ取っていないレースID。止めたレースを先頭に、一覧の順",
+    )
     fetched_at: datetime = Field(..., description="この一覧を組み立てた時刻")
-    warning: str | None = Field(None, description="日付が 2025 より前、または取りこぼしの理由")
+    warning: str | None = Field(
+        None, description="日付が 2025 より前、403、ログイン画面、または取りこぼしの理由"
+    )
 
 
 class HistoricalExport(BaseModel):
@@ -90,3 +104,13 @@ class HistoricalExport(BaseModel):
     race_count: int = Field(..., description="書いたレース数。範囲外は入れない")
     row_count: int = Field(..., description="走った行数。jsonl はレース数、csv は馬の行数")
     surfaces: list[str] = Field(default_factory=list, description="ファイルに入った芝・ダート")
+    stopped_at_race_id: str | None = Field(
+        None, description="403 またはログイン画面で止めたレースID。止まっていなければ null"
+    )
+    completed_race_ids: list[str] = Field(
+        default_factory=list, description="書き出した範囲内のレースID"
+    )
+    remaining_race_ids: list[str] = Field(
+        default_factory=list, description="まだ取っていないレースID。止めたレースを先頭にする"
+    )
+    warning: str | None = Field(None, description="停止理由。progress.json にも同じ文を書く")

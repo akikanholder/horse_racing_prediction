@@ -562,6 +562,7 @@ def cmd_history(args):
             flat_only=args.flat_only,
             priority_venues=args.priority_venues,
             delay_seconds=args.delay,
+            resume_from=args.resume_from,
         )
         if args.export:
             output = Path(args.output) if args.output else _default_history_dir()
@@ -596,6 +597,10 @@ def _print_history(batch: HistoricalBatch) -> None:
     print(f"平地のみ: {'はい' if batch.flat_only else 'いいえ'}")
     if batch.warning:
         print(f"警告: {batch.warning}")
+    if batch.stopped_at_race_id or batch.remaining_race_ids:
+        print(f"停止: {batch.stopped_at_race_id or 'レースIDなし'}")
+        print(f"完了: {', '.join(batch.completed_race_ids) or 'なし'}")
+        print(f"残り: {', '.join(batch.remaining_race_ids) or 'なし'}")
     for race in batch.races:
         _print_historical_race(race)
 
@@ -766,6 +771,9 @@ def main():
             "確定オッズはページが確定オッズと出すか、レース後のページのときだけ。"
             "発売中のオッズは確定にしない。欠測は null と警告。"
             "日付の範囲は1レースずつ、間隔を空け、ページはローカルにキャッシュする。"
+            "結果ページか開催一覧の 403 とログイン画面で止める。同じ実行では再試行しない。"
+            "再実行はキャッシュ済みのレースを取り直さず、止めたレースから続ける。"
+            "--resume-from はそれより前をキャッシュだけにする。"
             "--venue で競馬場を絞る。--priority-venues は東京・京都・中山・阪神。"
             "--flat-only が既定。障害は --no-flat-only。"
             "--export jsonl か csv は芝・ダートで校正できる形。"
@@ -790,6 +798,10 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="障害を除く（既定）。--no-flat-only で障害も残す",
+    )
+    history_parser.add_argument(
+        "--resume-from",
+        help="このレースIDからネットワークを開く。それより前はキャッシュだけ",
     )
     history_parser.add_argument(
         "--delay",

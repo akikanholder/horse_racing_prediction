@@ -37,8 +37,13 @@ from backend.scrapers.final_odds import (
 )
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
-from backend.scrapers.netkeiba_scraper import NetkeibaScraper
+from backend.scrapers.netkeiba_scraper import (
+    RACE_RESULT_FORBIDDEN,
+    RACE_RESULT_LOGIN,
+    NetkeibaScraper,
+)
 from backend.scrapers.page_cache import CachingHTTPClient, default_page_cache_dir
+from backend.scrapers.page_fallback import AccessBlocked
 from backend.scrapers.runner_status import flag_quotes, join_warnings, merge_non_runners
 
 logger = logging.getLogger(__name__)
@@ -139,19 +144,38 @@ class HistoricalService:
         venues: Sequence[str] | None = None,
         flat_only: bool = True,
         priority_venues: bool = False,
+        resume_from: str | None = None,
     ) -> HistoricalBatch:
         """One race, one day, or an inclusive date range.
 
         Dates before 2025 are not requested. Races are fetched one after another
         with ``delay_seconds`` between them. A direct ``race_id`` is returned
         even when it is out of scope, with ``in_scope`` false.
+
+        A 403 or a login wall on the race list or the result page stops the
+        range. That request is not retried, and later races are not opened.
+        Pages already stored in the cache are not requested again. ``resume_from``
+        loads earlier races from the cache only.
         """
         fetched_at = datetime.now()
         selected = _venue_filter(venues, priority_venues)
         if race_id:
-            record = self._one(race_id, fetched_at)
+            record, blocked = self._one(race_id, fetched_at)
             record = _apply_scope(record, venues=selected, flat_only=flat_only)
-            warning = None if record.in_scope else record.warning
+            if blocked:
+                return HistoricalBatch(
+                    races=[record],
+                    skipped=0,
+                    flat_only=flat_only,
+                    venues=list(selected),
+                    date_from=None,
+                    date_to=None,
+                    stopped_at_race_id=race_id,
+                    completed_race_ids=[],
+                    remaining_race_ids=[race_id],
+                    fetched_at=fetched_at,
+                    warning=_stop_line(race_id, record.result.warning),
+                )
             return HistoricalBatch(
                 races=[record],
                 skipped=0,
@@ -159,8 +183,11 @@ class HistoricalService:
                 venues=list(selected),
                 date_from=None,
                 date_to=None,
+                stopped_at_race_id=None,
+                completed_race_ids=[race_id] if record.in_scope else [],
+                remaining_race_ids=[],
                 fetched_at=fetched_at,
-                warning=warning,
+                warning=None if record.in_scope else record.warning,
             )
 
         start, end, range_warning = _resolve_span(on_date, date_from, date_to)
@@ -172,18 +199,26 @@ class HistoricalService:
                 venues=list(selected),
                 date_from=None,
                 date_to=None,
+                stopped_at_race_id=None,
+                completed_race_ids=[],
+                remaining_race_ids=[],
                 fetched_at=fetched_at,
                 warning=range_warning or "historical races start in 2025",
             )
         races: list[HistoricalRace] = []
         skipped = 0
         notes: list[str | None] = [range_warning]
-        first = True
+        planned: list[str] = []
         day = start
         while day <= end:
             try:
                 listed = self.netkeiba.get_races_by_date(day)
             except Exception as exc:
+                block = _list_block_warning(exc)
+                if block is not None:
+                    logger.warning("Race list blocked for %s: %s", day, exc)
+                    notes.append(block)
+                    break
                 logger.warning("Race list failed for %s: %s", day, exc)
                 notes.append(f"race list failed for {day.isoformat()}")
                 listed = []
@@ -191,27 +226,72 @@ class HistoricalService:
                 if not _list_row_in_play(race, selected, flat_only):
                     skipped += 1
                     continue
-                if not first and self.delay_seconds > 0:
-                    self._sleeper(self.delay_seconds)
-                first = False
-                record = self._one(race.race_id, datetime.now())
-                record = _apply_scope(record, venues=selected, flat_only=flat_only)
-                if record.in_scope:
-                    races.append(record)
-                else:
-                    skipped += 1
+                if race.race_id not in planned:
+                    planned.append(race.race_id)
             day += timedelta(days=1)
+        start_at = 0
+        if resume_from:
+            if resume_from not in planned:
+                notes.append(f"resume-from race was not in the range: {resume_from}")
+                return self._batch(
+                    races=[],
+                    skipped=skipped,
+                    flat_only=flat_only,
+                    selected=selected,
+                    start=start,
+                    end=end,
+                    fetched_at=fetched_at,
+                    notes=notes,
+                    stopped_at=None,
+                    completed=[],
+                    remaining=list(planned),
+                )
+            start_at = planned.index(resume_from)
+            missed = [
+                planned_id
+                for planned_id in planned[:start_at]
+                if not self._result_cached(planned_id)
+            ]
+            if missed:
+                notes.append("resume left uncached races: " + ", ".join(missed))
+        completed: list[str] = []
+        stopped_at: str | None = None
+        remaining: list[str] = []
+        network_started = False
+        for index, planned_id in enumerate(planned):
+            cached = self._result_cached(planned_id)
+            if index < start_at and not cached:
+                continue
+            if not cached:
+                if network_started and self.delay_seconds > 0:
+                    self._sleeper(self.delay_seconds)
+                network_started = True
+            record, blocked = self._one(planned_id, datetime.now())
+            record = _apply_scope(record, venues=selected, flat_only=flat_only)
+            if blocked:
+                notes.append(_stop_line(planned_id, record.result.warning))
+                stopped_at = planned_id
+                remaining = planned[index:]
+                break
+            if record.in_scope:
+                races.append(record)
+                completed.append(planned_id)
+            else:
+                skipped += 1
         if skipped:
             notes.append(f"excluded {skipped} races outside the flat 2025 venue filter")
-        return HistoricalBatch(
+        return self._batch(
             races=races,
             skipped=skipped,
             flat_only=flat_only,
-            venues=list(selected),
-            date_from=start,
-            date_to=end,
+            selected=selected,
+            start=start,
+            end=end,
             fetched_at=fetched_at,
-            warning=join_warnings(*notes),
+            notes=notes,
+            stopped_at=stopped_at,
+            completed=completed,
+            remaining=remaining,
         )
 
     @staticmethod
@@ -228,16 +308,18 @@ class HistoricalService:
         for surface in ("芝", "ダート"):
             if surface in present:
                 surfaces.append(surface)
+        progress = _write_progress(directory / "progress.json", batch)
         if fmt == "jsonl":
             path = directory / "historical.jsonl"
             with path.open("w", encoding="utf-8") as handle:
                 for race in chosen:
                     handle.write(json.dumps(race.model_dump(mode="json"), ensure_ascii=False))
                     handle.write("\n")
-            return HistoricalExport(
-                format="jsonl",
-                directory=str(directory),
-                paths=[str(path)],
+            return _export_result(
+                batch,
+                fmt="jsonl",
+                directory=directory,
+                paths=[str(path), progress],
                 race_count=len(chosen),
                 row_count=len(chosen),
                 surfaces=surfaces,
@@ -248,21 +330,60 @@ class HistoricalService:
         for surface in surfaces:
             surface_rows = [row for row in flat_rows if row["surface"] == surface]
             paths.append(_write_csv(directory / f"runners_{surface}.csv", surface_rows))
-        return HistoricalExport(
-            format="csv",
-            directory=str(directory),
+        paths.append(progress)
+        return _export_result(
+            batch,
+            fmt="csv",
+            directory=directory,
             paths=paths,
             race_count=len(chosen),
             row_count=len(flat_rows),
             surfaces=surfaces,
         )
 
-    def _one(self, race_id: str, fetched_at: datetime) -> HistoricalRace:
+    def _batch(
+        self,
+        *,
+        races: list[HistoricalRace],
+        skipped: int,
+        flat_only: bool,
+        selected: list[str],
+        start: date,
+        end: date,
+        fetched_at: datetime,
+        notes: list[str | None],
+        stopped_at: str | None,
+        completed: list[str],
+        remaining: list[str],
+    ) -> HistoricalBatch:
+        return HistoricalBatch(
+            races=races,
+            skipped=skipped,
+            flat_only=flat_only,
+            venues=list(selected),
+            date_from=start,
+            date_to=end,
+            stopped_at_race_id=stopped_at,
+            completed_race_ids=completed,
+            remaining_race_ids=remaining,
+            fetched_at=fetched_at,
+            warning=join_warnings(*notes),
+        )
+
+    def _one(self, race_id: str, fetched_at: datetime) -> tuple[HistoricalRace, bool]:
         stamped = self._cached_stamp(race_id) or fetched_at
         settled = self.netkeiba.get_settled_race_result(race_id, fetched_at=stamped)
-        final_quotes, odds_runners, odds_source, odds_warning, odds_final = self._final_odds(
-            race_id, settled
-        )
+        blocked = _is_result_block(settled.warning)
+        if blocked:
+            final_quotes = None
+            odds_runners = None
+            odds_source = None
+            odds_warning = None
+            odds_final = False
+        else:
+            final_quotes, odds_runners, odds_source, odds_warning, odds_final = self._final_odds(
+                race_id, settled
+            )
         runners = merge_non_runners(
             [
                 None
@@ -315,7 +436,18 @@ class HistoricalService:
             source=_join_source(settled.source, odds_source),
             fetched_at=stamped,
             warning=warning,
-        )
+        ), blocked
+
+    def _result_cached(self, race_id: str) -> bool:
+        """True when the result page is already on disk. A 403 is not cached."""
+        client = self.http
+        if client is None:
+            candidate = getattr(self.netkeiba, "http_client", None)
+            if isinstance(candidate, CachingHTTPClient):
+                client = candidate
+        if client is None:
+            return False
+        return client.cached_fetched_at("GET", RESULT_URL, {"race_id": race_id}) is not None
 
     def _final_odds(
         self,
@@ -415,6 +547,70 @@ class HistoricalService:
         if self.http is None:
             return None
         return self.http.cached_fetched_at("GET", RESULT_URL, {"race_id": race_id})
+
+
+def _is_result_block(warning: str | None) -> bool:
+    """A refused result page stops the range. Odds gaps do not."""
+    if not warning:
+        return False
+    return RACE_RESULT_FORBIDDEN in warning or RACE_RESULT_LOGIN in warning
+
+
+def _stop_line(race_id: str, warning: str | None) -> str:
+    if warning and RACE_RESULT_LOGIN in warning:
+        reason = RACE_RESULT_LOGIN
+    else:
+        reason = RACE_RESULT_FORBIDDEN
+    return f"stopped at {race_id}: {reason}"
+
+
+def _list_block_warning(exc: Exception) -> str | None:
+    """403 and a login wall stop the date list. Other errors do not."""
+    if isinstance(exc, AccessBlocked):
+        if exc.status == 403:
+            return "race list returned 403"
+        return "race list requires login"
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403:
+        return "race list returned 403"
+    if status == 401:
+        return "race list requires login"
+    return None
+
+
+def _write_progress(path: Path, batch: HistoricalBatch) -> str:
+    payload = {
+        "stopped_at_race_id": batch.stopped_at_race_id,
+        "completed_race_ids": batch.completed_race_ids,
+        "remaining_race_ids": batch.remaining_race_ids,
+        "warning": batch.warning,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _export_result(
+    batch: HistoricalBatch,
+    *,
+    fmt: Literal["jsonl", "csv"],
+    directory: Path,
+    paths: list[str],
+    race_count: int,
+    row_count: int,
+    surfaces: list[str],
+) -> HistoricalExport:
+    return HistoricalExport(
+        format=fmt,
+        directory=str(directory),
+        paths=paths,
+        race_count=race_count,
+        row_count=row_count,
+        surfaces=surfaces,
+        stopped_at_race_id=batch.stopped_at_race_id,
+        completed_race_ids=list(batch.completed_race_ids),
+        remaining_race_ids=list(batch.remaining_race_ids),
+        warning=batch.warning,
+    )
 
 
 def _venue_filter(venues: Sequence[str] | None, priority: bool) -> list[str]:

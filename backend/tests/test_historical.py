@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from backend.cli import main as cli_main
 from backend.main import app
 from backend.models.odds import RaceOdds
-from backend.models.race import Race
+from backend.models.race import Race, SettledRaceResult
 from backend.scrapers.final_odds import (
     FINAL_ODDS_NOT_CONFIRMED,
     PublicOddsPages,
@@ -23,7 +23,12 @@ from backend.scrapers.jra_scraper import JRAScraper, _ParsedRaceCname
 from backend.scrapers.netkeiba_odds_scraper import parse_netkeiba_place_odds
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
-from backend.scrapers.page_fallback import FetchedBody, headless_browser_installed, render_headless
+from backend.scrapers.page_fallback import (
+    AccessBlocked,
+    FetchedBody,
+    headless_browser_installed,
+    render_headless,
+)
 from backend.services.historical_service import HistoricalService
 from backend.services.race_service import RaceService
 
@@ -673,6 +678,436 @@ def test_history_span_requires_a_date():
     with TestClient(app) as client:
         response = client.get("/api/races/history")
     assert response.status_code == 400
+
+
+def _listed_race(race_id: str, venue: str = "東京") -> Race:
+    return Race(
+        race_id=race_id,
+        race_name="平地",
+        race_number=int(race_id[-2:]),
+        race_date=date(2025, 3, 1),
+        venue=venue,
+        distance=1600,
+        track_type="芝",
+    )
+
+
+def _blocked_result(race_id: str, warning: str) -> SettledRaceResult:
+    return SettledRaceResult(race_id=race_id, fetched_at=FETCHED, warning=warning)
+
+
+def test_date_range_stops_on_403_and_does_not_retry_or_open_later_races(tmp_path: Path):
+    seen: list[str] = []
+    odds = _Odds(phase="pre")
+    jra = _JraPages(None)
+    ids = ["202505010101", "202505010102", "202505010103"]
+
+    class _List:
+        def get_races_by_date(self, target):
+            assert target == date(2025, 3, 1)
+            return [_listed_race(race_id) for race_id in ids]
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            if race_id == ids[1]:
+                return _blocked_result(race_id, "race result returned 403")
+            html = _result_html(
+                _runner("1", 1, "アルファ", "2.4", "1"),
+                surface="芝1600m",
+                going="良",
+                race_class="未勝利",
+                venue="東京",
+                heads=1,
+            )
+            scraper = NetkeibaScraper(http_client=_QuietHTTP(html), headless_render="off")  # type: ignore[arg-type]
+            return scraper.get_settled_race_result(race_id, fetched_at=fetched_at)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=jra,  # type: ignore[arg-type]
+        odds=odds,
+        delay_seconds=1.5,
+        sleeper=lambda _seconds: None,
+    )
+    batch = service.get(on_date=date(2025, 3, 1))
+    assert seen == ids[:2]
+    assert seen.count(ids[1]) == 1
+    assert jra.calls == [ids[0]]
+    assert odds.calls == []
+    assert batch.stopped_at_race_id == ids[1]
+    assert batch.completed_race_ids == [ids[0]]
+    assert batch.remaining_race_ids == ids[1:]
+    assert batch.warning is not None
+    assert "stopped at 202505010102: race result returned 403" in batch.warning
+    assert [race.race_id for race in batch.races] == [ids[0]]
+
+    exported = service.export(batch, tmp_path, "jsonl")
+    progress = json.loads((tmp_path / "progress.json").read_text(encoding="utf-8"))
+    assert progress["stopped_at_race_id"] == ids[1]
+    assert progress["completed_race_ids"] == [ids[0]]
+    assert progress["remaining_race_ids"] == ids[1:]
+    assert "returned 403" in progress["warning"]
+    assert exported.stopped_at_race_id == ids[1]
+    assert exported.completed_race_ids == [ids[0]]
+    assert exported.remaining_race_ids == ids[1:]
+    assert exported.warning == batch.warning
+    csv_export = service.export(batch, tmp_path / "csv", "csv")
+    csv_progress = json.loads((tmp_path / "csv" / "progress.json").read_text(encoding="utf-8"))
+    assert csv_progress["remaining_race_ids"] == ids[1:]
+    assert csv_export.stopped_at_race_id == ids[1]
+
+
+def test_login_wall_stops_the_range_without_a_second_request():
+    seen: list[str] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            return [_listed_race("202505010101"), _listed_race("202505010102")]
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            if race_id.endswith("02"):
+                return _blocked_result(race_id, "race result requires login")
+            html = _result_html(
+                _runner("1", 1, "アルファ", "2.0", "1"),
+                surface="芝1600m",
+                going="良",
+                race_class="未勝利",
+                venue="東京",
+                heads=1,
+            )
+            scraper = NetkeibaScraper(http_client=_QuietHTTP(html), headless_render="off")  # type: ignore[arg-type]
+            return scraper.get_settled_race_result(race_id, fetched_at=fetched_at)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2025, 3, 1))
+    assert seen == ["202505010101", "202505010102"]
+    assert batch.stopped_at_race_id == "202505010102"
+    assert batch.completed_race_ids == ["202505010101"]
+    assert batch.remaining_race_ids == ["202505010102"]
+    assert batch.warning is not None
+    assert "requires login" in batch.warning
+
+
+def test_race_list_403_does_not_open_later_days_or_results():
+    listed: list[date] = []
+    seen: list[str] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            listed.append(target)
+            if target == date(2025, 3, 2):
+                raise _http_error(403)
+            return [_listed_race("202505010101")]
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            html = _result_html(
+                _runner("1", 1, "アルファ", "2.0", "1"),
+                surface="芝1600m",
+                going="良",
+                race_class="未勝利",
+                venue="東京",
+                heads=1,
+            )
+            scraper = NetkeibaScraper(http_client=_QuietHTTP(html), headless_render="off")  # type: ignore[arg-type]
+            return scraper.get_settled_race_result(race_id, fetched_at=fetched_at)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(phase="pre"),
+        delay_seconds=0,
+    )
+    batch = service.get(date_from=date(2025, 3, 1), date_to=date(2025, 3, 3))
+    assert listed == [date(2025, 3, 1), date(2025, 3, 2)]
+    assert seen == ["202505010101"]
+    assert batch.stopped_at_race_id is None
+    assert batch.completed_race_ids == ["202505010101"]
+    assert batch.remaining_race_ids == []
+    assert batch.warning == "race list returned 403"
+
+
+def test_jra_odds_403_does_not_stop_the_date_range():
+    seen: list[str] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            return [_listed_race("202505010101"), _listed_race("202505010102")]
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            html = _result_html(
+                _runner("1", 1, "アルファ", "2.0", "1"),
+                surface="芝1600m",
+                going="良",
+                race_class="未勝利",
+                venue="東京",
+                heads=1,
+            )
+            scraper = NetkeibaScraper(http_client=_QuietHTTP(html), headless_render="off")  # type: ignore[arg-type]
+            return scraper.get_settled_race_result(race_id, fetched_at=fetched_at)
+
+        def close(self):
+            return None
+
+    class _BlockedJra:
+        def fetch_odds_pages(self, race_id, fetched_at=None):
+            return PublicOddsPages([], "JRA odds returned 403", True)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_BlockedJra(),  # type: ignore[arg-type]
+        odds=_Odds(phase="pre"),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2025, 3, 1))
+    assert seen == ["202505010101", "202505010102"]
+    assert batch.stopped_at_race_id is None
+    assert batch.completed_race_ids == ["202505010101", "202505010102"]
+    assert batch.remaining_race_ids == []
+
+
+def test_race_list_login_stops_before_any_result():
+    seen: list[str] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            raise AccessBlocked(401, "requires login")
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            raise AssertionError(race_id)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2025, 3, 1))
+    assert seen == []
+    assert batch.stopped_at_race_id is None
+    assert batch.completed_race_ids == []
+    assert batch.remaining_race_ids == []
+    assert batch.warning == "race list requires login"
+
+
+def test_race_list_403_is_not_swallowed():
+    class _HTTP:
+        def get(self, url, params=None, headers=None, encoding=None):
+            raise _http_error(403)
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            raise AssertionError("post")
+
+    scraper = NetkeibaScraper(http_client=_HTTP(), headless_render="off")  # type: ignore[arg-type]
+    with pytest.raises(requests.HTTPError):
+        scraper.get_races_by_date(date(2025, 3, 1))
+
+
+def test_resume_from_skips_earlier_races_that_are_not_cached():
+    seen: list[str] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            return [
+                _listed_race(race_id)
+                for race_id in ("202505010101", "202505010102", "202505010103")
+            ]
+
+        def get_settled_race_result(self, race_id, fetched_at=None):
+            seen.append(race_id)
+            html = _result_html(
+                _runner("1", 1, "アルファ", "2.0", "1"),
+                surface="芝1600m",
+                going="良",
+                race_class="未勝利",
+                venue="東京",
+                heads=1,
+            )
+            scraper = NetkeibaScraper(http_client=_QuietHTTP(html), headless_render="off")  # type: ignore[arg-type]
+            return scraper.get_settled_race_result(race_id, fetched_at=fetched_at)
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(phase="pre"),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2025, 3, 1), resume_from="202505010102")
+    assert seen == ["202505010102", "202505010103"]
+    assert batch.completed_race_ids == ["202505010102", "202505010103"]
+    assert batch.remaining_race_ids == []
+    assert batch.warning is not None
+    assert "resume left uncached races: 202505010101" in batch.warning
+
+
+def test_rerun_uses_cached_pages_and_resumes_at_the_blocked_race(tmp_path: Path):
+    ids = ["202505010101", "202505010102", "202505010103"]
+    links = "".join(
+        f"<a href='/race/result.html?race_id={race_id}'>東京 芝1600m</a>" for race_id in ids
+    )
+    listing = f"<div class='RaceList'>{links}</div>"
+    result = _result_html(
+        _runner("1", 1, "アルファ", "2.4", "1"),
+        surface="芝1600m",
+        going="良",
+        race_class="未勝利",
+        venue="東京",
+        heads=1,
+    )
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.gets: list[tuple[str, str | None]] = []
+            self.blocked: set[str] = {ids[1]}
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            race_id = None if params is None else params.get("race_id")
+            self.gets.append((url, race_id))
+            if "race_list" in url:
+                return listing
+            if race_id in self.blocked:
+                raise _http_error(403)
+            return result
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            return "<html><body>パラメータエラー</body></html>"
+
+    transport = _Transport()
+    http = CachingHTTPClient(tmp_path, transport=transport, min_request_interval=0)
+
+    def _open() -> HistoricalService:
+        return HistoricalService(
+            netkeiba=NetkeibaScraper(http_client=http, headless_render="off"),  # type: ignore[arg-type]
+            jra=_JraPages(None),  # type: ignore[arg-type]
+            odds=_Odds(phase="pre"),
+            delay_seconds=1.5,
+            sleeper=lambda _seconds: None,
+        )
+
+    first = _open().get(on_date=date(2025, 3, 1))
+    assert first.stopped_at_race_id == ids[1]
+    assert first.completed_race_ids == [ids[0]]
+    assert first.remaining_race_ids == [ids[1], ids[2]]
+    assert [race_id for url, race_id in transport.gets if race_id == ids[0]] == [ids[0]]
+    assert [race_id for url, race_id in transport.gets if race_id == ids[1]] == [ids[1]]
+    assert ids[2] not in {race_id for _url, race_id in transport.gets}
+
+    marked = len(transport.gets)
+    second = _open().get(on_date=date(2025, 3, 1))
+    fresh = transport.gets[marked:]
+    assert second.stopped_at_race_id == ids[1]
+    assert second.completed_race_ids == [ids[0]]
+    assert [race_id for _url, race_id in fresh] == [ids[1]]
+    assert all("race_list" not in url for url, _race_id in fresh)
+
+    transport.blocked.clear()
+    marked = len(transport.gets)
+    third = _open().get(on_date=date(2025, 3, 1), resume_from=ids[1])
+    fresh = transport.gets[marked:]
+    assert [race_id for _url, race_id in fresh if race_id] == [ids[1], ids[2]]
+    assert third.stopped_at_race_id is None
+    assert third.completed_race_ids == ids
+    assert third.remaining_race_ids == []
+
+
+def test_history_passes_resume_from(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _Service:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get_historical_races(self, **kwargs):
+            captured.update(kwargs)
+            return _service(
+                _result_html(
+                    _runner("1", 1, "アルファ", "2.4", "1"),
+                    surface="芝1600m",
+                    going="良",
+                    race_class="オープン",
+                    venue="東京",
+                    heads=1,
+                ),
+                None,
+            ).get(race_id=RACE_ID)
+
+        def export_historical_races(self, batch, directory, fmt):
+            raise AssertionError("not requested")
+
+    monkeypatch.setattr("backend.cli.RaceService", lambda: _Service())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backend.cli",
+            "history",
+            "--date",
+            "2025-03-01",
+            "--resume-from",
+            "202505010102",
+            "--json",
+        ],
+    )
+    cli_main()
+    assert captured["resume_from"] == "202505010102"
+    assert captured["on_date"] == date(2025, 3, 1)
+
+
+def test_history_api_forwards_resume_from(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake(self, **kwargs):
+        captured.update(kwargs)
+        html = _result_html(
+            _runner("1", 1, "アルファ", "2.4", "1"),
+            surface="芝1600m",
+            going="良",
+            race_class="オープン",
+            venue="東京",
+            heads=1,
+        )
+        return _service(html, None).get(race_id=RACE_ID)
+
+    monkeypatch.setattr(RaceService, "get_historical_races", _fake)
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/races/history", params={"date": "2025-03-01", "resume_from": "202505010102"}
+        )
+    assert response.status_code == 200
+    assert captured["resume_from"] == "202505010102"
+    body = response.json()
+    assert "stopped_at_race_id" in body
+    assert "completed_race_ids" in body
+    assert "remaining_race_ids" in body
 
 
 @pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")

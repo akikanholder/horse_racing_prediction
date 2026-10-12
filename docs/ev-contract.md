@@ -441,6 +441,7 @@ python -m backend.cli history 202505030811 --json
 python -m backend.cli history --date 2025-01-05 --venue 東京 --priority-venues --json
 python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --flat-only --export jsonl
 python -m backend.cli history --date 2025-01-05 --export csv --output backend/csv_output/historical
+python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 202505010201 --json
 ```
 
 対象は 2025-01-01 以降。それより前の日は取りにいかない。`warning` は `historical races start in 2025`。`race_id` を直接指定してページの日付が 2025 より前のときは、レコードは返るが `in_scope` は false。日付はレースIDの桁からは作らない。
@@ -493,17 +494,34 @@ python -m backend.cli history --date 2025-01-05 --export csv --output backend/cs
 - `historical races start in 2025`
 - `JRA odds returned 403`
 - `headless browser is not installed`
+- `stopped at {race_id}: race result returned 403`
+- `stopped at {race_id}: race result requires login`
+- `race list returned 403`
+- `race list requires login`
 
 単勝の確定オッズと、単勝・ワイド・馬連・三連複の払戻が揃えばバックテストに足りる。組み合わせの確定オッズはページにあるときだけ。
 
-日付範囲はレースを順に取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、同じ URL は開き直さない。403 とログイン画面はキャッシュしない。
+日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、同じ URL は開き直さない。403 とログイン画面はキャッシュしない。
 
-書き出しは範囲内（`in_scope`）だけ。
+結果ページが `race result returned 403` または `race result requires login` のとき、そのレースのオッズも、それより後のレースも開かない。同じ実行ではその URL を再試行しない。User-Agent の差し替え、captcha、ログインはしない。開催一覧が 403 またはログイン画面のときは、その日以降の一覧を開かない。すでに並んだレースだけ取り、`warning` は `race list returned 403` または `race list requires login`。JRA のオッズだけが 403 のときは、そのレースの netkeiba に一度だけ進み、日付範囲は止めない。JRA の次のページは開かない。
+
+止めたときの `HistoricalBatch` と書き出し:
+
+| フィールド | 意味 |
+|---|---|
+| `stopped_at_race_id` | 403 またはログイン画面だったレースID。開催一覧で止まりレースIDが無いときは null |
+| `completed_race_ids` | この実行で取り終えた範囲内のレースID。止めたレースは含めない |
+| `remaining_race_ids` | まだ取っていないID。止めたレースを先頭に、一覧の順 |
+| `warning` | `stopped at {race_id}: race result returned 403` のように止めた理由 |
+
+同じ日付範囲をもう一度実行すると、`completed_race_ids` の結果ページはキャッシュから読む。ネットワークは止めたレースからで、完了済みは取り直さない。`--resume-from`（`resume_from`）は、そのIDより前をキャッシュだけにし、キャッシュが無いIDは開かない。
+
+書き出しは範囲内（`in_scope`）だけ。`progress.json` に上の4つを書く。JSON の `HistoricalBatch` と、export の応答も同じフィールドを持つ。
 
 | 形式 | 中身 |
 |---|---|
-| `jsonl` | `historical.jsonl`。1レース1行。`surface` で分ける |
-| `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、馬番、馬名、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻 |
+| `jsonl` | `historical.jsonl`。1レース1行。`surface` で分ける。`progress.json` に停止位置 |
+| `csv` | `runners.csv` は1頭1行。`runners_芝.csv` と `runners_ダート.csv` は面ごと。列は `surface`、`distance`、`race_class`、`field_size`、`going`、馬番、馬名、着順、`status`、`final_win_odds`、`popularity`、単勝・ワイド・馬連・三連複の払戻。`progress.json` に停止位置 |
 
 ## 血統 `pedigree`
 

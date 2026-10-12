@@ -47,7 +47,12 @@ from backend.scrapers.jra_payout import (
     OfficialRefund,
     cross_check_payouts,
 )
-from backend.scrapers.page_fallback import FetchedBody, PageFallback
+from backend.scrapers.page_fallback import (
+    AccessBlocked,
+    FetchedBody,
+    PageFallback,
+    looks_like_login_wall,
+)
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
     NETKEIBA_SHUTUBA_FORBIDDEN,
@@ -1344,6 +1349,8 @@ class NetkeibaScraper(BaseScraper):
                 f"{self.BASE_URL}/top/race_list.html",
                 params={"kaisai_date": date_str},
             )
+            if looks_like_login_wall(str(soup)):
+                raise AccessBlocked(401, "requires login")
             containers = soup.find_all(
                 ["div", "table", "section"],
                 class_=re.compile(r"RaceList|race_list|RaceData"),
@@ -1373,6 +1380,9 @@ class NetkeibaScraper(BaseScraper):
                         )
                     )
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if isinstance(e, AccessBlocked) or status in {401, 403}:
+                raise
             logger.error(f"Failed to fetch races for {target_date}: {e}")
 
         unique_races = {race.race_id: race for race in races}
@@ -2437,9 +2447,7 @@ class NetkeibaScraper(BaseScraper):
         soup = BeautifulSoup(html, "lxml")
         if self._find_shutuba_table(soup) is None:
             return False
-        entries = self._parse_race_entries(
-            soup, source="netkeiba_html", fetched_at=datetime.min
-        )
+        entries = self._parse_race_entries(soup, source="netkeiba_html", fetched_at=datetime.min)
         if not entries:
             return True
         return any(entry.status is None for entry in entries)
@@ -2447,7 +2455,9 @@ class NetkeibaScraper(BaseScraper):
     def _shutuba_pages_incomplete(self, pages: list[FetchedBody], race_id: str) -> bool:
         card = self._card_from_shutuba_pages(pages, race_id)
         if card is None or not card.entries:
-            return bool(card is None or self._find_shutuba_table(BeautifulSoup(pages[0].body, "lxml")))
+            return bool(
+                card is None or self._find_shutuba_table(BeautifulSoup(pages[0].body, "lxml"))
+            )
         return any(entry.status is None for entry in card.entries)
 
     def _card_from_shutuba_pages(self, pages: list[FetchedBody], race_id: str) -> RaceCard | None:
@@ -2458,9 +2468,7 @@ class NetkeibaScraper(BaseScraper):
             if not page.body.lstrip().startswith(("{", "[")):
                 soup = BeautifulSoup(page.body, "lxml")
                 race = self._parse_race_info(soup, race_id)
-                entries = self._parse_race_entries(
-                    soup, source=source, fetched_at=page.fetched_at
-                )
+                entries = self._parse_race_entries(soup, source=source, fetched_at=page.fetched_at)
                 if race is not None and card is None:
                     card = RaceCard(race=race, entries=entries)
                 elif card is not None and entries:
@@ -2488,7 +2496,9 @@ class NetkeibaScraper(BaseScraper):
                 )
         return card
 
-    def _shutuba_warning(self, card: RaceCard, chain_warning: str | None, status: str) -> str | None:
+    def _shutuba_warning(
+        self, card: RaceCard, chain_warning: str | None, status: str
+    ) -> str | None:
         """A printed status for every starter drops the fallback warning."""
         if card.entries and all(entry.status is not None for entry in card.entries):
             return None
@@ -2530,9 +2540,7 @@ class NetkeibaScraper(BaseScraper):
                 continue
 
             try:
-                entry = self._parse_entry_row(
-                    row, cols, source=page_source, fetched_at=fetched
-                )
+                entry = self._parse_entry_row(row, cols, source=page_source, fetched_at=fetched)
                 if entry:
                     entries.append(entry)
             except Exception as e:

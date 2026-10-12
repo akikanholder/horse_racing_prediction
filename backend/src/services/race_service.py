@@ -259,6 +259,7 @@ class RaceService:
         flat_only: bool = True,
         priority_venues: bool = False,
         delay_seconds: float = 1.5,
+        resume_from: str | None = None,
     ) -> HistoricalBatch:
         """Past flat races for an EV backtest.
 
@@ -276,6 +277,7 @@ class RaceService:
                 venues=venues,
                 flat_only=flat_only,
                 priority_venues=priority_venues,
+                resume_from=resume_from,
             )
 
     @staticmethod
