@@ -1,9 +1,12 @@
 """Netkeiba website scraper."""
 
+import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import date, datetime
+from typing import Literal, cast
 
 from bs4 import BeautifulSoup, Tag
 
@@ -29,14 +32,24 @@ from backend.models.race import (
     RacePayout,
     RaceResult,
     RaceSchedule,
+    ResultPhase,
+    ResultRunnerStatus,
+    ResultSource,
     SettledFinisher,
     SettledRaceResult,
 )
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.jra_payout import (
+    JRA_PAYOUT_UNREACHABLE,
+    OfficialPayoutKey,
+    cross_check_payouts,
+)
+from backend.scrapers.page_fallback import FetchedBody, PageFallback
 from backend.utils.date_utils import (
     get_current_week_dates,
     parse_japanese_date,
 )
+from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +66,34 @@ RACE_RESULT_PAYOUT_MISSING = "払戻に無い馬券種は空のまま"
 RACE_RESULT_PAYOUT_UNPAIRED = "払戻の対応が取れない馬券種は空のまま"
 RACE_RESULT_PAYOUT_BLANK = "価格が無い払戻行は空のまま"
 RACE_RESULT_PAYOUT_ABSENT = "払戻が結果ページに無い"
+RACE_RESULT_FORBIDDEN = "race result returned 403"
+RACE_RESULT_LOGIN = "race result requires login"
+RACE_RESULT_PHASE_UNKNOWN = "result phase was not on the page"
+RACE_RESULT_PHASE_DISAGREE = "result phase sources disagree"
+RACE_RESULT_HEADLESS_UNAVAILABLE = "headless browser is not installed"
+
+_STATUS_BY_LABEL = {
+    "取消": "scratched",
+    "出走取消": "scratched",
+    "除外": "excluded",
+    "競走除外": "excluded",
+    "中止": "did_not_finish",
+    "競走中止": "did_not_finish",
+    "失格": "disqualified",
+}
+_RUNNER_LIST_KEYS = ("runners", "results", "horses", "race_result")
+_HARD_RESULT_WARNINGS = frozenset(
+    {
+        RACE_RESULT_FETCH_FAILED,
+        RACE_RESULT_NOT_FOUND,
+        RACE_RESULT_NOT_SETTLED,
+        RACE_RESULT_TABLE_MALFORMED,
+        RACE_RESULT_EMPTY,
+        RACE_RESULT_FORBIDDEN,
+        RACE_RESULT_LOGIN,
+    }
+)
+_SOURCE_ORDER = ("netkeiba_html", "netkeiba_js", "headless")
 
 _PLACEHOLDERS = frozenset({"", "-", "--", "---", "**", "*", "----", "---.-"})
 _RESULT_HEADERS = {
@@ -629,6 +670,278 @@ def _join_note(prefix: str, labels: list[str]) -> str | None:
     return f"{prefix}: " + "、".join(labels)
 
 
+def _join_warnings(*parts: str | None) -> str | None:
+    items = [part for part in parts if part]
+    if not items:
+        return None
+    return "; ".join(items)
+
+
+def _as_status(value: str | None) -> ResultRunnerStatus | None:
+    if value in {"finished", "scratched", "excluded", "did_not_finish", "disqualified", "unknown"}:
+        return cast(ResultRunnerStatus, value)
+    return None
+
+
+def _as_source(value: str) -> ResultSource:
+    if value in _SOURCE_ORDER:
+        return cast(ResultSource, value)
+    return "netkeiba_html"
+
+
+def _as_phase(value: str | None) -> ResultPhase | None:
+    if value in {"provisional", "confirmed"}:
+        return cast(ResultPhase, value)
+    return None
+
+
+def _result_source(value: str) -> str:
+    if value in _SOURCE_ORDER:
+        return value
+    return "netkeiba_html"
+
+
+def _result_block_warning(warning: str | None) -> str:
+    if warning is not None and "403" in warning:
+        return RACE_RESULT_FORBIDDEN
+    return RACE_RESULT_LOGIN
+
+
+def _phase_label(text: str) -> str | None:
+    compact = _compact(text)
+    if compact in {"結果確定前", "未確定", "暫定", "provisional"}:
+        return "provisional"
+    if compact in {"結果確定", "確定", "confirmed"}:
+        return "confirmed"
+    return None
+
+
+def _result_phase_on_page(soup: BeautifulSoup) -> str | None:
+    """Phase only from a status label on the race header, not from nav or meta text."""
+    for node in soup.select(".RaceResultState, [data-result-phase]"):
+        if not isinstance(node, Tag):
+            continue
+        raw = node.get("data-result-phase")
+        label = raw if isinstance(raw, str) and raw.strip() else node.get_text()
+        phase = _phase_label(str(label))
+        if phase is not None:
+            return phase
+    header = soup.select_one(".RaceList_Item02")
+    if not isinstance(header, Tag):
+        return None
+    if header.select_one(".Race_Provisional") is not None:
+        return "provisional"
+    if header.select_one(".Race_Fixed") is not None:
+        return "confirmed"
+    for node in header.find_all(True):
+        if not isinstance(node, Tag):
+            continue
+        own = "".join(str(piece) for piece in node.find_all(string=True, recursive=False))
+        phase = _phase_label(own)
+        if phase is not None:
+            return phase
+    return None
+
+
+def _race_number_on_page(soup: BeautifulSoup) -> int | None:
+    """Race number printed in the title. The race id's last digits are not used."""
+    if soup.title is None:
+        return None
+    match = re.search(r"(\d{1,2})\s*[RＲ]", soup.title.get_text())
+    if match is None:
+        return None
+    number = int(match.group(1))
+    if 1 <= number <= 12:
+        return number
+    return None
+
+
+def _finish_status(rank_text: str) -> tuple[int | None, str | None, str | None, bool]:
+    """Rank, status code, printed label, and whether the row says 降着.
+
+    Non-finishers keep a null rank. A demoted horse keeps the official placing.
+    """
+    demoted = "降着" in rank_text
+    compact = _compact(rank_text.replace("降着", ""))
+    if re.fullmatch(r"\d+", compact):
+        return int(compact), "finished", None, demoted
+    code = _STATUS_BY_LABEL.get(compact)
+    if code is not None:
+        return None, code, compact, demoted
+    printed = _compact(rank_text)
+    if printed and printed not in _PLACEHOLDERS:
+        return None, "unknown", printed, demoted
+    return None, None, None, demoted
+
+
+def _assess_complete(
+    results: list[SettledFinisher], entry_count: int | None
+) -> tuple[bool, str | None]:
+    if entry_count is None:
+        return False, "race result incomplete: card runner count was not on the page"
+    if len(results) != entry_count:
+        return False, f"race result incomplete: {len(results)} of {entry_count} runners"
+    missing = [
+        str(row.horse_number) if row.horse_number is not None else "?"
+        for row in results
+        if row.status is None
+    ]
+    if missing:
+        return False, "race result incomplete: runner missing status: " + "、".join(missing)
+    return True, None
+
+
+def _merge_phase(current: str | None, new: str | None) -> tuple[str | None, bool]:
+    if new is None:
+        return current, False
+    if current is None:
+        return new, False
+    if current != new:
+        return None, True
+    return current, False
+
+
+def _runner_key(row: SettledFinisher) -> str:
+    if row.horse_number is not None:
+        return f"n:{row.horse_number}"
+    return f"name:{row.horse_name}"
+
+
+def _merge_runners(
+    base: list[SettledFinisher], extra: list[SettledFinisher]
+) -> list[SettledFinisher]:
+    """Keep HTML rows, then append runners the table did not have."""
+    order: list[str] = []
+    rows: dict[str, SettledFinisher] = {}
+    for row in base:
+        key = _runner_key(row)
+        if key not in rows:
+            order.append(key)
+        rows[key] = row
+    for row in extra:
+        key = _runner_key(row)
+        if key not in rows:
+            order.append(key)
+            rows[key] = row
+            continue
+        current = rows[key]
+        if current.status is None and row.status is not None:
+            rows[key] = current.model_copy(
+                update={
+                    "rank": row.rank,
+                    "status": row.status,
+                    "status_label": row.status_label,
+                    "demoted": row.demoted or current.demoted,
+                    "source": row.source,
+                }
+            )
+    return [rows[key] for key in order]
+
+
+def _race_source(results: list[SettledFinisher], payouts: list[RacePayout]) -> str | None:
+    found = [
+        source
+        for source in _SOURCE_ORDER
+        if any(row.source == source for row in results)
+        or any(payout.source == source for payout in payouts)
+    ]
+    if not found:
+        return None
+    return "+".join(found)
+
+
+def _mapping_text(row: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        return str(value)
+    return ""
+
+
+def _finisher_from_mapping(
+    row: dict[str, object], source: str, fetched_at: datetime
+) -> SettledFinisher | None:
+    """One runner object embedded in the page's JSON."""
+    rank_text = _mapping_text(row, "rank", "着順", "Rank")
+    label_text = _mapping_text(row, "status_label", "区分")
+    status_text = _mapping_text(row, "status")
+    probe = (
+        label_text if label_text and not re.fullmatch(r"\d+", _compact(rank_text)) else rank_text
+    )
+    if not probe and label_text:
+        probe = label_text
+    rank, status, status_label, demoted = _finish_status(probe or label_text)
+    if "降着" in label_text or "降着" in rank_text or row.get("demoted") is True:
+        demoted = True
+    explicit = _as_status(status_text)
+    if explicit is not None:
+        status = explicit
+        if explicit in {"scratched", "excluded", "did_not_finish", "disqualified"}:
+            rank = None
+            if isinstance(label_text, str) and label_text:
+                status_label = _compact(label_text)
+        elif explicit == "finished":
+            status_label = None
+    horse_number = _optional_int(_mapping_text(row, "horse_number", "馬番", "Umaban"))
+    horse_name = _optional_text(_mapping_text(row, "horse_name", "馬名", "Bamei"))
+    if horse_name is None and horse_number is None:
+        return None
+    horse_id_text = _optional_text(_mapping_text(row, "horse_id", "馬ID"))
+    return SettledFinisher(
+        rank=rank,
+        status=_as_status(status),
+        status_label=status_label,
+        demoted=demoted,
+        bracket_number=_optional_int(_mapping_text(row, "bracket_number", "枠", "Wakuban")),
+        horse_number=horse_number,
+        horse_name=horse_name,
+        horse_id=horse_id_text,
+        weight=_optional_float(_mapping_text(row, "weight", "斤量")),
+        jockey_name=_optional_text(_mapping_text(row, "jockey_name", "騎手")),
+        finish_time=_parse_finish_time(_mapping_text(row, "finish_time", "タイム")),
+        margin=_optional_text(_mapping_text(row, "margin", "着差")),
+        last_3f=_optional_float(_mapping_text(row, "last_3f", "後3F")),
+        popularity=_optional_int(_mapping_text(row, "popularity", "人気")),
+        odds=_optional_float(_mapping_text(row, "odds", "単勝オッズ")),
+        passing_order=_optional_text(_mapping_text(row, "passing_order", "コーナー通過順")),
+        source=_as_source(source),
+        fetched_at=fetched_at,
+    )
+
+
+def _venue_code(codes: dict[str, str], name: str) -> str | None:
+    for code, venue in codes.items():
+        if venue == name:
+            return code
+    return None
+
+
+def _official_payout_key(
+    header: "_SettledHeader", venue_codes: dict[str, str]
+) -> OfficialPayoutKey | None:
+    """Match a JRA payout day from values printed on the result page."""
+    if (
+        header.venue is None
+        or header.race_date is None
+        or header.kai is None
+        or header.meeting_day is None
+        or header.race_number is None
+    ):
+        return None
+    code = _venue_code(venue_codes, header.venue)
+    if code is None:
+        return None
+    return OfficialPayoutKey(
+        venue_code=code,
+        year=header.race_date.year,
+        kai=header.kai,
+        meeting_day=header.meeting_day,
+        race_date=header.race_date,
+        race_number=header.race_number,
+    )
+
+
 @dataclass
 class _SettledHeader:
     """Race header read from the result page. Missing pieces stay null."""
@@ -640,6 +953,11 @@ class _SettledHeader:
     track_type: str | None = None
     track_condition: str | None = None
     weather: str | None = None
+    entry_count: int | None = None
+    kai: int | None = None
+    meeting_day: int | None = None
+    race_number: int | None = None
+    result_phase: str | None = None
 
 
 class NetkeibaScraper(BaseScraper):
@@ -671,6 +989,20 @@ class NetkeibaScraper(BaseScraper):
         "09": "阪神",
         "10": "小倉",
     }
+
+    def __init__(
+        self,
+        http_client: HTTPClient | None = None,
+        *,
+        headless_render: Callable[[str], str] | Literal["auto", "off"] = "auto",
+    ):
+        """Create a scraper.
+
+        ``headless_render="off"`` skips the browser step and does not warn.
+        ``"auto"`` uses Playwright when the browser is installed.
+        """
+        super().__init__(http_client)
+        self._headless_render = headless_render
 
     def get_weekly_races(self) -> RaceSchedule:
         """Get this week's race schedule from netkeiba.
@@ -830,6 +1162,10 @@ class NetkeibaScraper(BaseScraper):
         A failed fetch, a missing race, or a race that has no finish table
         returns empty finishers and payouts with ``warning``. Prices are not made up.
 
+        When the HTML table is shorter than the printed field, JSON embedded in
+        the page or a same-site result URL the page calls is read next, then an
+        optional headless render. HTTP 403 and a login wall stop that chain.
+
         Args:
             race_id: Race ID
             fetched_at: Timestamp stored on the payload. Defaults to now.
@@ -838,12 +1174,50 @@ class NetkeibaScraper(BaseScraper):
             Settled race result. ``warning`` is set when it is not usable.
         """
         fetched = fetched_at or datetime.now()
-        try:
-            soup = self._fetch_race_result_page(race_id)
-        except Exception as e:
-            logger.error("Failed to fetch settled race result for %s: %s", race_id, e)
+        fallback = PageFallback(
+            self.http_client,
+            site="netkeiba",
+            headless_render=self._headless_render,
+        )
+        loaded = fallback.load(
+            url=f"{self.BASE_URL}/race/result.html",
+            params={"race_id": race_id},
+            headers={**self.BROWSER_HEADERS, "Referer": f"{self.BASE_URL}/top/"},
+            encoding="utf-8",
+            fetched_at=fetched,
+            should_fallback=self._result_html_needs_fallback,
+            still_incomplete=lambda pages: self._result_pages_incomplete(pages, race_id, fetched),
+        )
+        if loaded.status == "blocked" and not loaded.pages:
+            return self._empty_settled_result(
+                race_id,
+                fetched,
+                _result_block_warning(loaded.warning),
+            )
+        if loaded.status == "failed" or not loaded.pages:
             return self._empty_settled_result(race_id, fetched, RACE_RESULT_FETCH_FAILED)
-        return self._parse_settled_race_result(soup, race_id, fetched)
+
+        settled = self._settled_from_pages(loaded.pages, race_id, fetched)
+        if loaded.status == "blocked":
+            settled = settled.model_copy(
+                update={
+                    "warning": _join_warnings(
+                        settled.warning, _result_block_warning(loaded.warning)
+                    )
+                }
+            )
+        elif (
+            loaded.warning == RACE_RESULT_HEADLESS_UNAVAILABLE
+            and not settled.complete
+            and settled.warning not in _HARD_RESULT_WARNINGS
+        ):
+            settled = settled.model_copy(
+                update={
+                    "warning": _join_warnings(settled.warning, RACE_RESULT_HEADLESS_UNAVAILABLE)
+                }
+            )
+        header = self._settled_header(BeautifulSoup(loaded.pages[0].body, "lxml"))
+        return self._with_official_payouts(settled, header)
 
     def _fetch_race_result_page(self, race_id: str) -> BeautifulSoup:
         """Fetch the race result page with the browser UA and UTF-8."""
@@ -874,6 +1248,9 @@ class NetkeibaScraper(BaseScraper):
             track_condition=identity.track_condition,
             weather=identity.weather,
             fetched_at=fetched_at,
+            source=None,
+            complete=False,
+            result_phase=None,
             results=[],
             payouts=[],
             payout_note=None,
@@ -881,7 +1258,12 @@ class NetkeibaScraper(BaseScraper):
         )
 
     def _parse_settled_race_result(
-        self, soup: BeautifulSoup, race_id: str, fetched_at: datetime
+        self,
+        soup: BeautifulSoup,
+        race_id: str,
+        fetched_at: datetime,
+        *,
+        source: str = "netkeiba_html",
     ) -> SettledRaceResult:
         """Read one result page. Do not fill blanks from the race id."""
         header = self._settled_header(soup)
@@ -897,25 +1279,18 @@ class NetkeibaScraper(BaseScraper):
                 race_id, fetched_at, RACE_RESULT_TABLE_MALFORMED, header
             )
 
-        results = self._settled_finishers(table, columns)
+        results = self._settled_finishers(table, columns, source=source, fetched_at=fetched_at)
         if not results:
             return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_EMPTY, header)
 
-        payouts, payout_note = self._settled_payouts(soup)
-        return SettledRaceResult(
-            race_id=race_id,
-            race_name=header.race_name,
-            race_date=header.race_date,
-            venue=header.venue,
-            distance=header.distance,
-            track_type=header.track_type,
-            track_condition=header.track_condition,
-            weather=header.weather,
-            fetched_at=fetched_at,
-            results=results,
-            payouts=payouts,
-            payout_note=payout_note,
-            warning=None,
+        payouts, payout_note = self._settled_payouts(soup, source=source, fetched_at=fetched_at)
+        return self._result_from_parts(
+            race_id,
+            fetched_at,
+            header,
+            results,
+            payouts,
+            payout_note,
         )
 
     def _settled_header(self, soup: BeautifulSoup) -> _SettledHeader:
@@ -925,11 +1300,23 @@ class NetkeibaScraper(BaseScraper):
         data02 = soup.select_one(".RaceData02")
         if isinstance(data02, Tag):
             venues = set(self.VENUE_CODES.values())
+            data_text = data02.get_text(" ", strip=True)
             for span in data02.find_all("span"):
                 venue = _clean(span.get_text())
                 if venue in venues:
                     header.venue = venue
                     break
+            kai_match = re.search(r"(\d+)回", data_text)
+            day_match = re.search(r"(\d+)日目", data_text)
+            count_match = re.search(r"(\d+)頭", data_text)
+            if kai_match:
+                header.kai = int(kai_match.group(1))
+            if day_match:
+                header.meeting_day = int(day_match.group(1))
+            if count_match:
+                header.entry_count = int(count_match.group(1))
+        header.race_number = _race_number_on_page(soup)
+        header.result_phase = _result_phase_on_page(soup)
         data01 = soup.select_one(".RaceData01")
         if isinstance(data01, Tag):
             header.distance, header.track_type = self._settled_surface(data01)
@@ -996,7 +1383,14 @@ class NetkeibaScraper(BaseScraper):
                 columns[field_name] = index
         return columns
 
-    def _settled_finishers(self, table: Tag, columns: dict[str, int]) -> list[SettledFinisher]:
+    def _settled_finishers(
+        self,
+        table: Tag,
+        columns: dict[str, int],
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> list[SettledFinisher]:
         finishers: list[SettledFinisher] = []
         for row in table.find_all("tr")[1:]:
             if not isinstance(row, Tag):
@@ -1004,12 +1398,22 @@ class NetkeibaScraper(BaseScraper):
             cols = [cell for cell in row.find_all("td", recursive=False) if isinstance(cell, Tag)]
             if not cols:
                 continue
-            finisher = self._settled_finisher(cols, columns)
+            finisher = self._settled_finisher(
+                cols, columns, row=row, source=source, fetched_at=fetched_at
+            )
             if finisher is not None:
                 finishers.append(finisher)
         return finishers
 
-    def _settled_finisher(self, cols: list[Tag], columns: dict[str, int]) -> SettledFinisher | None:
+    def _settled_finisher(
+        self,
+        cols: list[Tag],
+        columns: dict[str, int],
+        *,
+        row: Tag | None = None,
+        source: str,
+        fetched_at: datetime,
+    ) -> SettledFinisher | None:
         horse_cell = _cell(cols, columns, "horse_name")
         horse_name = _optional_text(horse_cell.get_text()) if horse_cell is not None else None
         horse_number = _optional_int(_cell_text(cols, columns, "horse_number"))
@@ -1022,10 +1426,14 @@ class NetkeibaScraper(BaseScraper):
                 if match:
                     horse_id = match.group(1)
                     break
-        rank_text = _compact(_cell_text(cols, columns, "rank"))
-        rank = int(rank_text) if re.fullmatch(r"\d+", rank_text) else None
+        rank, status, status_label, demoted = _finish_status(_cell_text(cols, columns, "rank"))
+        if row is not None and "降着" in row.get_text():
+            demoted = True
         return SettledFinisher(
             rank=rank,
+            status=_as_status(status),
+            status_label=status_label,
+            demoted=demoted,
             bracket_number=_optional_int(_cell_text(cols, columns, "bracket_number")),
             horse_number=horse_number,
             horse_name=horse_name,
@@ -1038,9 +1446,17 @@ class NetkeibaScraper(BaseScraper):
             popularity=_optional_int(_cell_text(cols, columns, "popularity")),
             odds=_optional_float(_cell_text(cols, columns, "odds")),
             passing_order=_optional_text(_cell_text(cols, columns, "passing_order")),
+            source=_as_source(source),
+            fetched_at=fetched_at,
         )
 
-    def _settled_payouts(self, soup: BeautifulSoup) -> tuple[list[RacePayout], str | None]:
+    def _settled_payouts(
+        self,
+        soup: BeautifulSoup,
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> tuple[list[RacePayout], str | None]:
         """Read 払戻 rows. A missing or unpaired price is omitted, not invented."""
         tables = soup.select("table.Payout_Detail_Table")
         if not tables:
@@ -1092,6 +1508,8 @@ class NetkeibaScraper(BaseScraper):
                             combination=combination,
                             payout=amount,
                             popularity=popularity,
+                            source=_as_source(source),
+                            fetched_at=fetched_at,
                         )
                     )
                 if not tickets:
@@ -1119,6 +1537,200 @@ class NetkeibaScraper(BaseScraper):
             if note
         ]
         return payouts, " ".join(notes) or None
+
+    def _result_html_needs_fallback(self, html: str) -> bool:
+        """True when the result table is missing columns, empty, or short of the card."""
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.find("table", summary="全着順")
+        if not isinstance(table, Tag):
+            return False
+        columns = self._settled_columns(table)
+        if any(name not in columns for name in ("rank", "horse_number", "horse_name")):
+            return True
+        header = self._settled_header(soup)
+        rows = self._settled_finishers(
+            table,
+            columns,
+            source="netkeiba_html",
+            fetched_at=datetime.min,
+        )
+        if not rows:
+            return True
+        if header.entry_count is None:
+            return False
+        return len(rows) < header.entry_count
+
+    def _result_pages_incomplete(
+        self, pages: list[FetchedBody], race_id: str, fetched_at: datetime
+    ) -> bool:
+        """True when HTML plus JSON still does not cover the card."""
+        settled = self._settled_from_pages(pages, race_id, fetched_at)
+        if settled.warning in {
+            RACE_RESULT_NOT_FOUND,
+            RACE_RESULT_NOT_SETTLED,
+            RACE_RESULT_FETCH_FAILED,
+            RACE_RESULT_FORBIDDEN,
+            RACE_RESULT_LOGIN,
+        }:
+            return False
+        return not settled.complete
+
+    def _settled_from_pages(
+        self, pages: list[FetchedBody], race_id: str, fetched_at: datetime
+    ) -> SettledRaceResult:
+        """Merge the HTML table with later JSON or headless documents."""
+        first = pages[0]
+        soup = BeautifulSoup(first.body, "lxml")
+        base = self._parse_settled_race_result(
+            soup, race_id, first.fetched_at, source=_result_source(first.source)
+        )
+        header = self._settled_header(soup)
+        runners = list(base.results)
+        phase = header.result_phase
+        phase_disagree = False
+        entry_count = header.entry_count
+        payouts = list(base.payouts)
+        payout_note = base.payout_note
+        for page in pages[1:]:
+            extra_runners, extra_phase, extra_count, extra_payouts, extra_note = (
+                self._supplement_from_page(page, race_id)
+            )
+            if extra_runners:
+                runners = _merge_runners(runners, extra_runners)
+            if extra_count is not None and entry_count is None:
+                entry_count = extra_count
+            phase, disagreed = _merge_phase(phase, extra_phase)
+            phase_disagree = phase_disagree or disagreed
+            if extra_payouts and not payouts:
+                payouts = extra_payouts
+                payout_note = extra_note
+        if not runners:
+            return base
+        header.entry_count = entry_count
+        header.result_phase = None if phase_disagree else phase
+        return self._result_from_parts(
+            race_id,
+            fetched_at,
+            header,
+            runners,
+            payouts,
+            payout_note,
+            phase_disagree=phase_disagree,
+        )
+
+    def _supplement_from_page(
+        self, page: FetchedBody, race_id: str
+    ) -> tuple[
+        list[SettledFinisher],
+        str | None,
+        int | None,
+        list[RacePayout],
+        str | None,
+    ]:
+        text = page.body.lstrip()
+        source = _result_source(page.source)
+        if not text.startswith("<"):
+            runners, phase, entry_count = self._runners_from_json(
+                page.body, source, page.fetched_at
+            )
+            return runners, phase, entry_count, [], None
+        soup = BeautifulSoup(page.body, "lxml")
+        parsed = self._parse_settled_race_result(soup, race_id, page.fetched_at, source=source)
+        header = self._settled_header(soup)
+        return (
+            list(parsed.results),
+            header.result_phase,
+            header.entry_count,
+            list(parsed.payouts),
+            parsed.payout_note,
+        )
+
+    def _runners_from_json(
+        self, body: str, source: str, fetched_at: datetime
+    ) -> tuple[list[SettledFinisher], str | None, int | None]:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return [], None, None
+        if not isinstance(payload, dict):
+            return [], None, None
+        raw_rows: list[object] | None = None
+        for key in _RUNNER_LIST_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                raw_rows = value
+                break
+        runners: list[SettledFinisher] = []
+        if raw_rows is not None:
+            for item in raw_rows:
+                if not isinstance(item, dict):
+                    continue
+                runner = _finisher_from_mapping(item, source, fetched_at)
+                if runner is not None:
+                    runners.append(runner)
+        phase = _phase_label(str(payload.get("result_phase") or ""))
+        count = payload.get("entry_count")
+        entry_count = count if isinstance(count, int) else None
+        return runners, phase, entry_count
+
+    def _result_from_parts(
+        self,
+        race_id: str,
+        fetched_at: datetime,
+        header: _SettledHeader,
+        results: list[SettledFinisher],
+        payouts: list[RacePayout],
+        payout_note: str | None,
+        *,
+        phase_disagree: bool = False,
+    ) -> SettledRaceResult:
+        complete, incomplete = _assess_complete(results, header.entry_count)
+        phase_warning: str | None = None
+        phase = None if phase_disagree else header.result_phase
+        if phase_disagree:
+            phase_warning = RACE_RESULT_PHASE_DISAGREE
+        elif phase is None:
+            phase_warning = RACE_RESULT_PHASE_UNKNOWN
+        return SettledRaceResult(
+            race_id=race_id,
+            race_name=header.race_name,
+            race_date=header.race_date,
+            venue=header.venue,
+            distance=header.distance,
+            track_type=header.track_type,
+            track_condition=header.track_condition,
+            weather=header.weather,
+            fetched_at=fetched_at,
+            source=_race_source(results, payouts),
+            complete=complete,
+            result_phase=_as_phase(phase),
+            results=results,
+            payouts=payouts,
+            payout_note=payout_note,
+            warning=_join_warnings(incomplete, phase_warning),
+        )
+
+    def _with_official_payouts(
+        self, settled: SettledRaceResult, header: _SettledHeader
+    ) -> SettledRaceResult:
+        """Warn when JRA's public payout list is missing or disagrees. Do not invent prices."""
+        if not settled.payouts or settled.warning in _HARD_RESULT_WARNINGS:
+            return settled
+        key = _official_payout_key(header, self.VENUE_CODES)
+        if key is None:
+            note: str | None = JRA_PAYOUT_UNREACHABLE
+        else:
+            note = cross_check_payouts(
+                self.http_client,
+                key,
+                [
+                    (payout.bet_type, payout.combination, payout.payout, payout.popularity)
+                    for payout in settled.payouts
+                ],
+            )
+        if note is None:
+            return settled
+        return settled.model_copy(update={"warning": _join_warnings(settled.warning, note)})
 
     def get_horse_info(self, horse_id: str, *, fetched_at: datetime | None = None) -> Horse | None:
         """Get horse identity and near-run history.
@@ -1423,9 +2035,7 @@ class NetkeibaScraper(BaseScraper):
             logger.warning(f"Failed to parse race info: {e}")
             return None
 
-    def _confirmed_meeting(
-        self, soup: BeautifulSoup, race_id: str
-    ) -> tuple[str | None, str, str]:
+    def _confirmed_meeting(self, soup: BeautifulSoup, race_id: str) -> tuple[str | None, str, str]:
         """Return venue code, name, and RaceData01 text when the page is that meeting.
 
         The name is copied only from a ``RaceData02`` span. Nav chrome and a

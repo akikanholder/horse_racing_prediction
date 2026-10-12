@@ -175,12 +175,16 @@ with TrackInfoService() as service:
 
 - ページは `https://race.netkeiba.com/race/result.html?race_id={race_id}`。出馬表や `cli horse` の `/horse/result/{horse_id}/` ではない。
 - このページは UTF-8。馬の成績ページ（EUC-JP）とは別。UA はオッズ・馬ページと同じ Chrome。
-- `results` はこのレースの確定着順（結果表の並び）。`取消` などは `rank: null` のまま行に残す。タイム、着差、オッズ、払戻が空のセルから数値は作らない。
+- `results` はこのレースの出走馬（結果表の並び）。取消・除外・中止・競走中止・失格も残す。`rank` は入着の公式順位だけ。未入着は null のまま。着順は作らない。
+- 各馬の `status` は `finished` / `scratched` / `excluded` / `did_not_finish` / `disqualified` / `unknown`。`status_label` はページの文字のまま（`取消`、`除外`、`中止`、`競走中止`、`失格`）。行に `降着` があるときだけ `demoted: true`。着順はその公式順位。
+- `complete` は返した頭数がページの `N頭` と一致し、各馬に `status` があるときだけ true。足りないときは false と、何が足りないかの `warning`。
+- `result_phase` はページが `確定` か `確定前`（暫定・未確定）と印字しているときだけ `confirmed` / `provisional`。タイトルや「速報」からは決めない。印字が無ければ null と `result phase was not on the page`。
+- 着順表が `N頭` より短い、空、壊れているときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。各値の `source` は `netkeiba_html` / `netkeiba_js` / `headless`。`fetched_at` はその値を得た時刻。ヘッドレスは任意（`pip install -e ".[headless]"`）。未インストールなら警告だけ。403 とログイン画面は止め、回避しない。
 - 開催日はページの `kaisai_date`（無ければタイトルの年月日）。レースIDの桁からは日付を作らない。
 - 競馬場、距離、芝/ダート、馬場、天候は結果ページに書いてあるときだけ入る。馬場の `稍` は馬成績と同じく `稍重`。
-- 払戻はページの単勝・複勝・枠連・馬連・ワイド・馬単・3連複・3連単。金額が無い馬券種は入れず、`payout_note` に残す。ページに無い価格は作らない。
-- 取れないときは `results: []`、`payouts: []` と `warning`。値は `race result fetch failed`、`race result not found`、`race not yet settled`、`race result table malformed`、`no finishers on race result page`。
-- `fetched_at` は取得時刻。
+- 払戻はページの単勝・複勝・枠連・馬連・ワイド・馬単・3連複・3連単。金額が無い馬券種は入れず、`payout_note` に残す。ページに無い価格は作らない。JRA の公開払戻に届くときは突き合わせ、不一致は `warning`。届かないときも金額は作らず `JRA official payout was not reachable`。
+- 取れないときは `results: []`、`payouts: []` と `warning`。値は `race result fetch failed`、`race result not found`、`race not yet settled`、`race result table malformed`、`no finishers on race result page`、`race result returned 403`、`race result requires login`。
+- `fetched_at` は取得時刻。フィールドの対応は `docs/ev-contract.md`。
 
 ## オッズ
 

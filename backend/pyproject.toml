@@ -21,6 +21,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+headless = [
+    "playwright>=1.40.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -72,7 +75,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["bs4.*", "lxml.*"]
+module = ["bs4.*", "lxml.*", "playwright.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

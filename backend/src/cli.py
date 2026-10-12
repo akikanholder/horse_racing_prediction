@@ -424,6 +424,11 @@ def _print_settled_result(settled: SettledRaceResult) -> None:
     course = _settled_course(settled)
     print(f"条件: {settled.venue or '不明'} {course}".rstrip())
     print(f"取得時刻: {settled.fetched_at}")
+    phase = {"confirmed": "確定", "provisional": "確定前"}.get(settled.result_phase or "", "不明")
+    print(f"結果区分: {phase}")
+    print(f"出走と一致: {'はい' if settled.complete else 'いいえ'}")
+    if settled.source:
+        print(f"取得元: {settled.source}")
     if settled.warning:
         print(f"警告: {settled.warning}")
     print("\n--- 着順 ---")
@@ -455,7 +460,14 @@ def _settled_course(settled: SettledRaceResult) -> str:
 
 
 def _format_finisher(finisher: SettledFinisher) -> str:
-    rank = f"{finisher.rank}着" if finisher.rank is not None else "---"
+    if finisher.rank is not None:
+        rank = f"{finisher.rank}着"
+    elif finisher.status_label:
+        rank = finisher.status_label
+    else:
+        rank = "---"
+    if finisher.demoted:
+        rank = f"{rank}降着"
     number = f"{finisher.horse_number}番" if finisher.horse_number is not None else "?番"
     name = finisher.horse_name or ""
     jockey = finisher.jockey_name or ""
@@ -553,7 +565,8 @@ def main():
         "result",
         help="確定した1レースの着順と払戻を取得（馬の近走成績ではない）",
         description=(
-            "確定した1レースの着順と払戻。マーク×着順の事後ログ用。"
+            "確定した1レースの全頭の着順と払戻。マーク×着順の事後ログ用。"
+            "取消・除外・中止・失格は rank を null のまま status で区別する。"
             "cli horse の近走成績ではなく、レース前の期待値の入力に混ぜない。"
         ),
     )

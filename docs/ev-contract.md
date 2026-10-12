@@ -209,22 +209,61 @@ python -m backend.cli result 202605030811 --json
 | `race_name` / `race_date` / `venue` | ページの見出しと `kaisai_date`。日付はレースIDの桁からは作らない | 無いとき null |
 | `distance` / `track_type` / `track_condition` / `weather` | 結果ページに書いてあるときだけ | 無いとき null。`稍` は `稍重` |
 | `fetched_at` | 取得時刻 | 必須 |
-| `results` | `SettledFinisher`。結果表の並び | 失敗時 `[]` |
+| `source` | 着順を得た方法。`netkeiba_html` / `netkeiba_js` / `headless`。混ざるときは `netkeiba_html+netkeiba_js` | 失敗時 null |
+| `complete` | 返した頭数がページの `N頭` と一致し、各馬に `status` があるときだけ true | 失敗時 false |
+| `result_phase` | ページに印字された `confirmed`（確定）か `provisional`（確定前・暫定・未確定） | 印字が無ければ null |
+| `results` | `SettledFinisher`。結果表の並び。未入着も含む | 失敗時 `[]` |
 | `payouts` | `RacePayout`。金額がある馬券種だけ | 失敗時 `[]` |
 | `payout_note` | 金額を作らなかった馬券種の注記 | 無ければ null |
-| `warning` | 着順が取れない理由 | 取れたら null |
+| `warning` | 着順が取れない、または頭数・区分・確定印・公式払戻が揃わない理由。複数は `; ` でつなぐ | 揃っていれば null |
 
-`SettledFinisher`: `rank`（取消・除外・中止・失格は null のまま行に残す）, `bracket_number`, `horse_number`, `horse_name`, `horse_id`, `weight`, `jockey_name`, `finish_time`, `margin`, `last_3f`（後3F）, `popularity`, `odds`, `passing_order`。空セルから数値は作らない。
+`results` はカードの全頭。着順表がページの `N頭` より短い、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
 
-`RacePayout`: `bet_type` はページの表記（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）。`combination` はページの並び（馬単・3連単は着順どおり）。`payout` は円。`popularity` が無いときは null。ページに無い馬券種は要素にしない。
+`result_phase` は結果ヘッダの印字だけ（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が無ければ null と `result phase was not on the page`。複数の取得元が食い違うときは null と `result phase sources disagree`。
 
-`warning`:
+`SettledFinisher`:
+
+| フィールド | 意味 | 欠測 |
+|---|---|---|
+| `rank` | 公式の着順 | 取消・除外・中止・競走中止・失格は null。着順は作らない |
+| `status` | `finished` / `scratched`（取消・出走取消）/ `excluded`（除外・競走除外）/ `did_not_finish`（中止・競走中止）/ `disqualified`（失格）/ `unknown` | 着順欄が空なら null。その行があると `complete` は false |
+| `status_label` | ページに印字された区分のまま（`取消`、`除外`、`中止`、`競走中止`、`失格`） | 入着は null |
+| `demoted` | その行に `降着` と印字があるとき true。着順は公式の順位のまま | 印字が無ければ false。ページ末尾の「降着・失格のルール」は対象外 |
+| `bracket_number` から `passing_order` | 従来どおり。`last_3f` は後3F | 空セルから数値は作らない |
+| `source` | その行を得た方法。`netkeiba_html` / `netkeiba_js` / `headless` | 失敗時 null |
+| `fetched_at` | その行を得た時刻 | 失敗時 null |
+
+`unknown` は区分がある（`status` は null ではない）。印字が `取消` など以外で数字でもないとき、`status_label` はその文字、`rank` は null。
+
+`RacePayout`: `bet_type` はページの表記（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）。`combination` はページの並び（馬単・3連単は着順どおり）。`payout` は円。`popularity` が無いときは null。ページに無い馬券種は要素にしない。各要素に `source`（`netkeiba_html` / `netkeiba_js` / `headless`）と `fetched_at`。
+
+払戻があるとき、結果ページに印字された競馬場・回・日・レース番号・開催日から JRA の公開払戻（`accessH`、メニューに印刷された cname）を突き合わせる。金額は置き換えない。不一致は `JRA payout mismatch: netkeibaのみ: …; JRAのみ: …`。ページが取れない、開催が一つに決まらないときは `JRA official payout was not reachable`。401/403 は `JRA payout returned 403` で止め、次のページは開かない。金額は作らない。
+
+`warning`（取得そのものが失敗したときは、この文だけ。確定印や払戻の注記は足さない）:
 
 - `race result fetch failed`
 - `race result not found`
 - `race not yet settled`
 - `race result table malformed`
 - `no finishers on race result page`
+- `race result returned 403`
+- `race result requires login`
+
+揃い方の注記（上と `; ` でつなぐことがある）:
+
+- `race result incomplete: card runner count was not on the page`
+- `race result incomplete: 5 of 8 runners`
+- `race result incomplete: runner missing status: 2、7`
+- `result phase was not on the page`
+- `result phase sources disagree`
+- `headless browser is not installed`（表がまだ短く、Playwright が無いときだけ。`headless` を切ったテストでは出さない）
+- `JRA official payout was not reachable`
+- `JRA payout returned 403`
+- `JRA payout mismatch: …`
+
+ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は後から馬場・調教でも使える。この契約の馬場・調教の中身は変えていない。
+
+レース前の `Race` / `RaceEntry` / `Horse` に `status`、`status_label`、`demoted`、`complete`、`result_phase` は無い。
 
 `payout_note` の文:
 

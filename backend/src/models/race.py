@@ -197,13 +197,39 @@ class RaceWithResults(BaseModel):
     results: list[RaceResult] = Field(default_factory=list, description="レース結果")
 
 
+ResultRunnerStatus = Literal[
+    "finished",
+    "scratched",
+    "excluded",
+    "did_not_finish",
+    "disqualified",
+    "unknown",
+]
+ResultPhase = Literal["provisional", "confirmed"]
+ResultSource = Literal["netkeiba_html", "netkeiba_js", "headless"]
+_NON_FINISH = frozenset({"scratched", "excluded", "did_not_finish", "disqualified"})
+
+
 class SettledFinisher(BaseModel):
-    """One row on the settled race result page.
+    """One runner on the settled race result page.
 
     着順が ``取消`` などのときは ``rank`` は null。空欄からタイムやオッズは作らない。
+    ``status`` は固定コード、``status_label`` はページに印字された日本語のまま。
     """
 
     rank: int | None = Field(None, description="着順。取消・除外・中止・失格は null")
+    status: ResultRunnerStatus | None = Field(
+        None,
+        description=(
+            "finished / scratched（取消）/ excluded（除外）/ "
+            "did_not_finish（中止・競走中止）/ disqualified（失格）/ unknown"
+        ),
+    )
+    status_label: str | None = Field(
+        None,
+        description="ページに印字された区分。取消、除外、中止、競走中止、失格など。入着は null",
+    )
+    demoted: bool = Field(False, description="降着。ページに印字があるときだけ true。着順は公式の順位")
     bracket_number: int | None = Field(None, description="枠番")
     horse_number: int | None = Field(None, description="馬番")
     horse_name: str | None = Field(None, description="馬名")
@@ -216,6 +242,18 @@ class SettledFinisher(BaseModel):
     popularity: int | None = Field(None, description="単勝人気")
     odds: float | None = Field(None, description="単勝オッズ")
     passing_order: str | None = Field(None, description="コーナー通過順")
+    source: ResultSource | None = Field(
+        None,
+        description="この行を得た方法。netkeiba_html / netkeiba_js / headless",
+    )
+    fetched_at: datetime | None = Field(None, description="この行を得た時刻")
+
+    @model_validator(mode="after")
+    def non_finisher_rank_stays_null(self) -> "SettledFinisher":
+        """取消・除外・中止・失格に着順を付けない。"""
+        if self.status in _NON_FINISH and self.rank is not None:
+            raise ValueError("non-finisher rank must be null")
+        return self
 
 
 class RacePayout(BaseModel):
@@ -232,6 +270,11 @@ class RacePayout(BaseModel):
     )
     payout: int = Field(..., description="払戻金（円）", gt=0)
     popularity: int | None = Field(None, description="人気。ページに無いときは null")
+    source: ResultSource | None = Field(
+        None,
+        description="この払戻を得た方法。netkeiba_html / netkeiba_js / headless",
+    )
+    fetched_at: datetime | None = Field(None, description="この払戻を得た時刻")
 
 
 class SettledRaceResult(BaseModel):
@@ -250,9 +293,24 @@ class SettledRaceResult(BaseModel):
     track_condition: str | None = Field(None, description="馬場状態 (良/稍重/重/不良)")
     weather: str | None = Field(None, description="天候")
     fetched_at: datetime = Field(..., description="取得日時")
+    source: str | None = Field(
+        None,
+        description=(
+            "着順を得た方法。netkeiba_html / netkeiba_js / headless。"
+            "混ざるときは netkeiba_html+netkeiba_js のように足す"
+        ),
+    )
+    complete: bool = Field(
+        False,
+        description="返した頭数がページの出走頭数と一致し、各馬に status があるときだけ true",
+    )
+    result_phase: ResultPhase | None = Field(
+        None,
+        description="ページが示す provisional（確定前・暫定）か confirmed（確定）。印字が無ければ null",
+    )
     results: list[SettledFinisher] = Field(
         default_factory=list,
-        description="このレースの確定着順。結果ページの並び。馬の近走成績ではない",
+        description="このレースの出走馬。結果ページの並び。未入着も含む。馬の近走成績ではない",
     )
     payouts: list[RacePayout] = Field(
         default_factory=list,
@@ -265,10 +323,12 @@ class SettledRaceResult(BaseModel):
     warning: str | None = Field(
         None,
         description=(
-            "確定結果を取れなかった理由。"
+            "確定結果を取れなかった、または頭数・区分・確定印・公式払戻が揃わない理由。"
             "race result fetch failed / race result not found / "
             "race not yet settled / race result table malformed / "
-            "no finishers on race result page"
+            "no finishers on race result page / race result returned 403 / "
+            "race result requires login / race result incomplete / "
+            "result phase was not on the page / JRA official payout was not reachable"
         ),
     )
 
