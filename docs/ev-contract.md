@@ -128,8 +128,25 @@ python -m backend.cli card 202605030811 --json
 | `trainer_name` / `trainer_id` | 調教師 | 無いとき null |
 | `owner_name` | 馬主 | 無いとき null |
 | `horse_weight` / `horse_weight_diff` | 馬体重と増減 | 空なら null |
-| `odds` | 出馬表の単勝。期待値には使わない | 空なら null |
+| `odds` | 出馬表の単勝。期待値には使わない | 空なら null。`----` や `取消` から価格は作らない |
 | `popularity` | 人気 | 空なら null |
+| `status` | `entered`（出走）/ `scratched`（取消・出走取消）/ `excluded`（除外・競走除外）/ `unknown` | ページから区分が読めないとき null。`finished` はレース前には使わない |
+| `status_label` | ページに印字された区分のまま（`取消`、`出走取消`、`除外`、`競走除外`） | 出走は null |
+| `source` | `jra_html` / `jra_js` / `netkeiba_html` / `netkeiba_js` / `headless` | 読めないとき null |
+| `fetched_at` | その区分を得た時刻 | 読めないとき null |
+
+印字が無い出走馬は `entered`。`status_label` は null。`unknown` は、区分の欄に `取消` 以外の短い文字があるとき。その文字が `status_label`。JRA の印字を優先し、JRA が無いときは netkeiba。両方に印字があるときも JRA。馬番は作らない。
+
+出馬表の表が空、または区分が埋まっていないときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、入っていればヘッドレス描画の順で足す。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いときは `headless browser is not installed`。区分がそれでも無い馬は `status` が null で、`warning` に `scratch status was not on the page`。
+
+`warning` の例:
+
+- `scratch status was not on the page`
+- `JRA shutuba returned 403`
+- `JRA shutuba requires login`
+- `netkeiba shutuba returned 403`
+- `netkeiba shutuba requires login`
+- `headless browser is not installed`
 
 出馬表に調教・血統・脚質は無い。それらは `horse` と `/horses`。
 
@@ -281,7 +298,7 @@ python -m backend.cli result 202605030811 --json
 
 ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は後から馬場・調教でも使える。この契約の馬場・調教の中身は変えていない。
 
-レース前の `Race` / `RaceEntry` / `Horse` に `status`、`status_label`、`demoted`、`complete`、`result_phase` は無い。
+レース前の `Race` と `Horse` に `status`、`status_label`、`demoted`、`complete`、`result_phase` は無い。`RaceEntry` にはレース前の `status`（`entered` / `scratched` / `excluded` / `unknown`）と `status_label` がある。`demoted`、`complete`、`result_phase` は確定結果だけ。
 
 `payout_note` の文:
 
@@ -315,6 +332,8 @@ python -m backend.cli result 202605030811 --json
 | `encoding` | 常に `utf-8` |
 | `race_phase` | `pre` または `post`。馬券種で食い違うとき、判別できない失敗は null |
 | `quotes` | `OddsQuote`。失敗時は `[]` |
+| `non_runners` | 取消・除外の馬。`horse_number`、`status`（`scratched` / `excluded` / `unknown`）、`status_label`、`source`、`fetched_at`。ページを読んで無いときは `[]`。読めないときは null |
+| `warning` | 取消・除外が読めない理由。価格の失敗は `reason`。読めれば null |
 | `fetched_at` | 取得時刻。必須 |
 
 `race_phase` は API の `status` から決める。`yoso` と `middle` は `pre`（レース前）。`result` は `post`（レース後の確定オッズ）。
@@ -324,14 +343,18 @@ python -m backend.cli result 202605030811 --json
 | フィールド | 単勝 `win` | ワイド `wide` | 馬連 `umaren` | 三連複 `sanrenpuku` |
 |---|---|---|---|---|
 | `combination` | 馬番 `1`（1–18） | `3-7`（小さい順） | `3-7`（小さい順） | `1-2-5`（小さい順、重複なし） |
-| `odds` | 単一価格 | null | 単一価格 | 単一価格 |
-| `odds_min` / `odds_max` | null | 両方必須。下限が上限を超えない | null | null |
+| `odds` | 単一価格。`----` や `取消` のときは null | null | 単一価格。`----` や `取消` のときは null | 同左 |
+| `odds_min` / `odds_max` | null | 両方必須。下限が上限を超えない。`----` や `取消` のときは両方 null | null | null |
 | `source` | 下表 | 同左 | 同左 | 同左 |
 | `kind` | `yoso` または `live` | 同左 | 同左 | 同左 |
 | `fetched_at` | 必須 | 必須 | 必須 | 必須 |
 | `market_updated_at` | API の `official_datetime` があるときだけ | 同左 | 同左 | 同左 |
+| `non_runner` | その馬が取消・除外のとき true | 組のどれかが取消・除外のとき true | 同左 | 同左 |
+| `withheld` | ページが `----` または `取消` のとき true | 同左 | 同左 | 同左 |
 
-価格が無い行、ワイドで範囲の片側しか無い行は捨てる。変動値は範囲ではないので馬連・三連複の `odds_min` / `odds_max` には入れない。HTTP 400 の本文に数値が載っていても価格にしない。
+価格が無い行、ワイドで範囲の片側しか無い行は捨てる。ページが `----` または `取消` / `除外` / `出走取消` / `競走除外` と出している行は残す。価格は null、`withheld` は true。数値は作らない。組のページが行自体を出していないときは、その組は作らない。取消馬を含む組でページが価格を出しているときは、その価格を残し `non_runner` を true。変動値は範囲ではないので馬連・三連複の `odds_min` / `odds_max` には入れない。HTTP 400 の本文に数値が載っていても価格にしない。
+
+`non_runners` はレース単位の取消・除外。JRA のオッズページ（無ければ出馬表の印字）を優先し、JRA が 403 またはログインのときはそこで止め、netkeiba の印字を残す。`warning` は `JRA odds returned 403`、`JRA odds requires login`、`netkeiba odds returned 403`、`netkeiba odds requires login`、`JRA odds fetch failed`、`JRA odds page was not on the card`、`headless browser is not installed`。403 本文から馬番は作らない。価格の欠測は従来どおり `reason`。
 
 `source` と `kind`:
 
@@ -341,7 +364,7 @@ python -m backend.cli result 202605030811 --json
 | `middle` | `netkeiba_live` | `live` | `live` | `pre` |
 | `result`（数値あり） | `netkeiba_live` | `live` | `live` | `post` |
 
-型としての `source` は `netkeiba_yoso` | `netkeiba_live` | `jradb`。`kind=yoso` は `source=netkeiba_yoso` だけ。`kind=live` に `netkeiba_yoso` は入らない。`jradb` は `kind=live` のトークンとして許される。今のオッズ取得は netkeiba の API だけで、引用の `source` に `jradb` は書かない。accessD / JRADB は出馬表と当日バイアスであり、オッズ引用ではない。CLI という文字列を `source` に入れない。
+型としての引用 `source` は `netkeiba_yoso` | `netkeiba_live` | `jradb`。`kind=yoso` は `source=netkeiba_yoso` だけ。`kind=live` に `netkeiba_yoso` は入らない。`jradb` は `kind=live` のトークンとして許される。価格の引用は netkeiba の API で、引用の `source` に `jradb` は書かない。取消・除外の `source` は別で、`jra_html` / `jra_js` / `netkeiba_html` / `netkeiba_js` / `headless`。accessD / JRADB は出馬表と当日バイアスと、取消・除外の印字。オッズの数値にはしない。CLI という文字列を `source` に入れない。
 
 `prefer=live` で市場が無いとき（`quotes=[]`、`status=unavailable`）、予想へは切り替えない。予想が要るなら `prefer=yoso` を明示する。`status=yoso` の本体は `prefer=live` でも `kind=yoso` のまま。複数馬券種で一部だけ空のときは、空の馬券種は `quotes` に現れず、スナップショットの `reason` は null。要求した `bet_types` と引用の `bet_type` を突き合わせる。
 

@@ -5,7 +5,14 @@ from datetime import date, datetime
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.horse import Horse, HorseBasicInfo
-from backend.models.odds import ODDS_ENCODING, BetType, OddsPrefer, OddsStatus, RaceOdds, RacePhase
+from backend.models.odds import (
+    ODDS_ENCODING,
+    BetType,
+    OddsPrefer,
+    OddsStatus,
+    RaceOdds,
+    RacePhase,
+)
 from backend.models.race import (
     Race,
     RaceCard,
@@ -22,6 +29,14 @@ from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publicati
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
+from backend.scrapers.runner_status import (
+    JRA_ODDS_FETCH_FAILED,
+    SCRATCH_STATUS_MISSING,
+    ScratchPage,
+    apply_scratch_page,
+    join_warnings,
+    merge_non_runners,
+)
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
 
 logger = logging.getLogger(__name__)
@@ -276,8 +291,12 @@ class RaceService:
             self._fetch_bet_odds(race_id, bet_type, fetched_at, preference) for bet_type in selected
         ]
         if len(snapshots) == 1:
-            return snapshots[0].model_copy(update={"prefer": preference, "bet_types": selected})
-        return _merge_odds_snapshots(race_id, selected, preference, fetched_at, snapshots)
+            snapshot = snapshots[0].model_copy(update={"prefer": preference, "bet_types": selected})
+        else:
+            snapshot = _merge_odds_snapshots(race_id, selected, preference, fetched_at, snapshots)
+        if isinstance(self._odds_scraper, NetkeibaOddsScraper):
+            snapshot = self._prefer_jra_scratches(snapshot, race_id)
+        return snapshot
 
     def _fetch_bet_odds(
         self,
@@ -311,6 +330,19 @@ class RaceService:
                 fetched_at=fetched_at,
             )
         return snapshot.model_copy(update={"prefer": preference, "bet_types": [bet_type]})
+
+    def _prefer_jra_scratches(self, snapshot: RaceOdds, race_id: str) -> RaceOdds:
+        """JRA scratch marks win. A 403 keeps the netkeiba list and warns.
+
+        Odds numbers already on the snapshot are not replaced with a JRA price.
+        A JRA ``----`` or ``取消`` nulls that quote.
+        """
+        try:
+            page = self.jra_scraper.odds_scratches(race_id, fetched_at=snapshot.fetched_at)
+        except Exception as e:
+            logger.warning("JRA odds scratch lookup failed for %s: %s", race_id, e)
+            page = ScratchPage(None, set(), JRA_ODDS_FETCH_FAILED, False)
+        return apply_scratch_page(snapshot, page)
 
     @property
     def training_scraper(self) -> TrainingScraper:
@@ -508,7 +540,14 @@ class RaceService:
         entries = self._merge_entries(netkeiba_card.entries, jra_card.entries)
         if race.entry_count is None and entries:
             race = race.model_copy(update={"entry_count": len(entries)})
-        return RaceCard(race=race, entries=entries)
+        warning = None
+        if entries and any(entry.status is None for entry in entries):
+            warning = join_warnings(
+                jra_card.warning,
+                netkeiba_card.warning,
+                SCRATCH_STATUS_MISSING,
+            )
+        return RaceCard(race=race, entries=entries, warning=warning)
 
     @property
     def day_of_bias(self) -> DayOfBiasClient:
@@ -565,8 +604,9 @@ class RaceService:
         """Copy empty primary fields from the secondary entry."""
         updates: dict[str, object] = {}
         id_fields = {"horse_id", "jockey_id", "trainer_id"}
+        status_fields = {"status", "status_label", "source", "fetched_at"}
         for field_name in RaceEntry.model_fields:
-            if field_name in {"bracket_number", "horse_number"}:
+            if field_name in {"bracket_number", "horse_number"} or field_name in status_fields:
                 continue
             current = getattr(primary, field_name)
             incoming = getattr(secondary, field_name)
@@ -578,6 +618,11 @@ class RaceService:
                 updates[field_name] = incoming
             elif current == "" and incoming:
                 updates[field_name] = incoming
+        if secondary.status is not None:
+            updates["status"] = secondary.status
+            updates["status_label"] = secondary.status_label
+            updates["source"] = secondary.source
+            updates["fetched_at"] = secondary.fetched_at
         return primary.model_copy(update=updates)
 
     def _merge_race_info(self, race1: Race, race2: Race) -> Race:
@@ -668,6 +713,8 @@ def _merge_odds_snapshots(
     """Combine bet types. An empty type adds no prices and does not relabel the rest."""
     quotes = [quote for snapshot in snapshots for quote in snapshot.quotes]
     race_phase = _shared_race_phase(snapshots)
+    non_runners = merge_non_runners([snapshot.non_runners for snapshot in snapshots])
+    warning = join_warnings(*(snapshot.warning for snapshot in snapshots))
     if not quotes:
         return RaceOdds(
             race_id=race_id,
@@ -678,6 +725,8 @@ def _merge_odds_snapshots(
             encoding=ODDS_ENCODING,
             race_phase=race_phase,
             quotes=[],
+            non_runners=non_runners,
+            warning=warning,
             fetched_at=fetched_at,
         )
     status: OddsStatus = "yoso" if all(quote.kind == "yoso" for quote in quotes) else "live"
@@ -690,6 +739,8 @@ def _merge_odds_snapshots(
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
         quotes=quotes,
+        non_runners=non_runners,
+        warning=warning,
         fetched_at=fetched_at,
     )
 

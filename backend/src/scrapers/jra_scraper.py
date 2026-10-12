@@ -2,15 +2,40 @@
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
-from urllib.parse import unquote
+from typing import Literal
+from urllib.parse import quote, unquote
 
 from bs4 import BeautifulSoup, Tag
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.race import Race, RaceCard, RaceEntry, RaceSchedule
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
+from backend.scrapers.runner_status import (
+    HEADLESS_UNAVAILABLE,
+    JRA_ODDS_FETCH_FAILED,
+    JRA_ODDS_FORBIDDEN,
+    JRA_ODDS_LOGIN,
+    JRA_SHUTUBA_FORBIDDEN,
+    JRA_SHUTUBA_LOGIN,
+    SCRATCH_STATUS_MISSING,
+    OddsMarks,
+    ScratchPage,
+    apply_records,
+    as_page_source,
+    join_warnings,
+    marks_from_html,
+    marks_from_json,
+    records_from_entries,
+    row_status,
+    same_site_status_urls,
+)
+from backend.scrapers.runner_status import (
+    page_records as _page_records,
+)
 from backend.utils.date_utils import (
     get_current_week_dates,
     parse_japanese_date,
@@ -23,6 +48,10 @@ logger = logging.getLogger(__name__)
 
 _ACCESS_D_ACTION = re.compile(
     r"""doAction\(\s*['"]([^'"]*accessD\.html)['"]\s*,\s*['"]([^'"]+)['"]""",
+    re.IGNORECASE,
+)
+_ACCESS_O_ACTION = re.compile(
+    r"""doAction\(\s*['"]([^'"]*accessO\.html)['"]\s*,\s*['"]([^'"]+)['"]""",
     re.IGNORECASE,
 )
 _CNAME_PARAM = re.compile(r"(?:CNAME|cname)=([A-Za-z0-9/%]+)")
@@ -106,6 +135,7 @@ class JRAScraper(BaseScraper):
     BASE_URL = "https://jra.jp"
     ENCODING = "utf-8"
     ACCESS_D_URL = "https://www.jra.go.jp/JRADB/accessD.html"
+    ACCESS_O_URL = "https://www.jra.go.jp/JRADB/accessO.html"
     ACCESS_D_ENCODING = "cp932"
     SHUTUBA_INDEX_CNAME = "pw01dli00/F3"
 
@@ -122,10 +152,20 @@ class JRAScraper(BaseScraper):
         "小倉": "10",
     }
 
-    def __init__(self, http_client: HTTPClient | None = None):
-        """Initialize scraper and the accessD page cache."""
+    def __init__(
+        self,
+        http_client: HTTPClient | None = None,
+        *,
+        headless_render: Callable[[str], str] | Literal["auto", "off"] = "auto",
+    ):
+        """Initialize scraper and the accessD page cache.
+
+        ``headless_render="off"`` skips the browser step and does not warn.
+        ``"auto"`` uses Playwright when the browser is installed.
+        """
         super().__init__(http_client)
         self._access_d_html: dict[str, str] = {}
+        self._headless_render = headless_render
 
     def get_weekly_race_schedule(self) -> RaceSchedule:
         """Get this week's race schedule from JRA.
@@ -536,7 +576,18 @@ class JRAScraper(BaseScraper):
                 logger.info("No accessD card found for %s", race_id)
                 return None
             html = self._fetch_access_d(cname.cname)
-            return self._parse_race_card(html, race_id, cname)
+            fetched = tokyo_now()
+            if looks_like_login_wall(html):
+                logger.warning(
+                    "JRA shutuba requires login for %s. The page is not parsed.",
+                    race_id,
+                )
+                return None
+            if self._shutuba_needs_fallback(html):
+                return self._card_with_fallback(html, race_id, cname, fetched)
+            return self._parse_race_card(
+                html, race_id, cname, source="jra_html", fetched_at=fetched
+            )
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 403:
@@ -742,12 +793,263 @@ class JRAScraper(BaseScraper):
             race_date=race_date,
         )
 
+    def odds_scratches(self, race_id: str, *, fetched_at: datetime | None = None) -> ScratchPage:
+        """Scratch marks on the JRA odds page, then the shutuba page.
+
+        HTTP 403 or a login wall stops the chain. The odds numbers on that
+        page are not copied onto quotes. A missing price stays null.
+        """
+        fetched = fetched_at or tokyo_now()
+        lookup = self._lookup_from_race_id(race_id)
+        if lookup is None:
+            return ScratchPage(None, set(), "JRA odds page was not on the card", False)
+        try:
+            cname = self._find_race_cname(lookup)
+        except Exception as exc:
+            return self._odds_block(exc)
+        if cname is None:
+            return ScratchPage(None, set(), "JRA odds page was not on the card", False)
+        try:
+            shutuba = self._fetch_access_d(cname.cname)
+        except Exception as exc:
+            return self._odds_block(exc)
+        if looks_like_login_wall(shutuba):
+            return ScratchPage(None, set(), JRA_ODDS_LOGIN, True)
+        odds_cname = self._odds_cname(shutuba)
+        if odds_cname is None:
+            return self._scratches_from_shutuba(shutuba, fetched)
+        try:
+            odds_html = self.http_client.post(
+                self.ACCESS_O_URL,
+                data={"cname": odds_cname},
+                encoding=self.ACCESS_D_ENCODING,
+            )
+        except Exception as exc:
+            blocked = self._odds_block(exc)
+            if blocked.blocked:
+                return blocked
+            return ScratchPage(None, set(), JRA_ODDS_FETCH_FAILED, False)
+        if looks_like_login_wall(odds_html):
+            return ScratchPage(None, set(), JRA_ODDS_LOGIN, True)
+        return self._odds_page_marks(odds_html, odds_cname, fetched)
+
+    def _odds_block(self, exc: Exception) -> ScratchPage:
+        """A refused odds page is not parsed, and the next JRA page is not opened."""
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 403:
+            logger.warning("JRA odds returned 403. The chain stops.")
+            return ScratchPage(None, set(), JRA_ODDS_FORBIDDEN, True)
+        if status == 401:
+            return ScratchPage(None, set(), JRA_ODDS_LOGIN, True)
+        logger.warning("JRA odds fetch failed: %s", exc)
+        return ScratchPage(None, set(), JRA_ODDS_FETCH_FAILED, False)
+
+    @staticmethod
+    def _odds_cname(html: str) -> str | None:
+        """Odds cname printed on the shutuba page. The checksum is not computed."""
+        match = _ACCESS_O_ACTION.search(html)
+        if match is None:
+            return None
+        return unquote(match.group(2)).strip() or None
+
+    def _scratches_from_shutuba(self, html: str, fetched_at: datetime) -> ScratchPage:
+        """Win-cell labels on the card when the odds link itself is absent."""
+        marks = marks_from_html(html, source="jra_html", fetched_at=fetched_at)
+        if not marks.runners and not marks.withheld and not marks.saw_price:
+            return ScratchPage(None, set(), "JRA odds page was not on the card", False)
+        return ScratchPage(marks.runners, marks.withheld, None, False)
+
+    def _odds_page_marks(self, html: str, cname: str, fetched_at: datetime) -> ScratchPage:
+        """Read the odds HTML, then JSON and headless only when it is a shell."""
+        marks = marks_from_html(html, source="jra_html", fetched_at=fetched_at)
+        if marks.complete or not marks.saw_table:
+            warning = None if marks.complete or marks.saw_price else "JRA odds page could not be parsed"
+            runners = marks.runners if marks.complete else None
+            return ScratchPage(runners, marks.withheld, warning, False)
+        page_url = f"{self.ACCESS_O_URL}?CNAME={quote(cname, safe='')}"
+        fallback = PageFallback(
+            self.http_client,
+            site="jra",
+            headless_render=self._headless_render,
+            url_finder=same_site_status_urls,
+        )
+        loaded = fallback.load(
+            url=page_url,
+            params=None,
+            headers=None,
+            encoding=self.ACCESS_D_ENCODING,
+            fetched_at=fetched_at,
+            should_fallback=lambda body: not marks_from_html(
+                body, source="jra_html", fetched_at=fetched_at
+            ).complete,
+            still_incomplete=lambda pages: not self._marks_from_pages(pages, fetched_at).complete,
+            html_body=html,
+        )
+        if loaded.status == "blocked" and not loaded.pages:
+            warning = JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
+            return ScratchPage(None, set(), warning, True)
+        merged = self._marks_from_pages(loaded.pages, fetched_at)
+        warning = None
+        if loaded.status == "blocked":
+            warning = (
+                JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
+            )
+        elif loaded.warning == HEADLESS_UNAVAILABLE and not merged.complete:
+            warning = HEADLESS_UNAVAILABLE
+        elif not merged.complete:
+            warning = "JRA odds page could not be parsed"
+        runners = merged.runners if merged.complete or merged.runners else None
+        if merged.complete and not merged.runners:
+            runners = []
+        return ScratchPage(runners, merged.withheld, warning, loaded.status == "blocked")
+
+    def _marks_from_pages(self, pages: list[FetchedBody], fetched_at: datetime) -> OddsMarks:
+        """Merge HTML and later JSON. A later page does not invent a price."""
+        marks = OddsMarks()
+        for page in pages:
+            source = as_page_source(page.source)
+            if page.body.lstrip().startswith(("{", "[")):
+                extra = marks_from_json(page.body, source=source, fetched_at=fetched_at)
+            else:
+                extra = marks_from_html(page.body, source=source, fetched_at=fetched_at)
+            marks.saw_price = marks.saw_price or extra.saw_price
+            marks.saw_table = marks.saw_table or extra.saw_table
+            marks.withheld.update(extra.withheld)
+            seen = {runner.horse_number for runner in marks.runners}
+            for runner in extra.runners:
+                if runner.horse_number not in seen:
+                    marks.runners.append(runner)
+                    seen.add(runner.horse_number)
+        return marks
+
+    def _shutuba_needs_fallback(self, html: str) -> bool:
+        """True when a starter table is present but status was not on it."""
+        soup = BeautifulSoup(html, "lxml")
+        if soup.find("table") is None:
+            return False
+        entries = self._parse_shutuba_entries(soup, source="jra_html", fetched_at=tokyo_now())
+        if not entries:
+            return True
+        return any(entry.status is None for entry in entries)
+
+    def _card_with_fallback(
+        self,
+        html: str,
+        race_id: str,
+        cname: _ParsedRaceCname,
+        fetched_at: datetime,
+    ) -> RaceCard | None:
+        """HTML first, then JSON the page embeds or calls, then headless."""
+        page_url = f"{self.ACCESS_D_URL}?CNAME={quote(cname.cname, safe='')}"
+        fallback = PageFallback(
+            self.http_client,
+            site="jra",
+            headless_render=self._headless_render,
+            url_finder=same_site_status_urls,
+        )
+        loaded = fallback.load(
+            url=page_url,
+            params=None,
+            headers=None,
+            encoding=self.ACCESS_D_ENCODING,
+            fetched_at=fetched_at,
+            should_fallback=self._shutuba_needs_fallback,
+            still_incomplete=lambda pages: self._card_pages_incomplete(pages, race_id, cname),
+            html_body=html,
+        )
+        if loaded.status == "blocked" and not loaded.pages:
+            return None
+        card = self._card_from_pages(loaded.pages, race_id, cname)
+        if card is None:
+            return None
+        warning = self._card_warning(card, loaded.warning, loaded.status)
+        if warning != card.warning:
+            card = card.model_copy(update={"warning": warning})
+        return card
+
+    def _card_pages_incomplete(
+        self, pages: list[FetchedBody], race_id: str, cname: _ParsedRaceCname
+    ) -> bool:
+        card = self._card_from_pages(pages, race_id, cname)
+        if card is None or not card.entries:
+            return True
+        return any(entry.status is None for entry in card.entries)
+
+    def _card_from_pages(
+        self, pages: list[FetchedBody], race_id: str, cname: _ParsedRaceCname
+    ) -> RaceCard | None:
+        """Merge starter rows. A later source fills only a missing status."""
+        card: RaceCard | None = None
+        for page in pages:
+            source = as_page_source(page.source)
+            if not page.body.lstrip().startswith(("{", "[")):
+                soup = BeautifulSoup(page.body, "lxml")
+                entries = self._parse_shutuba_entries(
+                    soup, source=source, fetched_at=page.fetched_at
+                )
+                if card is None:
+                    race = self._parse_shutuba_race(soup, race_id, cname, len(entries))
+                    card = RaceCard(race=race, entries=entries)
+                elif entries:
+                    card = card.model_copy(
+                        update={
+                            "entries": apply_records(
+                                card.entries,
+                                records_from_entries(entries),
+                                source=page.source,
+                                fetched_at=page.fetched_at,
+                            )
+                        }
+                    )
+            records = _page_records(page.body)
+            if card is not None and records:
+                card = card.model_copy(
+                    update={
+                        "entries": apply_records(
+                            card.entries,
+                            records,
+                            source=page.source,
+                            fetched_at=page.fetched_at,
+                        )
+                    }
+                )
+        if card is None:
+            return None
+        if card.entries and (card.race.entry_count or 0) != len(card.entries):
+            race = card.race.model_copy(update={"entry_count": len(card.entries)})
+            card = card.model_copy(update={"race": race})
+        if not card.entries and card.race.race_name.endswith("R"):
+            return None
+        return card
+
+    def _card_warning(self, card: RaceCard, chain_warning: str | None, status: str) -> str | None:
+        """A complete status list does not keep a fallback warning."""
+        if card.entries and all(entry.status is not None for entry in card.entries):
+            return None
+        blocked = None
+        if status == "blocked":
+            blocked = (
+                JRA_SHUTUBA_FORBIDDEN
+                if chain_warning and "403" in chain_warning
+                else JRA_SHUTUBA_LOGIN
+            )
+        headless = HEADLESS_UNAVAILABLE if chain_warning == HEADLESS_UNAVAILABLE else None
+        missing = SCRATCH_STATUS_MISSING if card.entries else None
+        return join_warnings(blocked, headless, missing)
+
     def _parse_race_card(
-        self, html: str, race_id: str, cname: _ParsedRaceCname
+        self,
+        html: str,
+        race_id: str,
+        cname: _ParsedRaceCname,
+        *,
+        source: str = "jra_html",
+        fetched_at: datetime | None = None,
     ) -> RaceCard | None:
         """Parse a shutuba page into a race card."""
         soup = BeautifulSoup(html, "lxml")
-        entries = self._parse_shutuba_entries(soup)
+        fetched = fetched_at or tokyo_now()
+        entries = self._parse_shutuba_entries(soup, source=source, fetched_at=fetched)
         if not entries:
             return None
 
@@ -798,18 +1100,31 @@ class JRAScraper(BaseScraper):
             entry_count=entry_count,
         )
 
-    def _parse_shutuba_entries(self, soup: BeautifulSoup) -> list[RaceEntry]:
+    def _parse_shutuba_entries(
+        self,
+        soup: BeautifulSoup,
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> list[RaceEntry]:
         """Parse starter rows from the shutuba table."""
         entries: list[RaceEntry] = []
+        page_source = as_page_source(source)
         for row in soup.select("table tr"):
             if row.select_one("td.waku") is None or row.select_one("td.horse") is None:
                 continue
-            entry = self._parse_shutuba_row(row)
+            entry = self._parse_shutuba_row(row, source=page_source, fetched_at=fetched_at)
             if entry is not None:
                 entries.append(entry)
         return entries
 
-    def _parse_shutuba_row(self, row: Tag) -> RaceEntry | None:
+    def _parse_shutuba_row(
+        self,
+        row: Tag,
+        *,
+        source: str,
+        fetched_at: datetime,
+    ) -> RaceEntry | None:
         """Parse one starter row."""
         bracket_number = self._bracket_number(row.select_one("td.waku"))
         horse_number = self.extract_number(self._cell_text(row, "td.num"))
@@ -830,6 +1145,9 @@ class JRAScraper(BaseScraper):
 
         sex, age = self._parse_sex_age(self._node_text(jockey_cell.select_one("p.age")))
         weight_diff = self._horse_weight_diff(horse_cell)
+        printed = row_status(row)
+        status = printed[0] if printed is not None else "entered"
+        status_label = printed[1] if printed is not None else None
         return RaceEntry(
             bracket_number=bracket_number,
             horse_number=horse_number,
@@ -844,6 +1162,10 @@ class JRAScraper(BaseScraper):
             horse_weight_diff=weight_diff,
             odds=self._odds(horse_cell),
             popularity=self._popularity(horse_cell),
+            status=status,
+            status_label=status_label,
+            source=as_page_source(source),
+            fetched_at=fetched_at,
         )
 
     def _venue_name(self, venue_code: str) -> str:

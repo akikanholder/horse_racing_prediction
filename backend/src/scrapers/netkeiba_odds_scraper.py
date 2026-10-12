@@ -27,7 +27,7 @@
 馬連は ``data.odds["4"]``。キーはワイドと同じ馬番2桁の連結で、
 値は単勝と同じ ``[オッズ, 変動, 人気]``。組み合わせは ``3-7``（小さい順）。
 変動は範囲ではないので ``odds_min`` / ``odds_max`` には入れない。
-価格が無い行は捨てる。
+価格が無い行は捨てる。``----`` と ``取消`` / ``除外`` は捨てず、価格は null のまま残す。
 三連複は同じ API の type=7。Referer はオッズページの type=b7
 （ナビ ``odds_navi_b7`` が 3連複）。
 
@@ -55,6 +55,7 @@ import requests
 from backend.models.odds import (
     ODDS_ENCODING,
     BetType,
+    NonRunner,
     OddsKind,
     OddsQuote,
     OddsSource,
@@ -63,6 +64,14 @@ from backend.models.odds import (
     RacePhase,
 )
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.runner_status import (
+    PriceCell,
+    RangeCell,
+    non_runners_from_cells,
+    read_price_cell,
+    read_range_cell,
+    records_from_json,
+)
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
@@ -72,7 +81,6 @@ WIDE_ODDS_KEY = "5"
 UMAREN_ODDS_KEY = "4"
 SANRENPUKU_ODDS_KEY = "7"
 _LIVE_STATUSES = frozenset({"result", "middle"})
-_PLACEHOLDERS = frozenset({"", "-", "--", "---", "---.-", "**", "*", "----"})
 _MARKET_UPDATED_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
     "%Y/%m/%d %H:%M:%S",
@@ -230,7 +238,7 @@ def parse_netkeiba_win_odds(
     if isinstance(opened, RaceOdds):
         return opened
     win_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
-    quotes = _quotes_from_win_map(
+    quotes, runners = _quotes_from_win_map(
         win_map,
         race_id=race_id,
         source=source,
@@ -238,10 +246,12 @@ def parse_netkeiba_win_odds(
         fetched_at=fetched_at,
         market_updated_at=market_updated_at,
     )
+    runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
-        return _unavailable(
+        empty = _unavailable(
             race_id, fetched_at, reason or "odds unavailable", "win", race_phase=race_phase
         )
+        return empty.model_copy(update={"non_runners": runners})
 
     return RaceOdds(
         race_id=race_id,
@@ -252,6 +262,7 @@ def parse_netkeiba_win_odds(
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
         quotes=quotes,
+        non_runners=runners,
         fetched_at=fetched_at,
     )
 
@@ -278,7 +289,7 @@ def parse_netkeiba_wide_odds(
     if isinstance(opened, RaceOdds):
         return opened
     wide_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
-    quotes = _quotes_from_wide_map(
+    quotes, runners = _quotes_from_wide_map(
         wide_map,
         race_id=race_id,
         source=source,
@@ -286,10 +297,12 @@ def parse_netkeiba_wide_odds(
         fetched_at=fetched_at,
         market_updated_at=market_updated_at,
     )
+    runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
-        return _unavailable(
+        empty = _unavailable(
             race_id, fetched_at, reason or "odds unavailable", "wide", race_phase=race_phase
         )
+        return empty.model_copy(update={"non_runners": runners})
 
     return RaceOdds(
         race_id=race_id,
@@ -300,6 +313,7 @@ def parse_netkeiba_wide_odds(
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
         quotes=quotes,
+        non_runners=runners,
         fetched_at=fetched_at,
     )
 
@@ -327,7 +341,7 @@ def parse_netkeiba_umaren_odds(
     if isinstance(opened, RaceOdds):
         return opened
     umaren_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
-    quotes = _quotes_from_umaren_map(
+    quotes, runners = _quotes_from_umaren_map(
         umaren_map,
         race_id=race_id,
         source=source,
@@ -335,10 +349,12 @@ def parse_netkeiba_umaren_odds(
         fetched_at=fetched_at,
         market_updated_at=market_updated_at,
     )
+    runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
-        return _unavailable(
+        empty = _unavailable(
             race_id, fetched_at, reason or "odds unavailable", "umaren", race_phase=race_phase
         )
+        return empty.model_copy(update={"non_runners": runners})
 
     return RaceOdds(
         race_id=race_id,
@@ -349,6 +365,7 @@ def parse_netkeiba_umaren_odds(
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
         quotes=quotes,
+        non_runners=runners,
         fetched_at=fetched_at,
     )
 
@@ -376,7 +393,7 @@ def parse_netkeiba_sanrenpuku_odds(
     if isinstance(opened, RaceOdds):
         return opened
     trio_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
-    quotes = _quotes_from_sanrenpuku_map(
+    quotes, runners = _quotes_from_sanrenpuku_map(
         trio_map,
         race_id=race_id,
         source=source,
@@ -384,14 +401,16 @@ def parse_netkeiba_sanrenpuku_odds(
         fetched_at=fetched_at,
         market_updated_at=market_updated_at,
     )
+    runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
-        return _unavailable(
+        empty = _unavailable(
             race_id,
             fetched_at,
             reason or "odds unavailable",
             "sanrenpuku",
             race_phase=race_phase,
         )
+        return empty.model_copy(update={"non_runners": runners})
 
     return RaceOdds(
         race_id=race_id,
@@ -402,6 +421,7 @@ def parse_netkeiba_sanrenpuku_odds(
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
         quotes=quotes,
+        non_runners=runners,
         fetched_at=fetched_at,
     )
 
@@ -500,31 +520,40 @@ def _quotes_from_win_map(
     kind: OddsKind,
     fetched_at: datetime,
     market_updated_at: datetime | None,
-) -> list[OddsQuote]:
-    """Build one quote per horse. Combination is the horse number as a string."""
+) -> tuple[list[OddsQuote], list[NonRunner]]:
+    """Build one quote per horse. Combination is the horse number as a string.
+
+    A cell printed as ``----`` or ``取消`` stays, with a null price.
+    An empty cell is still dropped.
+    """
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
+    priced: list[tuple[str, PriceCell]] = []
     for key in sorted(win_map, key=_sort_key):
         combination = _combination(key)
         if combination is None or combination in seen:
             continue
-        odds_value = _positive_odds(win_map[key])
-        if odds_value is None:
+        cell = read_price_cell(win_map[key])
+        if cell is None:
             continue
         seen.add(combination)
+        priced.append((combination, cell))
         quotes.append(
             OddsQuote(
                 race_id=race_id,
                 bet_type="win",
                 combination=combination,
-                odds=odds_value,
+                odds=cell.odds,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
                 market_updated_at=market_updated_at,
+                non_runner=cell.non_runner,
+                withheld=cell.withheld,
             )
         )
-    return quotes
+    runners = non_runners_from_cells(priced, source="netkeiba_js", fetched_at=fetched_at)
+    return quotes, runners
 
 
 def _quotes_from_wide_map(
@@ -535,21 +564,24 @@ def _quotes_from_wide_map(
     kind: OddsKind,
     fetched_at: datetime,
     market_updated_at: datetime | None,
-) -> list[OddsQuote]:
-    """Build one quote per unordered pair. Combination is lower-higher."""
-    candidates: list[tuple[tuple[int, int, int, str], str, float, float]] = []
+) -> tuple[list[OddsQuote], list[NonRunner]]:
+    """Build one quote per unordered pair. Combination is lower-higher.
+
+    ``----`` or ``取消`` keeps the pair and nulls both ends. One missing end
+    still drops the pair. The present end is not copied into a range.
+    """
+    candidates: list[tuple[tuple[int, int, int, str], str, RangeCell]] = []
     for key, raw in wide_map.items():
         pair = _wide_pair(key)
-        odds_range = _odds_range(raw)
+        odds_range = read_range_cell(raw)
         if pair is None or odds_range is None or not isinstance(key, str):
             continue
         combination = f"{pair[0]}-{pair[1]}"
-        odds_min, odds_max = odds_range
-        candidates.append((_pair_sort(key, pair), combination, odds_min, odds_max))
+        candidates.append((_pair_sort(key, pair), combination, odds_range))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, odds_min, odds_max in sorted(candidates):
+    for _sort, combination, odds_range in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -558,15 +590,17 @@ def _quotes_from_wide_map(
                 race_id=race_id,
                 bet_type="wide",
                 combination=combination,
-                odds_min=odds_min,
-                odds_max=odds_max,
+                odds_min=odds_range.odds_min,
+                odds_max=odds_range.odds_max,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
                 market_updated_at=market_updated_at,
+                non_runner=odds_range.non_runner,
+                withheld=odds_range.withheld,
             )
         )
-    return quotes
+    return quotes, []
 
 
 def _quotes_from_umaren_map(
@@ -577,20 +611,23 @@ def _quotes_from_umaren_map(
     kind: OddsKind,
     fetched_at: datetime,
     market_updated_at: datetime | None,
-) -> list[OddsQuote]:
-    """Build one quote per unordered pair. Price is a single odds value."""
-    candidates: list[tuple[tuple[int, int, int, str], str, float]] = []
+) -> tuple[list[OddsQuote], list[NonRunner]]:
+    """Build one quote per unordered pair. Price is a single odds value.
+
+    ``----`` or ``取消`` keeps the pair with a null price. An empty cell is dropped.
+    """
+    candidates: list[tuple[tuple[int, int, int, str], str, PriceCell]] = []
     for key, raw in umaren_map.items():
         pair = _wide_pair(key)
-        odds_value = _positive_odds(raw)
-        if pair is None or odds_value is None or not isinstance(key, str):
+        cell = read_price_cell(raw)
+        if pair is None or cell is None or not isinstance(key, str):
             continue
         combination = f"{pair[0]}-{pair[1]}"
-        candidates.append((_pair_sort(key, pair), combination, odds_value))
+        candidates.append((_pair_sort(key, pair), combination, cell))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, odds_value in sorted(candidates):
+    for _sort, combination, cell in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -599,14 +636,16 @@ def _quotes_from_umaren_map(
                 race_id=race_id,
                 bet_type="umaren",
                 combination=combination,
-                odds=odds_value,
+                odds=cell.odds,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
                 market_updated_at=market_updated_at,
+                non_runner=cell.non_runner,
+                withheld=cell.withheld,
             )
         )
-    return quotes
+    return quotes, []
 
 
 def _quotes_from_sanrenpuku_map(
@@ -617,20 +656,23 @@ def _quotes_from_sanrenpuku_map(
     kind: OddsKind,
     fetched_at: datetime,
     market_updated_at: datetime | None,
-) -> list[OddsQuote]:
-    """Build one quote per unordered trio. Price is a single odds value."""
-    candidates: list[tuple[tuple[int, int, int, int, str], str, float]] = []
+) -> tuple[list[OddsQuote], list[NonRunner]]:
+    """Build one quote per unordered trio. Price is a single odds value.
+
+    ``----`` or ``取消`` keeps the trio with a null price. An empty cell is dropped.
+    """
+    candidates: list[tuple[tuple[int, int, int, int, str], str, PriceCell]] = []
     for key, raw in trio_map.items():
         trio = _trio(key)
-        odds_value = _positive_odds(raw)
-        if trio is None or odds_value is None or not isinstance(key, str):
+        cell = read_price_cell(raw)
+        if trio is None or cell is None or not isinstance(key, str):
             continue
         combination = f"{trio[0]}-{trio[1]}-{trio[2]}"
-        candidates.append((_trio_sort(key, trio), combination, odds_value))
+        candidates.append((_trio_sort(key, trio), combination, cell))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, odds_value in sorted(candidates):
+    for _sort, combination, cell in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -639,14 +681,44 @@ def _quotes_from_sanrenpuku_map(
                 race_id=race_id,
                 bet_type="sanrenpuku",
                 combination=combination,
-                odds=odds_value,
+                odds=cell.odds,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
                 market_updated_at=market_updated_at,
+                non_runner=cell.non_runner,
+                withheld=cell.withheld,
             )
         )
-    return quotes
+    return quotes, []
+
+
+def _runners_in_payload(payload: object, fetched_at: datetime) -> list[NonRunner]:
+    """Scratch list embedded beside the odds map. Odds numbers are not horses."""
+    if not isinstance(payload, dict):
+        return []
+    runners: list[NonRunner] = []
+    for record in records_from_json(json.dumps(payload)):
+        if record.status not in {"scratched", "excluded", "unknown"}:
+            continue
+        runners.append(
+            NonRunner(
+                horse_number=record.horse_number,
+                status=record.status,
+                status_label=record.status_label,
+                source="netkeiba_js",
+                fetched_at=fetched_at,
+            )
+        )
+    return runners
+
+
+def _merge_runner_lists(primary: list[NonRunner], extra: list[NonRunner]) -> list[NonRunner]:
+    """Keep the first mark for a horse number. Do not invent a second one."""
+    by_number = {runner.horse_number: runner for runner in primary}
+    for runner in extra:
+        by_number.setdefault(runner.horse_number, runner)
+    return [by_number[number] for number in sorted(by_number)]
 
 
 def _unavailable(
@@ -812,38 +884,3 @@ def _pair_sort(key: str, pair: tuple[int, int]) -> tuple[int, int, int, str]:
         ordered = 0
     return (pair[0], pair[1], ordered, text)
 
-
-def _odds_range(value: object) -> tuple[float, float] | None:
-    """Read ``[odds_min, odds_max, popularity]``. Both ends are required."""
-    if not isinstance(value, list | tuple) or len(value) < 2:
-        return None
-    low = _positive_odds(value[0])
-    high = _positive_odds(value[1])
-    if low is None or high is None:
-        return None
-    if low > high:
-        low, high = high, low
-    return low, high
-
-
-def _positive_odds(value: object) -> float | None:
-    """Read the win price from ``[odds, change, popularity]`` or a scalar."""
-    if isinstance(value, list | tuple):
-        if not value:
-            return None
-        value = value[0]
-    if isinstance(value, str):
-        text = value.strip().replace(",", "")
-        if text in _PLACEHOLDERS:
-            return None
-        try:
-            number = float(text)
-        except ValueError:
-            return None
-    elif isinstance(value, int | float) and not isinstance(value, bool):
-        number = float(value)
-    else:
-        return None
-    if number <= 0:
-        return None
-    return number

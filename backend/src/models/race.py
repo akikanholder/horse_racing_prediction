@@ -95,8 +95,17 @@ def _publication_applied(bias: TrackBias) -> bool:
     return bias.warning != TRACK_BIAS_NOT_LOADED
 
 
+CardRunnerStatus = Literal["entered", "scratched", "excluded", "unknown"]
+PageFetchSource = Literal["jra_html", "jra_js", "netkeiba_html", "netkeiba_js", "headless"]
+
+
 class RaceEntry(BaseModel):
-    """A single entry (horse) in a race."""
+    """A single entry (horse) in a race.
+
+    ``status`` は確定結果と同じ区分に、レース前の ``entered`` を足したもの。
+    印字が ``取消`` / ``出走取消`` なら ``scratched``、``除外`` / ``競走除外`` なら
+    ``excluded``。ページに無いときは null。着順の ``finished`` はレース前には使わない。
+    """
 
     bracket_number: int = Field(..., description="枠番", ge=1, le=8)
     horse_number: int = Field(..., description="馬番", ge=1)
@@ -114,6 +123,22 @@ class RaceEntry(BaseModel):
     horse_weight_diff: int | None = Field(None, description="馬体重増減")
     odds: float | None = Field(None, description="単勝オッズ")
     popularity: int | None = Field(None, description="人気順")
+    status: CardRunnerStatus | None = Field(
+        None,
+        description=(
+            "entered（出走）/ scratched（取消・出走取消）/ "
+            "excluded（除外・競走除外）/ unknown。ページに無いときは null"
+        ),
+    )
+    status_label: str | None = Field(
+        None,
+        description="ページに印字された区分。取消、出走取消、除外、競走除外など。出走は null",
+    )
+    source: PageFetchSource | None = Field(
+        None,
+        description="この区分を得た方法。jra_html / jra_js / netkeiba_html / netkeiba_js / headless",
+    )
+    fetched_at: datetime | None = Field(None, description="この区分を得た時刻")
 
 
 class RaceResult(BaseModel):
@@ -187,6 +212,13 @@ class RaceCard(BaseModel):
 
     race: Race
     entries: list[RaceEntry] = Field(default_factory=list, description="出走馬リスト")
+    warning: str | None = Field(
+        None,
+        description=(
+            "取消・除外がページから読めない理由。"
+            "読めている馬は status。読めない馬は status が null"
+        ),
+    )
 
     @model_validator(mode="after")
     def _fill_track_bias(self) -> "RaceCard":
