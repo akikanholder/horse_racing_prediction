@@ -35,6 +35,7 @@ from backend.scrapers.final_odds import (
     quotes_from_settled_win,
     result_is_post_race,
 )
+from backend.scrapers.jra_headless import close_shared
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import (
@@ -97,6 +98,7 @@ class HistoricalService:
         delay_seconds: float = HISTORICAL_REQUEST_DELAY,
         sleeper: Callable[[float], None] = time.sleep,
         headless_render: Literal["auto", "off"] = "auto",
+        fetch_mode: Literal["html", "headless", "auto"] = "html",
     ):
         self.delay_seconds = delay_seconds
         self._sleeper = sleeper
@@ -108,7 +110,8 @@ class HistoricalService:
                 min_request_interval=delay_seconds,
             )
             self.netkeiba = NetkeibaScraper(self.http, headless_render=headless_render)
-            self.jra = JRAScraper(self.http, headless_render=headless_render)
+            self.netkeiba.fetch_mode = fetch_mode
+            self.jra = JRAScraper(self.http, headless_render=headless_render, fetch_mode=fetch_mode)
             self.odds = NetkeibaOddsScraper(self.http)
         else:
             if netkeiba is None or jra is None or odds is None:
@@ -126,6 +129,7 @@ class HistoricalService:
         self.odds.close()
         if self.http is not None:
             self.http.close()
+        close_shared()
 
     def __enter__(self) -> HistoricalService:
         return self

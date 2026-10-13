@@ -318,6 +318,20 @@ python -m backend.cli result 202605030811 --json
 
 ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は後から馬場・調教でも使える。この契約の馬場・調教の中身は変えていない。
 
+### JRA の取得モード
+
+CLI の `--fetch-mode` と API の `fetch_mode` は `html`（既定）、`headless`、`auto`。対象は JRA 公式（accessD の出馬表、accessO のオッズ、accessH の払戻突き合わせ、馬場情報）。netkeiba の近走、競馬ブックの調教、netkeiba へのフォールバックは変えない。
+
+`html` は現行の HTTP。`headless` は Playwright で描画し、ページ内の JSON を数える。値は描画後の DOM を現行のパーサで読む。`source` はブラウザが文書を返したときだけ `headless`。`fetched_at` は今までどおり。JRA だけの返還は `source` が `headless`。netkeiba と足したときは `netkeiba_html+headless`。`auto` はブラウザがあれば headless、無ければ html で、未インストールの警告は出さない。
+
+`headless` でブラウザが無い、または描画に失敗したときは HTTP に戻り、`headless browser is not installed` または `headless render failed` を付ける。401/403、captcha、ログイン画面は HTTP に戻さず、null と今までの警告で止める。UA はブラウザ自身。差し替え、プロキシ、回避のための再試行はしない。間隔は 1.5 秒以上。
+
+確定オッズのパーサは `確定オッズ` の印字だけを確定とする。JRA の確定後ページが `最終オッズ` と出すときは、html も headless も確定引用は空のまま。単勝欄の数値は別で、このゲートは変えない。
+
+オッズの cname はページに印刷されたものを使う。メニューの `doAction` が先にあり、レースの `151ou` があるときはレース側を使う。`Z/` は最終オッズのボタン。チェックサムは計算しない。
+
+Playwright を入れる CI ワークフローはこのリポジトリに無い。ローカルページを描く4件（馬場、確定オッズ、取消、着順）は、`pip install -e ".[headless]"` と `playwright install chromium` が済んだ環境では実行する。無い環境では skip のまま。skip 条件は外さない。
+
 レース前の `Race` と `Horse` に `status`、`status_label`、`demoted`、`complete`、`result_phase` は無い。`RaceEntry` にはレース前の `status`（`entered` / `scratched` / `excluded` / `unknown`）と `status_label` がある。`demoted`、`complete`、`result_phase` は確定結果だけ。
 
 `payout_note` の文:

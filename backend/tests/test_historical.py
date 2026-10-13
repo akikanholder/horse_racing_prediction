@@ -1111,7 +1111,10 @@ def test_history_api_forwards_resume_from(monkeypatch):
     assert "remaining_race_ids" in body
 
 
-@pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")
+@pytest.mark.skipif(
+    not headless_browser_installed(),
+    reason="headless browser is not installed; no CI workflow installs Playwright",
+)
 def test_headless_render_reads_a_final_odds_page(tmp_path: Path):
     page = tmp_path / "odds.html"
     page.write_text(_load("jra_final_odds.html"), encoding="utf-8")

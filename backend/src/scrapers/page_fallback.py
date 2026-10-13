@@ -36,12 +36,20 @@ _HORSE_RESULT_PATH = re.compile(
 _BLOCKED_URL = re.compile(r"login|captcha|signin|odds", re.IGNORECASE)
 
 
+class _StatusResponse:
+    """Enough of an HTTP response for callers that read ``status_code``."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
 class AccessBlocked(Exception):
     """The site refused the page. Do not try another identity."""
 
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+        self.response = _StatusResponse(status)
 
 
 class HeadlessUnavailableError(Exception):
@@ -230,6 +238,7 @@ class PageFallback:
         should_fallback: Callable[[str], bool],
         still_incomplete: Callable[[list[FetchedBody]], bool] | None = None,
         html_body: str | None = None,
+        document_source: str | None = None,
     ) -> FallbackFetch:
         """GET ``url``. On 403 or a login wall, return no further documents.
 
@@ -242,9 +251,7 @@ class PageFallback:
             try:
                 html = self._get(url, params=params, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:
-                return FallbackFetch(
-                    status="blocked", warning=_blocked_warning(self.site, blocked)
-                )
+                return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, blocked))
             except Exception as exc:
                 logger.error("Page fetch failed for %s: %s", url, exc)
                 return FallbackFetch(status="failed", warning=None)
@@ -256,10 +263,11 @@ class PageFallback:
             return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, login))
 
         page_url = _with_query(url, params)
+        first_source = document_source or f"{self.site}_html"
         pages = [
             FetchedBody(
                 body=html,
-                source=f"{self.site}_html",
+                source=first_source,
                 fetched_at=fetched_at,
                 url=page_url,
             )
@@ -267,11 +275,12 @@ class PageFallback:
         if not should_fallback(html):
             return FallbackFetch(status="ok", pages=pages)
 
+        json_source = "headless" if document_source == "headless" else f"{self.site}_js"
         for payload in embedded_json_payloads(html):
             pages.append(
                 FetchedBody(
                     body=payload,
-                    source=f"{self.site}_js",
+                    source=json_source,
                     fetched_at=fetched_at,
                     url=page_url,
                 )
@@ -303,10 +312,13 @@ class PageFallback:
                     pages=pages,
                     warning=_blocked_warning(self.site, login),
                 )
+            fragment_source = f"{self.site}_js"
+            if document_source == "headless" and getattr(self.http_client, "used_headless", False):
+                fragment_source = "headless"
             pages.append(
                 FetchedBody(
                     body=body,
-                    source=f"{self.site}_js",
+                    source=fragment_source,
                     fetched_at=fetched_at,
                     url=endpoint,
                 )

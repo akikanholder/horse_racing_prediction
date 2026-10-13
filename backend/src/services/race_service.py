@@ -1,6 +1,8 @@
 """Race service for aggregating data from multiple sources."""
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from backend.models.race import (
 from backend.models.race_trends import RaceTrendReport
 from backend.models.training import TRAINING_FETCH_FAILED, unavailable_training
 from backend.scrapers.day_of_bias import DayOfBiasClient, fetch_failed_publication
+from backend.scrapers.jra_headless import close_shared
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
@@ -50,8 +53,15 @@ logger = logging.getLogger(__name__)
 class RaceService:
     """Service for aggregating race data from multiple sources."""
 
-    def __init__(self):
-        """Initialize race service."""
+    def __init__(self, fetch_mode: str = "html"):
+        """Initialize race service.
+
+        ``fetch_mode`` is ``html`` (the HTTP path), ``headless``, or ``auto``.
+        It applies to JRA official pages. netkeiba near-runs stay on HTTP.
+        """
+        if fetch_mode not in {"html", "headless", "auto"}:
+            fetch_mode = "html"
+        self.fetch_mode = fetch_mode
         self._jra_scraper: JRAScraper | None = None
         self._netkeiba_scraper: NetkeibaScraper | None = None
         self._odds_scraper: NetkeibaOddsScraper | None = None
@@ -62,7 +72,7 @@ class RaceService:
     def jra_scraper(self) -> JRAScraper:
         """Get or create JRA scraper."""
         if self._jra_scraper is None:
-            self._jra_scraper = JRAScraper()
+            self._jra_scraper = JRAScraper(fetch_mode=self.fetch_mode)  # type: ignore[arg-type]
         return self._jra_scraper
 
     @property
@@ -70,6 +80,7 @@ class RaceService:
         """Get or create Netkeiba scraper."""
         if self._netkeiba_scraper is None:
             self._netkeiba_scraper = NetkeibaScraper()
+            self._netkeiba_scraper.fetch_mode = self.fetch_mode
         return self._netkeiba_scraper
 
     @property
@@ -79,7 +90,12 @@ class RaceService:
             self._odds_scraper = NetkeibaOddsScraper()
         return self._odds_scraper
 
-    def get_weekly_races(self) -> RaceSchedule:
+    def get_weekly_races(self, *, fetch_mode: str | None = None) -> RaceSchedule:
+        """Get this week's race schedule from all sources."""
+        with self._using(fetch_mode):
+            return self._weekly_races()
+
+    def _weekly_races(self) -> RaceSchedule:
         """Get this week's race schedule from all sources.
 
         Combines data from JRA and netkeiba for comprehensive coverage.
@@ -160,7 +176,12 @@ class RaceService:
 
         return sorted(all_races.values(), key=lambda race: (race.venue, race.race_number))
 
-    def get_race_card(self, race_id: str) -> RaceCard | None:
+    def get_race_card(self, race_id: str, *, fetch_mode: str | None = None) -> RaceCard | None:
+        """Get race card with all entries."""
+        with self._using(fetch_mode):
+            return self._race_card(race_id)
+
+    def _race_card(self, race_id: str) -> RaceCard | None:
         """Get race card with all entries.
 
         Combines the netkeiba shutuba page with the JRA accessD card.
@@ -235,7 +256,14 @@ class RaceService:
             logger.error(f"Failed to get race result for {race_id}: {e}")
             return None
 
-    def get_settled_race_result(self, race_id: str) -> SettledRaceResult:
+    def get_settled_race_result(
+        self, race_id: str, *, fetch_mode: str | None = None
+    ) -> SettledRaceResult:
+        """Settled finish order and payouts for one race."""
+        with self._using(fetch_mode):
+            return self._settled_race_result(race_id)
+
+    def _settled_race_result(self, race_id: str) -> SettledRaceResult:
         """Settled finish order and payouts for one race.
 
         This is the post-race settlement used for mark × finish logs.
@@ -262,6 +290,7 @@ class RaceService:
         priority_venues: bool = False,
         delay_seconds: float = 1.5,
         resume_from: str | None = None,
+        fetch_mode: str | None = None,
     ) -> HistoricalBatch:
         """Past flat races for an EV backtest.
 
@@ -270,7 +299,8 @@ class RaceService:
         are kept only when the page says 確定オッズ or the page is post-race.
         Live odds are not copied.
         """
-        with HistoricalService(delay_seconds=delay_seconds) as service:
+        mode = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
+        with HistoricalService(delay_seconds=delay_seconds, fetch_mode=mode) as service:
             return service.get(
                 race_id=race_id,
                 on_date=on_date,
@@ -304,13 +334,15 @@ class RaceService:
         date_to: date | None = None,
         recent_meeting: bool = False,
         as_of: date | None = None,
+        fetch_mode: str | None = None,
     ) -> RaceTrendReport:
         """Win, top-2, top-3, and ROI tables over settled history.
 
         The rows come from ``history`` and the local page cache. A missing
         price or sire stays null. A 403 or a login wall is not retried.
         """
-        with RaceTrendService() as service:
+        mode = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
+        with RaceTrendService(fetch_mode=mode) as service:
             return service.get(
                 venues=venues,
                 surface=surface,
@@ -325,6 +357,18 @@ class RaceService:
             )
 
     def get_race_odds(
+        self,
+        race_id: str,
+        bet_types: str | list[str] | None = "win",
+        prefer: str = "live",
+        *,
+        fetch_mode: str | None = None,
+    ) -> RaceOdds:
+        """Get win, wide, umaren, and sanrenpuku odds quotes for EV."""
+        with self._using(fetch_mode):
+            return self._race_odds(race_id, bet_types, prefer)
+
+    def _race_odds(
         self,
         race_id: str,
         bet_types: str | list[str] | None = "win",
@@ -776,6 +820,28 @@ class RaceService:
         if self._training_scraper:
             self._training_scraper.close()
             self._training_scraper = None
+        close_shared()
+
+    @contextmanager
+    def _using(self, fetch_mode: str | None) -> Iterator[None]:
+        """Apply one JRA fetch mode for the duration of a call."""
+        chosen = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
+        previous = self.fetch_mode
+        previous_jra = getattr(self._jra_scraper, "fetch_mode", None)
+        previous_nk = getattr(self._netkeiba_scraper, "fetch_mode", None)
+        self.fetch_mode = chosen
+        if self._jra_scraper is not None and hasattr(self._jra_scraper, "fetch_mode"):
+            self._jra_scraper.fetch_mode = chosen  # type: ignore[assignment]
+        if self._netkeiba_scraper is not None and hasattr(self._netkeiba_scraper, "fetch_mode"):
+            self._netkeiba_scraper.fetch_mode = chosen
+        try:
+            yield
+        finally:
+            self.fetch_mode = previous
+            if previous_jra is not None and hasattr(self._jra_scraper, "fetch_mode"):
+                self._jra_scraper.fetch_mode = previous_jra  # type: ignore[assignment]
+            if previous_nk is not None and hasattr(self._netkeiba_scraper, "fetch_mode"):
+                self._netkeiba_scraper.fetch_mode = previous_nk
 
     def __enter__(self):
         """Context manager entry."""

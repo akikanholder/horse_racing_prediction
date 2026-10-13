@@ -32,6 +32,37 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _jra_fetch_flags() -> argparse.ArgumentParser:
+    """``--fetch-mode`` for JRA official pages. The default stays the HTTP path."""
+    flags = argparse.ArgumentParser(add_help=False)
+    flags.add_argument(
+        "--fetch-mode",
+        choices=["html", "headless", "auto"],
+        default="html",
+        help=(
+            "JRA公式の取得。html は現行のHTTP。headless はブラウザ。"
+            "auto はブラウザがあれば使い、無ければ HTTP。"
+            "403・ログイン・captcha は HTTP に戻さない"
+        ),
+    )
+    return flags
+
+
+def _open_service(factory: Callable[[], Any], args: Any) -> Any:
+    """Construct a service and set JRA fetch mode when the service has one."""
+    service = factory()
+    mode = getattr(args, "fetch_mode", "html")
+    if hasattr(service, "fetch_mode"):
+        service.fetch_mode = mode
+    scraper = getattr(service, "_jra_scraper", None)
+    if scraper is not None and hasattr(scraper, "fetch_mode"):
+        scraper.fetch_mode = mode
+    netkeiba = getattr(service, "_netkeiba_scraper", None)
+    if netkeiba is not None and hasattr(netkeiba, "fetch_mode"):
+        netkeiba.fetch_mode = mode
+    return service
+
+
 def _json_ready(data):
     """Turn models, including ones nested in dicts, into JSON values."""
     if hasattr(data, "model_dump"):
@@ -57,7 +88,7 @@ def print_json(data, indent: int = 2):
 
 def cmd_races(args):
     """Get weekly races."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         schedule = service.get_weekly_races()
         print(f"\n=== 今週のレース ({schedule.week_start} ~ {schedule.week_end}) ===")
         print(f"取得時刻: {schedule.fetched_at}")
@@ -75,7 +106,7 @@ def cmd_races(args):
 
 def cmd_race_card(args):
     """Get race card."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         race_card = service.get_race_card(args.race_id)
         if not race_card:
             print(f"レース {args.race_id} が見つかりません")
@@ -111,7 +142,7 @@ def cmd_race_card(args):
 
 def cmd_horse(args):
     """Get horse information."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         horse = service.get_horse_info(args.horse_id)
         if not horse:
             print(f"馬 {args.horse_id} が見つかりません")
@@ -278,7 +309,7 @@ def _format_performance(perf: HorsePerformance) -> str:
 
 def cmd_courses(args):
     """Get course information."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         if args.venue:
             course = service.get_course_info(args.venue)
             if not course:
@@ -340,7 +371,7 @@ def _moisture_text(moisture) -> str:
 
 def cmd_track(args):
     """Get detailed track (baba) information."""
-    with TrackInfoService() as service:
+    with _open_service(TrackInfoService, args) as service:
         results = service.get_track_info(
             racecourse=args.venue,
             date=args.date,
@@ -383,7 +414,7 @@ def cmd_track(args):
 
 def cmd_odds(args):
     """Get win, wide, umaren, and sanrenpuku odds quotes."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         snapshot = service.get_race_odds(
             args.race_id,
             bet_types=args.bet_types,
@@ -469,7 +500,7 @@ def cmd_result(args):
     This is post-race settlement for mark × finish logs.
     ``cli horse`` is that horse's past runs and is not this command.
     """
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         settled = service.get_settled_race_result(args.race_id)
 
     if args.json:
@@ -561,7 +592,7 @@ def cmd_history(args):
     if not args.race_id and not args.date and not args.date_from:
         print("race_id か --date か --from を指定してください")
         sys.exit(1)
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         batch = service.get_historical_races(
             race_id=args.race_id,
             on_date=_cli_date(args.date),
@@ -648,7 +679,7 @@ def cmd_trends(args):
     if not args.recent_meeting and not args.date and not args.date_from:
         print("--date か --from か --recent-meeting を指定してください")
         sys.exit(1)
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         report = service.get_race_trends(
             venues=args.venue,
             surface=args.surface,
@@ -734,7 +765,7 @@ def _rate_text(row: TrendBucket) -> str:
 
 def cmd_venues(args):
     """Get venue schedules."""
-    with RaceService() as service:
+    with _open_service(RaceService, args) as service:
         schedules = service.get_venue_schedules()
         print(f"\n=== 今週の開催競馬場 ({len(schedules)}場) ===\n")
 
@@ -756,13 +787,17 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON形式で出力")
 
     subparsers = parser.add_subparsers(dest="command", help="コマンド")
+    jra_flags = _jra_fetch_flags()
 
-    races_parser = subparsers.add_parser("races", help="今週のレース一覧を取得")
+    races_parser = subparsers.add_parser(
+        "races", help="今週のレース一覧を取得", parents=[jra_flags]
+    )
     races_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     races_parser.set_defaults(func=cmd_races)
 
     card_parser = subparsers.add_parser(
         "card",
+        parents=[jra_flags],
         help="出馬表を取得",
         description=(
             "出馬表。race.track_bias はページにある競馬場・芝/ダート・距離・馬場状態を写す。"
@@ -805,7 +840,7 @@ def main():
     venues_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     venues_parser.set_defaults(func=cmd_venues)
 
-    track_parser = subparsers.add_parser("track", help="馬場情報を取得")
+    track_parser = subparsers.add_parser("track", help="馬場情報を取得", parents=[jra_flags])
     track_parser.add_argument("--venue", "-V", help="競馬場名 (例: 中山)")
     track_parser.add_argument("--date", help="日付 YYYYMMDD (netkeiba)")
     track_parser.add_argument(
@@ -816,6 +851,7 @@ def main():
 
     result_parser = subparsers.add_parser(
         "result",
+        parents=[jra_flags],
         help="確定した1レースの着順と払戻を取得（馬の近走成績ではない）",
         description=(
             "確定した1レースの全頭の着順と払戻。マーク×着順の事後ログ用。"
@@ -829,6 +865,7 @@ def main():
 
     odds_parser = subparsers.add_parser(
         "odds",
+        parents=[jra_flags],
         help="単勝・ワイド・馬連・三連複のオッズを取得",
         description=(
             "単勝・ワイド・馬連・三連複のオッズ引用。"
@@ -863,6 +900,7 @@ def main():
 
     history_parser = subparsers.add_parser(
         "history",
+        parents=[jra_flags],
         help="過去の平地レースの確定オッズ・払戻・全着順を取得する",
         description=(
             "EV のバックテスト用。2025年以降の JRA 平地が対象。"
@@ -922,6 +960,7 @@ def main():
 
     trends_parser = subparsers.add_parser(
         "trends",
+        parents=[jra_flags],
         help="確定レースの人気・枠・脚質・騎手・父の勝率と回収を集計する",
         description=(
             "history の確定着順・確定オッズ・払戻と、ローカルキャッシュから集計する。"

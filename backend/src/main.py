@@ -31,6 +31,29 @@ race_service: RaceService | None = None
 track_info_service: TrackInfoService | None = None
 
 
+def _mode_arg(fetch_mode: str) -> dict[str, str]:
+    """Pass fetch_mode only when it is not the HTTP default.
+
+    Existing tests replace service methods with fakes that do not take the new
+    argument. The default request keeps that call shape.
+    """
+    if fetch_mode == "html":
+        return {}
+    return {"fetch_mode": fetch_mode}
+
+
+JraFetchMode = Annotated[
+    Literal["html", "headless", "auto"],
+    Query(
+        description=(
+            "JRA公式の取得。html（既定）/ headless / auto。"
+            "ブラウザが無い headless は HTTP に戻り警告する。"
+            "403・ログイン・captcha は HTTP に戻さない"
+        )
+    ),
+]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -92,7 +115,7 @@ async def root():
 
 
 @app.get("/api/races", response_model=RaceSchedule, tags=["Races"])
-async def get_weekly_races():
+async def get_weekly_races(fetch_mode: JraFetchMode = "html"):
     """今週のレース情報を取得する。
 
     JRAとnetkeibaから今週のレーススケジュールを取得します。
@@ -104,7 +127,7 @@ async def get_weekly_races():
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        schedule = race_service.get_weekly_races()
+        schedule = race_service.get_weekly_races(**_mode_arg(fetch_mode))
         return schedule
     except Exception as e:
         logger.error(f"Failed to get weekly races: {e}")
@@ -134,6 +157,7 @@ async def get_race_history_span(
         str | None,
         Query(description="このレースIDから再開する。それより前はキャッシュだけ"),
     ] = None,
+    fetch_mode: JraFetchMode = "html",
 ):
     """2025年以降の平地レースを、日付または日付範囲で返す。
 
@@ -154,6 +178,7 @@ async def get_race_history_span(
             flat_only=flat_only,
             priority_venues=priority_venues,
             resume_from=resume_from,
+            **_mode_arg(fetch_mode),
         )
     except Exception as e:
         logger.error(f"Failed to get historical races: {e}")
@@ -173,6 +198,7 @@ async def export_race_history(
         Literal["jsonl", "csv"],
         Query(alias="format", description="jsonl は1レース1行。csv は馬の行と芝・ダート別"),
     ] = "jsonl",
+    fetch_mode: JraFetchMode = "html",
 ):
     """範囲内のレースを、面で校正できる JSONL または CSV に書く。
 
@@ -191,6 +217,7 @@ async def export_race_history(
             flat_only=flat_only,
             priority_venues=priority_venues,
             resume_from=resume_from,
+            **_mode_arg(fetch_mode),
         )
         return race_service.export_historical_races(
             batch, str(_history_output_dir()), export_format
@@ -217,6 +244,7 @@ async def get_race_trends(
         Query(description="当日の確定レースと、同じ競馬場の前開催日だけ"),
     ] = False,
     as_of: Annotated[date | None, Query(description="recent meeting の当日。無ければ今日")] = None,
+    fetch_mode: JraFetchMode = "html",
 ):
     """人気、馬番、枠、脚質、騎手、父の勝率と回収。
 
@@ -239,6 +267,7 @@ async def get_race_trends(
             date_to=date_to,
             recent_meeting=recent_meeting,
             as_of=as_of,
+            **_mode_arg(fetch_mode),
         )
     except Exception as e:
         logger.error(f"Failed to get race trends: {e}")
@@ -246,7 +275,7 @@ async def get_race_trends(
 
 
 @app.get("/api/races/{race_id}", response_model=Race, tags=["Races"])
-async def get_race(race_id: str):
+async def get_race(race_id: str, fetch_mode: JraFetchMode = "html"):
     """特定のレース情報を取得する。
 
     Args:
@@ -259,7 +288,7 @@ async def get_race(race_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        race_card = race_service.get_race_card(race_id)
+        race_card = race_service.get_race_card(race_id, **_mode_arg(fetch_mode))
         if not race_card:
             raise HTTPException(status_code=404, detail=f"Race {race_id} not found")
         return race_card.race
@@ -271,7 +300,7 @@ async def get_race(race_id: str):
 
 
 @app.get("/api/races/{race_id}/card", response_model=RaceCard, tags=["Races"])
-async def get_race_card(race_id: str):
+async def get_race_card(race_id: str, fetch_mode: JraFetchMode = "html"):
     """レースの出馬表を取得する。
 
     Args:
@@ -288,7 +317,7 @@ async def get_race_card(race_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        race_card = race_service.get_race_card(race_id)
+        race_card = race_service.get_race_card(race_id, **_mode_arg(fetch_mode))
         if not race_card:
             raise HTTPException(status_code=404, detail=f"Race card for {race_id} not found")
         return race_card
@@ -300,7 +329,7 @@ async def get_race_card(race_id: str):
 
 
 @app.get("/api/races/{race_id}/result", response_model=SettledRaceResult, tags=["Races"])
-async def get_race_result(race_id: str):
+async def get_race_result(race_id: str, fetch_mode: JraFetchMode = "html"):
     """確定した1レースの着順と払戻を取得する。
 
     ``cli horse`` や ``/api/horses/{horse_id}`` の近走成績ではない。
@@ -318,7 +347,7 @@ async def get_race_result(race_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        return race_service.get_settled_race_result(race_id)
+        return race_service.get_settled_race_result(race_id, **_mode_arg(fetch_mode))
     except Exception as e:
         logger.error(f"Failed to get race result for {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -330,6 +359,7 @@ async def get_race_history(
     venue: Annotated[list[str] | None, Query()] = None,
     flat_only: Annotated[bool, Query()] = True,
     priority_venues: Annotated[bool, Query()] = False,
+    fetch_mode: JraFetchMode = "html",
 ):
     """1レースの確定着順、払戻、返還、確定オッズ。
 
@@ -344,6 +374,7 @@ async def get_race_history(
             venues=venue,
             flat_only=flat_only,
             priority_venues=priority_venues,
+            **_mode_arg(fetch_mode),
         )
     except Exception as e:
         logger.error(f"Failed to get historical race {race_id}: {e}")
@@ -373,6 +404,7 @@ async def get_race_odds(
             )
         ),
     ] = "live",
+    fetch_mode: JraFetchMode = "html",
 ):
     """レースの単勝・ワイド・馬連・三連複オッズを取得する。
 
@@ -405,7 +437,9 @@ async def get_race_odds(
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        return race_service.get_race_odds(race_id, bet_types=bet_types, prefer=prefer)
+        return race_service.get_race_odds(
+            race_id, bet_types=bet_types, prefer=prefer, **_mode_arg(fetch_mode)
+        )
     except Exception as e:
         logger.error(f"Failed to get odds for {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -595,6 +629,7 @@ async def get_track_info(
     venue: str | None = None,
     date: str | None = None,
     merge: bool = False,
+    fetch_mode: JraFetchMode = "html",
 ):
     """馬場情報（馬場状態、含水率、クッション値）を取得する。
 
@@ -609,7 +644,9 @@ async def get_track_info(
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        results = track_info_service.get_track_info(racecourse=venue, date=date, merge=merge)
+        results = track_info_service.get_track_info(
+            racecourse=venue, date=date, merge=merge, **_mode_arg(fetch_mode)
+        )
         if not results:
             raise HTTPException(status_code=404, detail="Track info not found")
         return results

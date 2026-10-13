@@ -14,6 +14,13 @@ from datetime import date
 
 from bs4 import BeautifulSoup, Tag
 
+from backend.scrapers.jra_headless import HEADLESS_RENDER_FAILED, shared_session
+from backend.scrapers.page_fallback import (
+    HEADLESS_UNAVAILABLE,
+    AccessBlocked,
+    HeadlessUnavailableError,
+)
+
 logger = logging.getLogger(__name__)
 
 JRA_PAYOUT_UNREACHABLE = "JRA official payout was not reachable"
@@ -66,38 +73,106 @@ def cross_check_payouts(
     http_client: object,
     key: OfficialPayoutKey | None,
     payouts: list[tuple[str, str, int, int | None]],
-) -> tuple[str | None, list[OfficialRefund] | None]:
-    """Return a payout warning and any 返還 block printed for this race.
+    *,
+    fetch_mode: str = "html",
+    session: object | None = None,
+) -> tuple[str | None, list[OfficialRefund] | None, str]:
+    """Return a payout warning, any 返還 block, and the JRA source token.
 
     ``payouts`` is the netkeiba list. This function does not invent replacements.
     Several rows of one bet type are kept. A missing popularity on one side is
     not a mismatch. ``None`` refunds means the page printed no 返還 block.
+    The source is ``headless`` only when the browser returned the documents.
+    A 403 is not fetched again through HTTP.
     """
     if key is None:
-        return JRA_PAYOUT_UNREACHABLE, None
+        return JRA_PAYOUT_UNREACHABLE, None, "jra_html"
     post = getattr(http_client, "post", None)
     if not callable(post):
-        return JRA_PAYOUT_UNREACHABLE, None
+        return JRA_PAYOUT_UNREACHABLE, None, "jra_html"
+    poster, source_of, extra = _payout_poster(post, fetch_mode, session)
     try:
-        index = _post(post, PAYOUT_INDEX_CNAME)
+        index = _post(poster, PAYOUT_INDEX_CNAME)
     except Exception as exc:
         logger.warning("JRA payout index was not reachable: %s", exc)
-        return _failure_warning(exc), None
+        return _join_note(_failure_warning(exc), extra()), None, source_of()
     cname = _meeting_cname(index, key)
     if cname is None:
-        return JRA_PAYOUT_UNREACHABLE, None
+        return _join_note(JRA_PAYOUT_UNREACHABLE, extra()), None, source_of()
     try:
-        day_html = _post(post, cname)
+        day_html = _post(poster, cname)
     except Exception as exc:
         logger.warning("JRA payout day page was not reachable: %s", exc)
-        return _failure_warning(exc), None
+        return _join_note(_failure_warning(exc), extra()), None, source_of()
     refunds = _race_refunds(day_html, key.race_number)
     if not payouts:
-        return None, refunds
+        return extra(), refunds, source_of()
     official = _race_tickets(day_html, key.race_number)
     if official is None:
-        return JRA_PAYOUT_UNREACHABLE, refunds
-    return _mismatch(payouts, official), refunds
+        return _join_note(JRA_PAYOUT_UNREACHABLE, extra()), refunds, source_of()
+    return _join_note(_mismatch(payouts, official), extra()), refunds, source_of()
+
+
+def _join_note(warning: str | None, extra: str | None) -> str | None:
+    if extra is None:
+        return warning
+    if warning is None:
+        return extra
+    if extra in warning:
+        return warning
+    return f"{warning}; {extra}"
+
+
+def _payout_poster(
+    http_post: object,
+    fetch_mode: str,
+    session: object | None,
+) -> tuple[object, object, object]:
+    """Return a poster, a source callable, and a fallback-warning callable."""
+    used: list[str] = []
+    notes: list[str] = []
+
+    def source_of() -> str:
+        if used and all(item == "headless" for item in used):
+            return "headless"
+        return "jra_html"
+
+    def extra() -> str | None:
+        if not notes:
+            return None
+        return notes[0]
+
+    def poster(url: str, data: dict[str, str] | None = None, encoding: str | None = None) -> str:
+        if fetch_mode not in {"headless", "auto"}:
+            used.append("html")
+            return http_post(url, data=data, encoding=encoding)  # type: ignore[operator]
+        browser = session
+        if browser is None:
+            try:
+                browser = shared_session()
+            except HeadlessUnavailableError:
+                browser = None
+        if browser is not None:
+            try:
+                body = browser.post(url, data=data, encoding=encoding)  # type: ignore[attr-defined]
+            except AccessBlocked:
+                raise
+            except HeadlessUnavailableError:
+                if fetch_mode == "headless" and HEADLESS_UNAVAILABLE not in notes:
+                    notes.append(HEADLESS_UNAVAILABLE)
+            except Exception as exc:
+                logger.warning("Headless JRA payout fetch failed: %s", exc)
+                if fetch_mode == "headless" and HEADLESS_RENDER_FAILED not in notes:
+                    notes.append(HEADLESS_RENDER_FAILED)
+            else:
+                if not isinstance(body, str):
+                    raise TypeError("Headless JRA payout response was not text")
+                used.append("headless")
+                return body
+        used.append("html")
+        return http_post(url, data=data, encoding=encoding)  # type: ignore[operator]
+
+    return poster, source_of, extra
 
 
 def _failure_warning(exc: BaseException) -> str:
