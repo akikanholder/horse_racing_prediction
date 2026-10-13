@@ -1,9 +1,12 @@
 """Track information service that aggregates data from multiple sources."""
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 
 from backend.models.track import CourseInfo, TrackInfo, empty_track_info
+from backend.scrapers.jra_headless import close_shared
 from backend.scrapers.jra_track_scraper import JRATrackScraper
 from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
 
@@ -35,13 +38,18 @@ class TrackInfoService:
         self,
         jra_scraper: JRATrackScraper | None = None,
         netkeiba_scraper: NetkeibaTrackScraper | None = None,
+        fetch_mode: str = "html",
     ):
         """Initialize the service with scrapers.
 
         Args:
             jra_scraper: JRA scraper instance (created if not provided)
             netkeiba_scraper: Netkeiba scraper instance (created if not provided)
+            fetch_mode: ``html``, ``headless``, or ``auto`` for the JRA baba pages
         """
+        if fetch_mode not in {"html", "headless", "auto"}:
+            fetch_mode = "html"
+        self.fetch_mode = fetch_mode
         self._jra_scraper = jra_scraper
         self._netkeiba_scraper = netkeiba_scraper
         self._owns_jra_scraper = jra_scraper is None
@@ -51,7 +59,7 @@ class TrackInfoService:
     def jra_scraper(self) -> JRATrackScraper:
         """Get JRA scraper, creating if necessary."""
         if self._jra_scraper is None:
-            self._jra_scraper = JRATrackScraper()
+            self._jra_scraper = JRATrackScraper(fetch_mode=self.fetch_mode)  # type: ignore[arg-type]
         return self._jra_scraper
 
     @property
@@ -61,9 +69,7 @@ class TrackInfoService:
             self._netkeiba_scraper = NetkeibaTrackScraper()
         return self._netkeiba_scraper
 
-    def get_track_info_from_jra(
-        self, racecourse: str | None = None
-    ) -> TrackInfo:
+    def get_track_info_from_jra(self, racecourse: str | None = None) -> TrackInfo:
         """Get track information from JRA.
 
         Args:
@@ -98,6 +104,7 @@ class TrackInfoService:
         date: str | None = None,
         sources: list[str] | None = None,
         merge: bool = False,
+        fetch_mode: str | None = None,
     ) -> dict[str, TrackInfo]:
         """Get track information from specified sources.
 
@@ -114,6 +121,16 @@ class TrackInfoService:
         if sources is None:
             sources = ["jra", "netkeiba"]
 
+        with self._using(fetch_mode):
+            return self._track_info(racecourse, date, sources, merge)
+
+    def _track_info(
+        self,
+        racecourse: str | None,
+        date: str | None,
+        sources: list[str],
+        merge: bool,
+    ) -> dict[str, TrackInfo]:
         results = {}
         errors = {}
 
@@ -130,15 +147,11 @@ class TrackInfoService:
         # payload stays the failure. Values copied from netkeiba name that source.
         if "netkeiba" in sources or _jra_needs_netkeiba(results.get("jra")):
             try:
-                results["netkeiba"] = self.get_track_info_from_netkeiba(
-                    racecourse, date
-                )
+                results["netkeiba"] = self.get_track_info_from_netkeiba(racecourse, date)
             except Exception as e:
                 logger.warning(f"Failed to get Netkeiba track info: {e}")
                 errors["netkeiba"] = str(e)
-                results["netkeiba"] = empty_track_info(
-                    "Netkeiba", "netkeiba track fetch failed"
-                )
+                results["netkeiba"] = empty_track_info("Netkeiba", "netkeiba track fetch failed")
 
         jra_info = results.get("jra")
         netkeiba_info = results.get("netkeiba")
@@ -307,6 +320,28 @@ class TrackInfoService:
             self._jra_scraper.close()
         if self._owns_netkeiba_scraper and self._netkeiba_scraper:
             self._netkeiba_scraper.close()
+        if self._owns_jra_scraper:
+            close_shared()
+
+    @contextmanager
+    def _using(self, fetch_mode: str | None) -> Iterator[None]:
+        chosen = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
+        previous = self.fetch_mode
+        scraper = self._jra_scraper
+        previous_scraper = getattr(scraper, "fetch_mode", None)
+        self.fetch_mode = chosen
+        if scraper is not None and hasattr(scraper, "fetch_mode"):
+            scraper.fetch_mode = chosen  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            self.fetch_mode = previous
+            if (
+                self._jra_scraper is not None
+                and previous_scraper is not None
+                and hasattr(self._jra_scraper, "fetch_mode")
+            ):
+                self._jra_scraper.fetch_mode = previous_scraper  # type: ignore[assignment]
 
     def __enter__(self):
         return self

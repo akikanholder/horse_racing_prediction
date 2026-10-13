@@ -55,9 +55,12 @@ class RaceTrendService:
         list_races: ListRaces | None = None,
         pedigree_lookup: PedigreeLookup | None = None,
         clock: Callable[[], date] | None = None,
+        fetch_mode: Literal["html", "headless", "auto"] = "html",
     ):
         self._owns = historical is None
-        self._historical = historical if historical is not None else HistoricalService()
+        self._historical = (
+            historical if historical is not None else HistoricalService(fetch_mode=fetch_mode)
+        )
         self._list_races = list_races
         self._pedigree_lookup = pedigree_lookup
         self._today = clock or date.today

@@ -876,6 +876,8 @@ def _merge_refunds(
     netkeiba: list[RaceRefund] | None,
     official: list[OfficialRefund] | None,
     fetched_at: datetime,
+    *,
+    jra_source: str = "jra_html",
 ) -> tuple[list[RaceRefund] | None, str | None]:
     """Keep the printed refund. Do not invent horses the page did not name."""
     if not official:
@@ -885,7 +887,7 @@ def _merge_refunds(
             horse_numbers=list(item.horse_numbers),
             bet_types=list(item.bet_types) if item.bet_types else None,
             bracket_numbers=list(item.bracket_numbers) if item.bracket_numbers else None,
-            source="jra_html",
+            source=jra_source,
             fetched_at=fetched_at,
         )
         for item in official
@@ -911,7 +913,7 @@ def _merge_refunds(
             update["bet_types"] = sorted(jra_bets)
         if record.bracket_numbers is None and jra_brackets:
             update["bracket_numbers"] = jra_brackets
-            update["source"] = "+".join(part for part in (record.source, "jra_html") if part)
+            update["source"] = "+".join(part for part in (record.source, jra_source) if part)
         if update:
             record = record.model_copy(update=update)
         merged.append(record)
@@ -1580,6 +1582,7 @@ class NetkeibaScraper(BaseScraper):
         """
         super().__init__(http_client)
         self._headless_render = headless_render
+        self.fetch_mode = "html"
 
     def get_weekly_races(self) -> RaceSchedule:
         """Get this week's race schedule from netkeiba.
@@ -2347,17 +2350,21 @@ class NetkeibaScraper(BaseScraper):
             if key is None:
                 notes.append(JRA_PAYOUT_UNREACHABLE)
                 official: list[OfficialRefund] | None = None
+                jra_source = "jra_html"
             else:
-                payout_note, official = cross_check_payouts(
+                payout_note, official, jra_source = cross_check_payouts(
                     self.http_client,
                     key,
                     [
                         (payout.bet_type, payout.combination, payout.payout, payout.popularity)
                         for payout in settled.payouts
                     ],
+                    fetch_mode=self.fetch_mode,
                 )
                 notes.append(payout_note)
-            refunds, refund_note = _merge_refunds(settled.refunds, official, settled.fetched_at)
+            refunds, refund_note = _merge_refunds(
+                settled.refunds, official, settled.fetched_at, jra_source=jra_source
+            )
             notes.append(refund_note)
         notes.append(_refund_status_warning(settled.results, refunds))
         warning = _join_warnings(settled.warning, *notes)

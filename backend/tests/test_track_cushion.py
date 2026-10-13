@@ -491,7 +491,10 @@ def test_missing_headless_browser_warns_and_leaves_cushion_null(monkeypatch):
     assert "headless browser is not installed" in info.warning
 
 
-@pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")
+@pytest.mark.skipif(
+    not headless_browser_installed(),
+    reason="headless browser is not installed; no CI workflow installs Playwright",
+)
 def test_installed_headless_browser_renders_a_local_track_page(tmp_path: Path):
     page = tmp_path / "track.html"
     page.write_text(

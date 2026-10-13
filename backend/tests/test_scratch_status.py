@@ -1090,7 +1090,10 @@ def test_cli_card_and_odds_text(monkeypatch, capsys):
     assert "2番 ----" in odds_out
 
 
-@pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")
+@pytest.mark.skipif(
+    not headless_browser_installed(),
+    reason="headless browser is not installed; no CI workflow installs Playwright",
+)
 def test_installed_headless_browser_renders_scratch_marks(tmp_path: Path):
     page = tmp_path / "shutuba.html"
     page.write_text(NETKEIBA_MARKED, encoding="utf-8")

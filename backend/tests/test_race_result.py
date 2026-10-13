@@ -1123,7 +1123,10 @@ def test_pre_race_models_do_not_carry_result_fields():
     assert {"status", "status_label", "source", "fetched_at"} <= set(RaceEntry.model_fields)
 
 
-@pytest.mark.skipif(not headless_browser_installed(), reason="headless browser is not installed")
+@pytest.mark.skipif(
+    not headless_browser_installed(),
+    reason="headless browser is not installed; no CI workflow installs Playwright",
+)
 def test_installed_headless_browser_renders_a_local_result_page(tmp_path: Path):
     page = tmp_path / "result.html"
     page.write_text(

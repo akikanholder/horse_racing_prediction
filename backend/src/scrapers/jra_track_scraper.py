@@ -25,6 +25,7 @@ from backend.models.track import (
     empty_track_info,
 )
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.jra_headless import HeadlessTransport
 from backend.scrapers.page_fallback import FetchedBody, PageFallback
 from backend.scrapers.track_readings import (
     CUSHION_MISSING,
@@ -85,13 +86,23 @@ class JRATrackScraper(BaseScraper):
         http_client: object | None = None,
         *,
         headless_render: Callable[[str], str] | Literal["auto", "off"] = "auto",
+        fetch_mode: Literal["html", "headless", "auto"] = "html",
+        headless_session: object | None = None,
     ):
         """Create a scraper.
 
         ``headless_render="off"`` skips the browser step and does not warn.
         ``"auto"`` uses Playwright when the browser is installed.
+        ``fetch_mode="html"`` keeps the HTTP path. A refusal is not fetched again.
         """
         super().__init__(http_client)  # type: ignore[arg-type]
+        self.fetch_mode: Literal["html", "headless", "auto"] = fetch_mode
+        self._transport = HeadlessTransport(
+            self.http_client,
+            mode_of=lambda: self.fetch_mode,
+            session=headless_session,
+        )
+        self.http_client = self._transport  # type: ignore[assignment]
         self._headless_render = headless_render
 
     def get_base_url(self) -> str:
@@ -136,10 +147,12 @@ class JRATrackScraper(BaseScraper):
             TrackInfo object with the scraped data, or an empty one
         """
         fetched = fetched_at or tokyo_now()
+        self._transport.fallback_warning = None
         requested = self._requested_name(racecourse)
         if racecourse and requested is None:
             return empty_track_info("JRA", self.BABA_UNPARSEABLE)
         pages: list[tuple[str, str]] = []
+        sources: dict[str, str] = {}
         saw_403 = False
         saw_error = False
         for url in self.BABA_INDEX_URLS:
@@ -154,6 +167,7 @@ class JRATrackScraper(BaseScraper):
                 logger.info("JRA baba fetch failed for %s (%s)", url, e)
                 continue
             pages.append((url, html))
+            sources[url] = "headless" if self._transport.used_headless else "jra_html"
 
         chosen = self._choose_page(pages, requested)
         if chosen is None:
@@ -163,12 +177,13 @@ class JRATrackScraper(BaseScraper):
         venue = self._title_venue(html) or requested
         if venue is None:
             return empty_track_info("JRA", self.BABA_UNPARSEABLE)
-        loaded = self._enrich(url, html, fetched)
+        loaded = self._enrich(url, html, fetched, document_source=sources.get(url))
         if not loaded.pages:
             return empty_track_info("JRA", self._blocked_warning(loaded.warning))
         info = self._from_pages(loaded.pages, venue)
-        if loaded.warning:
-            info = info.model_copy(update={"warning": join_warnings(info.warning, loaded.warning)})
+        extra = join_warnings(loaded.warning, self._transport.fallback_warning)
+        if extra:
+            info = info.model_copy(update={"warning": join_warnings(info.warning, extra)})
         return info
 
     def _requested_name(self, racecourse: str | None) -> str | None:
@@ -225,7 +240,14 @@ class JRATrackScraper(BaseScraper):
             return self.BABA_LOGIN
         return self.BABA_FETCH_FAILED
 
-    def _enrich(self, url: str, html: str, fetched_at: datetime) -> object:
+    def _enrich(
+        self,
+        url: str,
+        html: str,
+        fetched_at: datetime,
+        *,
+        document_source: str | None = None,
+    ) -> object:
         """Follow the page's own cushion fragment when the number slot is empty."""
         fallback = PageFallback(
             self.http_client,
@@ -242,15 +264,14 @@ class JRATrackScraper(BaseScraper):
             should_fallback=self._cushion_slot_empty,
             still_incomplete=self._still_missing_cushion,
             html_body=html,
+            document_source=document_source,
         )
 
     def _baba_urls(self, html: str, page_url: str) -> list[str]:
         """``_data_cushion.html`` and ``_data_moist.html`` only."""
 
         def fetch(script_url: str) -> str:
-            return fetch_or_block(
-                self.http_client.get, script_url, encoding=self.BABA_ENCODING
-            )
+            return fetch_or_block(self.http_client.get, script_url, encoding=self.BABA_ENCODING)
 
         return discover_jra_baba_urls(html, page_url, fetch)
 
@@ -688,9 +709,7 @@ class JRATrackScraper(BaseScraper):
 
                             rainfall = None
                             if rainfall_row and i < len(rainfall_row):
-                                rainfall = self._parse_float(
-                                    rainfall_row[i].get_text()
-                                )
+                                rainfall = self._parse_float(rainfall_row[i].get_text())
 
                             watering = False
                             if watering_row and i < len(watering_row):
@@ -844,9 +863,7 @@ def _apply_going(
     return info.model_copy(update={"turf": turf, "dirt": dirt})
 
 
-def _fill_post_time(
-    info: TrackInfo, text: str, source: str, fetched_at: datetime
-) -> TrackInfo:
+def _fill_post_time(info: TrackInfo, text: str, source: str, fetched_at: datetime) -> TrackInfo:
     """Copy 発走 when this document prints one and the track info does not have it."""
     if info.post_time is not None or not text:
         return info
