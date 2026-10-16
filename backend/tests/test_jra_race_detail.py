@@ -2,9 +2,12 @@
 
 from datetime import date
 
+from bs4 import BeautifulSoup
+
 from backend.models.race import Race, RaceCard, RaceEntry, RaceResult
 from backend.scrapers.day_of_bias import not_loaded_publication
 from backend.scrapers.jra_scraper import JRAScraper
+from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.services.race_service import RaceService
 
 
@@ -379,3 +382,23 @@ def test_live_accessd_cname_shape_parses():
     assert meeting is not None
     assert meeting.venue_code == "06"
     assert meeting.race_date == date(2026, 9, 26)
+
+
+def test_steeplechase_that_switches_turf_to_dirt_stays_an_obstacle():
+    html = """
+    <div class="race_header">
+      <span class="race_name">障害3歳以上未勝利</span>
+      <div class="type">
+        <div class="cell category">障害3歳以上</div>
+        <div class="cell course">コース：2,910<span class="unit">メートル</span>
+          <span class="detail">（芝→ダート）</span></div>
+      </div>
+    </div>
+    """
+    distance, track_type, direction = JRAScraper()._header_course(BeautifulSoup(html, "lxml"))
+    assert distance == 2910
+    assert track_type == "障害"
+    assert direction is None
+    assert NetkeibaScraper()._extract_distance_info("障2910m (芝 ダート)") == (2910, "障害")
+    assert NetkeibaScraper()._extract_distance_info("芝1600m") == (1600, "芝")
+    assert NetkeibaScraper()._extract_distance_info("ダ1400m") == (1400, "ダート")

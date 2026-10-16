@@ -5,8 +5,9 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal, cast
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
@@ -1587,41 +1588,27 @@ class NetkeibaScraper(BaseScraper):
     def get_weekly_races(self) -> RaceSchedule:
         """Get this week's race schedule from netkeiba.
 
+        The top page is not the race list. Each day of the weekend is the
+        date list. A 403 or a login wall stops the remaining days.
+
         Returns:
             RaceSchedule containing this week's races
         """
         week_start, week_end = get_current_week_dates()
         races: list[Race] = []
+        day = week_start
+        while day <= week_end:
+            try:
+                races.extend(self.get_races_by_date(day))
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if isinstance(e, AccessBlocked) or status in {401, 403}:
+                    logger.error("Weekly race list stopped on %s: %s", day, e)
+                    break
+                logger.error("Failed to fetch races for %s: %s", day, e)
+            day += timedelta(days=1)
 
-        try:
-            soup = self.fetch_page(f"{self.BASE_URL}/top/")
-
-            race_links = soup.find_all("a", href=re.compile(r"race_id=\d+"))
-            seen_ids = set()
-
-            for link in race_links:
-                href = link.get("href", "")
-                race_id = self._extract_race_id_from_url(href)
-
-                if race_id and race_id not in seen_ids:
-                    seen_ids.add(race_id)
-                    race = self._parse_race_link(link, race_id)
-                    if race:
-                        races.append(race)
-
-            race_tables = soup.find_all("table", class_=re.compile(r"race|Race"))
-            for table in race_tables:
-                races.extend(self._parse_race_table(table, week_start))
-
-            race_list_divs = soup.find_all("div", class_=re.compile(r"RaceList|race_list"))
-            for div in race_list_divs:
-                races.extend(self._parse_race_list_div(div, week_start))
-
-        except Exception as e:
-            logger.error(f"Failed to fetch weekly races: {e}")
-
-        unique_races = {r.race_id: r for r in races}
-
+        unique_races = {race.race_id: race for race in races}
         return RaceSchedule(
             week_start=week_start,
             week_end=week_end,
@@ -1642,40 +1629,15 @@ class NetkeibaScraper(BaseScraper):
         races: list[Race] = []
 
         try:
-            soup = self.fetch_page(
-                f"{self.BASE_URL}/top/race_list.html",
-                params={"kaisai_date": date_str},
-            )
+            list_url = f"{self.BASE_URL}/top/race_list.html"
+            soup = self.fetch_page(list_url, params={"kaisai_date": date_str})
             if looks_like_login_wall(str(soup)):
                 raise AccessBlocked(401, "requires login")
-            containers = soup.find_all(
-                ["div", "table", "section"],
-                class_=re.compile(r"RaceList|race_list|RaceData"),
-            )
-            search_roots: list[Tag] = containers or [soup]
-            seen_ids: set[str] = set()
-
-            for root in search_roots:
-                for link in root.find_all("a", href=re.compile(r"race_id=\d+")):
-                    if not isinstance(link, Tag):
-                        continue
-                    race_id = self._extract_race_id_from_url(str(link.get("href", "")))
-                    if not race_id or race_id in seen_ids:
-                        continue
-                    seen_ids.add(race_id)
-                    race = self._parse_race_link(link, race_id)
-                    if not race:
-                        continue
-                    venue_code, venue_name = self._resolve_venue(link, race_id)
-                    races.append(
-                        race.model_copy(
-                            update={
-                                "race_date": target_date,
-                                "venue": venue_name,
-                                "venue_code": venue_code,
-                            }
-                        )
-                    )
+            races = self._races_from_list_soup(soup, target_date)
+            if not races and self._shell_calls_date_list(soup):
+                sub = self._fetch_race_list_sub(date_str, list_url)
+                if sub is not None:
+                    races = self._races_from_list_soup(sub, target_date)
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if isinstance(e, AccessBlocked) or status in {401, 403}:
@@ -1687,6 +1649,196 @@ class NetkeibaScraper(BaseScraper):
             unique_races.values(),
             key=lambda race: (race.venue, race.race_number, race.race_id),
         )
+
+    def _shell_calls_date_list(self, soup: BeautifulSoup) -> bool:
+        """True when the shell's own script asks for the date list."""
+        for script in soup.find_all("script"):
+            text = script.string if script.string is not None else script.get_text()
+            if text and "race_list_get_date_list.html" in text:
+                return True
+        return False
+
+    def _fetch_race_list_sub(self, date_str: str, list_url: str) -> BeautifulSoup | None:
+        """Follow the date-list URL the shell calls, then its sub-list link.
+
+        ``current_group`` is copied from that page. It is not invented.
+        A 403 propagates. A login wall stops the chain.
+        """
+        referer = f"{list_url}?kaisai_date={date_str}"
+        headers = {**self.BROWSER_HEADERS, "Referer": referer}
+        html = self.http_client.get(
+            f"{self.BASE_URL}/top/race_list_get_date_list.html",
+            params={"kaisai_date": date_str, "encoding": "UTF-8"},
+            headers=headers,
+            encoding="utf-8",
+        )
+        if looks_like_login_wall(html):
+            raise AccessBlocked(401, "requires login")
+        sub_url = self._sub_list_url(BeautifulSoup(html, "lxml"), date_str)
+        if sub_url is None:
+            return None
+        body = self.http_client.get(sub_url, headers=headers, encoding="utf-8")
+        if looks_like_login_wall(body):
+            raise AccessBlocked(401, "requires login")
+        return BeautifulSoup(body, "lxml")
+
+    def _sub_list_url(self, soup: BeautifulSoup, date_str: str) -> str | None:
+        """The ``race_list_sub.html`` link for this date. Prefer ``li.Active``."""
+        matches: list[tuple[bool, str]] = []
+        for link in soup.find_all("a", href=True):
+            if not isinstance(link, Tag):
+                continue
+            href = str(link.get("href") or "")
+            if "race_list_sub.html" not in href or f"kaisai_date={date_str}" not in href:
+                continue
+            parent = link.find_parent("li")
+            classes = parent.get("class") if isinstance(parent, Tag) else []
+            if isinstance(classes, str):
+                classes = classes.split()
+            active = "Active" in [str(token) for token in (classes or [])]
+            matches.append((active, href.split("#", 1)[0]))
+        if not matches:
+            return None
+        href = next((item for active, item in matches if active), matches[0][1])
+        return urljoin(f"{self.BASE_URL}/top/race_list.html", href)
+
+    def _races_from_list_soup(self, soup: BeautifulSoup, target_date: date) -> list[Race]:
+        """Structured race rows, or the older link list when those rows are absent."""
+        items = [node for node in soup.select("li.RaceList_DataItem") if isinstance(node, Tag)]
+        if items:
+            return self._races_from_data_items(items, target_date)
+        return self._races_from_links(soup, target_date)
+
+    def _races_from_data_items(self, items: list[Tag], target_date: date) -> list[Race]:
+        """One race per ``li.RaceList_DataItem``. Movie links are not races."""
+        races: list[Race] = []
+        seen: set[str] = set()
+        for item in items:
+            link = self._card_link(item)
+            if link is None:
+                continue
+            race_id = self._extract_race_id_from_url(str(link.get("href") or ""))
+            if not race_id or race_id in seen:
+                continue
+            seen.add(race_id)
+            race = self._race_from_data_item(item, link, race_id, target_date)
+            if race is not None:
+                races.append(race)
+        return races
+
+    def _card_link(self, item: Tag) -> Tag | None:
+        """The shutuba or result link. A movie link is not the race."""
+        for anchor in item.find_all("a", href=True):
+            if not isinstance(anchor, Tag):
+                continue
+            href = str(anchor.get("href") or "")
+            if "race_id=" not in href or "movie" in href.lower():
+                continue
+            return anchor
+        return None
+
+    def _race_from_data_item(
+        self, item: Tag, link: Tag, race_id: str, target_date: date
+    ) -> Race | None:
+        """Copy name, distance, and venue from the list row. A clock is not 発走."""
+        try:
+            title = item.select_one(".ItemTitle")
+            race_number = self._extract_race_number(race_id)
+            race_name = self.clean_text(title.get_text()) if isinstance(title, Tag) else ""
+            if not race_name:
+                race_name = f"{race_number}R"
+            distance, track_type = self._extract_distance_info(self._distance_text(item))
+            venue_code, venue, round_number, day_number = self._meeting_from_item(item, link, race_id)
+            heads = item.select_one(".RaceList_Itemnumber")
+            entry_count = None
+            if isinstance(heads, Tag):
+                match = re.search(r"(\d+)", heads.get_text())
+                if match:
+                    entry_count = int(match.group(1))
+            return Race(
+                race_id=race_id,
+                race_name=race_name,
+                race_number=race_number,
+                race_date=target_date,
+                venue=venue,
+                venue_code=venue_code,
+                round_number=round_number,
+                day_number=day_number,
+                distance=distance or 0,
+                track_type=track_type or "不明",
+                entry_count=entry_count,
+            )
+        except Exception as e:
+            logger.warning("Failed to parse race list item %s: %s", race_id, e)
+            return None
+
+    def _distance_text(self, item: Tag) -> str:
+        """The distance span. ``障2910m`` is not always classed ``RaceList_ItemLong``."""
+        for span in item.select(".RaceData span"):
+            text = self.clean_text(span.get_text())
+            if re.search(r"\d{3,4}\s*m", text):
+                return text
+        long = item.select_one(".RaceList_ItemLong")
+        if isinstance(long, Tag):
+            return self.clean_text(long.get_text())
+        return ""
+
+    def _meeting_from_item(
+        self, item: Tag, link: Tag, race_id: str
+    ) -> tuple[str | None, str, int | None, int | None]:
+        """Venue, kai, and day from the meeting title, else the race id."""
+        meeting = item.find_parent("dl")
+        title = meeting.select_one(".RaceList_DataTitle") if isinstance(meeting, Tag) else None
+        text = self.clean_text(title.get_text(" ", strip=True)) if isinstance(title, Tag) else ""
+        venue_code: str | None = None
+        venue = "不明"
+        for code, name in self.VENUE_CODES.items():
+            if name in text:
+                venue_code, venue = code, name
+                break
+        if venue == "不明":
+            venue_code, venue = self._resolve_venue(link, race_id)
+        round_number = None
+        day_number = None
+        round_match = re.search(r"(\d+)\s*回", text)
+        day_match = re.search(r"(\d+)\s*日目", text)
+        if round_match:
+            round_number = int(round_match.group(1))
+        if day_match:
+            day_number = int(day_match.group(1))
+        return venue_code, venue, round_number, day_number
+
+    def _races_from_links(self, soup: BeautifulSoup, target_date: date) -> list[Race]:
+        """Race links already present on the shell. Used when the sub list is absent."""
+        containers = soup.find_all(
+            ["div", "table", "section"],
+            class_=re.compile(r"RaceList|race_list|RaceData"),
+        )
+        search_roots: list[Tag] = containers or [soup]
+        races: list[Race] = []
+        seen_ids: set[str] = set()
+        for root in search_roots:
+            for link in root.find_all("a", href=re.compile(r"race_id=\d+")):
+                if not isinstance(link, Tag):
+                    continue
+                race_id = self._extract_race_id_from_url(str(link.get("href", "")))
+                if not race_id or race_id in seen_ids:
+                    continue
+                seen_ids.add(race_id)
+                race = self._parse_race_link(link, race_id)
+                if not race:
+                    continue
+                venue_code, venue_name = self._resolve_venue(link, race_id)
+                races.append(
+                    race.model_copy(
+                        update={
+                            "race_date": target_date,
+                            "venue": venue_name,
+                            "venue_code": venue_code,
+                        }
+                    )
+                )
+        return races
 
     def get_race_card(self, race_id: str) -> RaceCard | None:
         """Get race card (shutuba-hyou) for a specific race.
@@ -1708,7 +1860,7 @@ class NetkeibaScraper(BaseScraper):
             url=f"{self.BASE_URL}/race/shutuba.html",
             params={"race_id": race_id},
             headers={**self.BROWSER_HEADERS, "Referer": f"{self.BASE_URL}/top/"},
-            encoding=self.ENCODING,
+            encoding="utf-8",
             fetched_at=fetched,
             should_fallback=self._shutuba_needs_fallback,
             still_incomplete=lambda pages: self._shutuba_pages_incomplete(pages, race_id),
@@ -3498,11 +3650,11 @@ class NetkeibaScraper(BaseScraper):
         if distance_match:
             distance = int(distance_match.group(1))
 
-        if "芝" in text:
+        if "障" in text:
+            track_type = "障害"
+        elif "芝" in text:
             track_type = "芝"
         elif "ダート" in text or re.search(r"ダ\d", text):
             track_type = "ダート"
-        elif "障" in text:
-            track_type = "障害"
 
         return distance, track_type

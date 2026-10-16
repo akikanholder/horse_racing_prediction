@@ -206,7 +206,7 @@ with TrackInfoService() as service:
 期待値は `RaceEntry.odds` ではなく、ここで返す `OddsQuote` を使う。
 
 - `bet_types` は `win`（単勝）、`wide`（ワイド）、`umaren`（馬連）、`sanrenpuku`（三連複）。カンマ区切りで同時に取れる。既定は `win`。
-- 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。ページが `----` または `取消` の行は残し、価格は null、`withheld` を true。
+- 単勝の価格は `odds`（馬番）。ワイドの組み合わせは `3-7`（馬番の小さい順）で、価格は `odds_min` と `odds_max`。範囲の片側しか無い行は捨て、価格は作らない。掲載上限 `9,999.9` で 2 列目が `0` または負の変動のときは両端がその上限。ページが `----` または `取消` の行は残し、価格は null、`withheld` を true。
 - 馬連の組み合わせも `3-7`（馬番の小さい順）。価格は単勝と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。`----` と `取消` は残して価格は null。
 - 三連複の組み合わせは `1-2-5`（馬番3つの小さい順）。価格は馬連と同じ単一の `odds`。netkeiba の変動値は範囲ではないので `odds_min` / `odds_max` は空。価格が無い行は捨て、数値は作らない。`----` と `取消` は残して価格は null。
 - `non_runners` は取消・除外の馬番。`status` は `scratched` / `excluded` / `unknown`。`status_label` はページの文字。JRA を優先し、403 のときは netkeiba。馬番は作らない。組がページに無いときはその組を作らない。
@@ -261,7 +261,7 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 `inside_outside` と `pace_bias` は、公式の事前ページが**バイアスの見出し**として印刷しているセルだけを写す。見出しは `内外` / `内外バイアス` / `枠バイアス`、または `ペース` / `ペースバイアス` / `展開バイアス`。セルは空白を畳んだ短いラベル（16字まで）。`傷み`、`内柵`、`コース`、`回り`、`メートル` を含む文は捨てる。
 
 - accessD / JRADB の出馬表（`POST https://www.jra.go.jp/JRADB/accessD.html`、`cname`）。ラベルがあれば `source` は `accessd`。
-- JRA 馬場情報の当週タブ（`https://www.jra.go.jp/keiba/baba/index.html` と `index2.html`）。タイトルの競馬場がこのレースと一致したページだけ。ラベルがあれば `source` は `jra_baba`。両方に同じ文字があるときは `accessd+jra_baba`。
+- JRA 馬場情報の当週タブ（`https://www.jra.go.jp/keiba/baba/index.html` と `index2.html`。`.kaisai_tab` の `indexN.html` も）。タイトルの競馬場がこのレースと一致したページだけ。ラベルがあれば `source` は `jra_baba`。両方に同じ文字があるときは `accessd+jra_baba`。
 - 二つのページの同じ項目が違う文字なら、両方 null。`warning` は `day-of track bias sources disagree`。
 
 写さないもの:
@@ -283,7 +283,7 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 - 通信失敗: `day-of track bias fetch failed`
 - 片方だけ: `day-of pace bias not published` または `day-of inside/outside bias not published`
 
-認証用の環境変数は無い。accessD も馬場情報も公開ページ。403 は資格情報不足ではなく、Akamai がデータセンターの IP を止めたとき。個別の `/keiba/baba/{venue}.html` は 403 になることがあるので、当週の `index.html` / `index2.html` だけを見る。馬場ページが 403 のときは、その JRA の値は null のまま、同じ場・日の netkeiba 公開ページ（クッション値、含水率、馬場、天候、発走時刻）へ戻る。403 の回避、captcha、ログインはしない。
+認証用の環境変数は無い。accessD も馬場情報も公開ページ。403 は資格情報不足ではなく、Akamai がデータセンターの IP を止めたとき。個別の `/keiba/baba/{venue}.html` は 403 になることがあるので、当週の `index.html` / `index2.html` と、その `.kaisai_tab` が指す `indexN.html` だけを見る。馬場ページが 403 のときは、その JRA の値は null のまま、同じ場・日の netkeiba 公開ページ（クッション値、含水率、馬場、天候、発走時刻）へ戻る。403 の回避、captcha、ログインはしない。
 
 - 出馬表と `GET /api/races/{race_id}` の `race.track_bias` は、条件を写したうえで上記を取りにいく。
 - 出走馬一覧の各馬にも同じオブジェクトを載せる。

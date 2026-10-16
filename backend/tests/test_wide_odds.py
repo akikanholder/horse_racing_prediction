@@ -163,6 +163,22 @@ class TestParseWideOdds:
         assert "1-6" in combinations
         assert len(snapshot.quotes) == 51
 
+    def test_published_ceiling_is_a_point_range(self):
+        payload = _live_payload()
+        wide_map = payload["data"]["odds"]["5"]
+        wide_map["0103"] = ["2.9", "0.0", "3"]
+        wide_map["0809"] = ["9,999.9", "0", "105"]
+        wide_map["0810"] = ["9,999.9", "-2", "29"]
+        snapshot = parse_netkeiba_wide_odds(payload, RACE_ID, fetched_at=FETCHED_AT)
+        by_combo = {quote.combination: quote for quote in snapshot.quotes}
+        assert "1-3" not in by_combo
+        assert by_combo["8-9"].odds_min == 9999.9
+        assert by_combo["8-9"].odds_max == 9999.9
+        assert by_combo["8-9"].withheld is False
+        assert by_combo["8-9"].non_runner is False
+        assert by_combo["8-10"].odds_min == 9999.9
+        assert by_combo["8-10"].odds_max == 9999.9
+
     def test_unknown_status_does_not_invent_quotes(self):
         payload = _live_payload()
         payload["status"] = "limit"

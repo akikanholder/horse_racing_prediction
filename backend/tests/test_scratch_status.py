@@ -434,7 +434,7 @@ def test_netkeiba_card_keeps_printed_labels_and_unknown():
     assert card is not None
     assert card.warning is None
     assert http.urls == [SHUTUBA_URL]
-    assert http.encodings == ["euc-jp"]
+    assert http.encodings == ["utf-8"]
     horses = _by_number(card)
     assert horses[1].status == "entered"
     assert horses[1].status_label is None
@@ -1112,3 +1112,90 @@ def test_installed_headless_browser_renders_scratch_marks(tmp_path: Path):
     assert horses[2].source == "headless"
     assert horses[5].status == "excluded"
     assert horses[5].status_label == "競走除外"
+
+
+def _jra_row_past(number: int, name: str, past: str, *, odds: str) -> str:
+    """A starter whose past-race cell prints 取消 or 除外. That is not this race."""
+    row = _jra_row(number, name, odds=odds)
+    cell = (
+        f'<td class="past"><div class="place_line"><div class="place stop">{past}</div></div></td>'
+    )
+    return row.replace("</tr>", cell + "</tr>", 1)
+
+
+def _jra_row_replaced_number(name: str) -> str:
+    """The number cell itself is 取消. The odds cell is the same label."""
+    return f"""
+    <tr>
+      <td class="waku"><img alt="枠5黄" src="/waku/5.png"></td>
+      <td class="num"><span class="cap">取消</span></td>
+      <td class="horse">
+        <div class="name"><a>{name}</a></div>
+        <div class="odds"><span class="num"><strong>取消</strong></span></div>
+        <p class="trainer"><a>調教師</a></p>
+      </td>
+      <td class="jockey"><p class="age">牡3</p><p class="jockey">騎手</p></td>
+    </tr>
+    """
+
+
+def test_past_finish_and_unselected_block_are_not_the_current_mark():
+    extra = """
+    <div class="exclusion_block">
+      <h2>非当選・非抽選馬情報</h2>
+      <table class="basic">
+        <tr>
+          <td class="waku"><img alt="枠1白"></td>
+          <td class="num">1</td>
+          <td class="horse">
+            <div class="name">ウッケン</div>
+            <div class="odds"><span class="num"><strong>除外</strong></span></div>
+          </td>
+          <td class="jockey"><p class="jockey">騎手</p></td>
+          <td class="exclude">除外</td>
+        </tr>
+      </table>
+    </div>
+    """
+    html = _jra_card_html(
+        _jra_row(4, "ダークアベンジャー", odds="18.4"),
+        _jra_row_replaced_number("ジェットシェヴロン"),
+        _jra_row(6, "プリズンブレイク", odds="14.3"),
+        _jra_row_past(8, "エースフライト", "取消", odds="4.8"),
+        _jra_row_past(17, "サニーサルサ", "除外", odds="25.9"),
+        extra=extra,
+    )
+    scraper = JRAScraper()
+    cname = scraper._parse_race_cname("pw01dde0106202604081120260926/2A")
+    assert cname is not None
+    card = scraper._parse_race_card(html, RACE_ID, cname)
+
+    assert card is not None
+    horses = _by_number(card)
+    assert set(horses) == {4, 5, 6, 8, 17}
+    assert "ウッケン" not in {entry.horse_name for entry in card.entries}
+    assert horses[5].horse_name == "ジェットシェヴロン"
+    assert horses[5].status == "scratched"
+    assert horses[5].status_label == "取消"
+    assert horses[5].odds is None
+    assert horses[8].horse_name == "エースフライト"
+    assert horses[8].status == "entered"
+    assert horses[8].status_label is None
+    assert horses[8].odds == 4.8
+    assert horses[17].status == "entered"
+    assert horses[17].odds == 25.9
+
+
+def test_status_number_that_collides_is_not_invented():
+    html = _jra_card_html(
+        _jra_row(1, "先頭"),
+        _jra_row_replaced_number("隙間なし"),
+        _jra_row(2, "次"),
+    )
+    scraper = JRAScraper()
+    cname = scraper._parse_race_cname("pw01dde0106202604081120260926/2A")
+    assert cname is not None
+    card = scraper._parse_race_card(html, RACE_ID, cname)
+    assert card is not None
+    assert {entry.horse_number for entry in card.entries} == {1, 2}
+    assert "隙間なし" not in {entry.horse_name for entry in card.entries}

@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 
 from backend.models.race import Race
 from backend.scrapers.jra_scraper import JRAScraper
+from backend.scrapers.jra_track_scraper import baba_meeting_tab_urls
 
 logger = logging.getLogger(__name__)
 
@@ -210,10 +211,23 @@ class DayOfBiasClient:
         return result
 
     def _fetch_baba(self, venue: str) -> tuple[str | None, str]:
-        """GET the two current baba tabs. Direct venue URLs often return 403."""
+        """GET the current baba tabs. Direct venue URLs often return 403.
+
+        ``index.html`` and ``index2.html`` come first. When neither title is
+        this venue, further ``indexN.html`` links inside ``.kaisai_tab`` are
+        followed. Facility pages are not.
+        """
         saw_403 = False
         saw_error = False
-        for url in BABA_URLS:
+        pages: list[tuple[str, str]] = []
+        queue = list(BABA_URLS)
+        seen: set[str] = set()
+        expanded = False
+        while queue:
+            url = queue.pop(0)
+            if url in seen:
+                continue
+            seen.add(url)
             try:
                 html = self.jra.http_client.get(url, encoding=BABA_ENCODING)
             except Exception as e:
@@ -226,6 +240,14 @@ class DayOfBiasClient:
                 continue
             if _baba_venue(html) == venue:
                 return html, "ok"
+            pages.append((url, html))
+            if expanded or any(known not in seen for known in BABA_URLS):
+                continue
+            expanded = True
+            for page_url, body in pages:
+                for extra in baba_meeting_tab_urls(body, page_url):
+                    if extra not in seen and extra not in queue:
+                        queue.append(extra)
         if saw_error:
             return None, "fetch_failed"
         if saw_403:

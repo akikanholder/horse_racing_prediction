@@ -108,6 +108,8 @@ python -m backend.cli odds 202605030811 --bet-types win --prefer yoso --json
 
 `Race` の主なフィールド: `race_id`, `race_name`, `race_number`, `race_date`, `post_time`, `post_time_source`, `post_time_fetched_at`, `venue`, `venue_code`, `round_number`, `day_number`, `distance`, `track_type`（芝/ダート/障害）, `direction`, `track_condition`（良/稍重/重/不良）, `weather`, `race_class`, `race_grade`, `age_condition`, `sex_condition`, `weight_condition`, `prize_money`（1着、万円）, `entry_count`。
 
+コース欄が `芝→ダート` でも、レース名かカテゴリに `障` があるときは `track_type` は `障害`。距離文字列の `障` は、同じ文字列の `芝` / `ダート` より先に読む。
+
 `post_time` は印字された発走時刻。`15時30分` や `15:45発走` は `15:30+09:00` のように Asia/Tokyo のオフセット付きで持つ。発走の語が無い時計（測定の `7時00分` など）は入れない。無ければ null。`post_time_source` は `jra_html` または `netkeiba_html`。`post_time_fetched_at` はその値を得た時刻。
 
 週次一覧の `track_bias` は null。そこでは当日バイアスを判定しない。
@@ -140,7 +142,7 @@ python -m backend.cli card 202605030811 --json
 | `source` | `jra_html` / `jra_js` / `netkeiba_html` / `netkeiba_js` / `headless` | 読めないとき null |
 | `fetched_at` | その区分を得た時刻 | 読めないとき null |
 
-印字が無い出走馬は `entered`。`status_label` は null。`unknown` は、区分の欄に `取消` 以外の短い文字があるとき。その文字が `status_label`。JRA の印字を優先し、JRA が無いときは netkeiba。両方に印字があるときも JRA。馬番は作らない。
+印字が無い出走馬は `entered`。`status_label` は null。`unknown` は、区分の欄に `取消` 以外の短い文字があるとき。その文字が `status_label`。JRA の印字を優先し、JRA が無いときは netkeiba。両方に印字があるときも JRA。馬番は作らない。過去走の着順（`td.past` の `取消` / `除外`）と `非当選・非抽選馬情報` は今走の印字ではない。馬番の欄自体が `取消` の行は残す。その馬番は、並びの中で欠けている整数（4 の次が `取消` でその次が 6 なら 5）。その整数が隣の馬番と重なるときは作らない。
 
 出馬表の表が空、または区分が埋まっていないときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、入っていればヘッドレス描画の順で足す。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いときは `headless browser is not installed`。区分がそれでも無い馬は `status` が null で、`warning` に `scratch status was not on the page`。
 
@@ -386,7 +388,7 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 | `non_runner` | その馬が取消・除外のとき true | 組のどれかが取消・除外のとき true | 同左 | 同左 |
 | `withheld` | ページが `----` または `取消` のとき true | 同左 | 同左 | 同左 |
 
-価格が無い行、ワイドで範囲の片側しか無い行は捨てる。ページが `----` または `取消` / `除外` / `出走取消` / `競走除外` と出している行は残す。価格は null、`withheld` は true。数値は作らない。組のページが行自体を出していないときは、その組は作らない。取消馬を含む組でページが価格を出しているときは、その価格を残し `non_runner` を true。変動値は範囲ではないので馬連・三連複の `odds_min` / `odds_max` には入れない。HTTP 400 の本文に数値が載っていても価格にしない。
+価格が無い行、ワイドで範囲の片側しか無い行は捨てる。ページが `----` または `取消` / `除外` / `出走取消` / `競走除外` と出している行は残す。価格は null、`withheld` は true。数値は作らない。組のページが行自体を出していないときは、その組は作らない。取消馬を含む組でページが価格を出しているときは、その価格を残し `non_runner` を true。変動値は範囲ではないので馬連・三連複の `odds_min` / `odds_max` には入れない。HTTP 400 の本文に数値が載っていても価格にしない。ワイドの掲載上限 `9,999.9` で 2 列目が `0` または負の変動のときは、両端がその上限の点範囲。`2.9` / `0.0` のような片側だけの行は捨てる。
 
 `non_runners` はレース単位の取消・除外。JRA のオッズページ（無ければ出馬表の印字）を優先し、JRA が 403 またはログインのときはそこで止め、netkeiba の印字を残す。`warning` は `JRA odds returned 403`、`JRA odds requires login`、`netkeiba odds returned 403`、`netkeiba odds requires login`、`JRA odds fetch failed`、`JRA odds page was not on the card`、`headless browser is not installed`。403 本文から馬番は作らない。価格の欠測は従来どおり `reason`。
 
@@ -483,7 +485,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 | フィールド | 意味 | null |
 |---|---|---|
-| `surface` | 芝 / ダート | 障害、または印字が無いとき null |
+| `surface` | 芝 / ダート | 障害、または印字が無いとき null。障害は騎手・父の芝/ダート集計に入れない |
 | `distance` | メートル | 印字が無いとき null |
 | `race_class` | 結果ページのクラス | 印字が無いとき null。`race class was not on the page` |
 | `field_size` | `N頭`。印字が無く着順があるときはその頭数 | 両方無いとき null |
@@ -656,7 +658,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 ソース:
 
 - accessD / JRADB の出馬表。ラベルがあれば `source` は `accessd`。
-- JRA 馬場情報の当週タブ（`https://www.jra.go.jp/keiba/baba/index.html` と `index2.html`）。タイトルの競馬場がこのレースと一致したページだけ。ラベルがあれば `jra_baba`。両方に同じ文字があるときは `accessd+jra_baba`。
+- JRA 馬場情報の当週タブ（`https://www.jra.go.jp/keiba/baba/index.html` と `index2.html`。そのページの `.kaisai_tab` が指す `index3.html` 以降も）。タイトルの競馬場がこのレースと一致したページだけ。ラベルがあれば `jra_baba`。両方に同じ文字があるときは `accessd+jra_baba`。
 - 二つのページの同じ項目が違う文字なら、両方 null。`warning` は `day-of track bias sources disagree`。
 
 写さないもの: 出馬表の `（芝・右 外）`（外回りであり内外バイアスではない）、使用コース（A/B/C）、内柵、芝の傷み、含水率、クッション値、馬場状態そのもの（`going` には写すがバイアスラベルにはしない。馬場の数値は `track`）、オッズ、人気、レース名、結果の通過順、予想ブログ、netkeiba のトラックバイアス（匿名 HTML に値が無く、公式の事前ラベルではない）。
@@ -840,7 +842,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 クッション値、含水率、馬場状態、天候、発走時刻の各値は、得た方法を `source`（`jra_html` / `jra_js` / `netkeiba_html` / `netkeiba_js` / `headless`）と `fetched_at` で持つ。`headless` は Playwright。ブラウザが無いときは `headless browser is not installed` を警告して、その段で止める。403 とログイン画面もそこで止め、User-Agent の差し替え、captcha、ログインはしない。
 
-JRA は個別の `/keiba/baba/{venue}.html` を見ない。当週の `index.html` と `index2.html`（cp932）だけ。タイトル `馬場情報（○○競馬場）` が依頼した場のタブだけを読む。HTML が取れて `#cushion_num` が空のときは、そのページ自身のスクリプトが呼ぶ同一サイトの `_data_cushion.html` を次に読む。`_data_moist.html` は、HTML の含水率欄が空のときだけ埋める。印字済みの含水率は上書きしない。目盛表 `#cushion_relation` は使わない。`/JRADB/accessJ.html` は追わない。403、タイトルの無い本文、別場のタブでは、その JRA オブジェクトの `racecourse` も `date` も null。`turf.cushion` と `turf.moisture` / `dirt.moisture` も null。`warning` は `JRA baba returned 403`、`JRA baba requires login`、`JRA baba page is not the requested meeting`、`JRA baba page could not be parsed`、`JRA baba fetch failed` のいずれか。
+JRA は個別の `/keiba/baba/{venue}.html` を見ない。当週の `index.html` と `index2.html`（cp932）を読み、依頼した場のタイトルがどちらにも無いときは、そのページの `.kaisai_tab` が指す `indexN.html` だけを続ける。施設ページは見ない。タイトル `馬場情報（○○競馬場）` が依頼した場のタブだけを読む。HTML が取れて `#cushion_num` が空のときは、そのページ自身のスクリプトが呼ぶ同一サイトの `_data_cushion.html` を次に読む。`_data_moist.html` は、HTML の含水率欄が空のときだけ埋める。印字済みの含水率は上書きしない。目盛表 `#cushion_relation` は使わない。`/JRADB/accessJ.html` は追わない。403、タイトルの無い本文、別場のタブでは、その JRA オブジェクトの `racecourse` も `date` も null。`turf.cushion` と `turf.moisture` / `dirt.moisture` も null。`warning` は `JRA baba returned 403`、`JRA baba requires login`、`JRA baba page is not the requested meeting`、`JRA baba page could not be parsed`、`JRA baba fetch failed` のいずれか。
 
 JRA が 403、またはクッション値の数値が無いときは、同じ場・同じ日の netkeiba 公開ページへ戻る。`sources` が `jra` だけのときも `netkeiba` キーを足す。JRA 側のオブジェクトは 403 の null のまま。netkeiba も、選択中のタブが依頼した場のときだけ数値を写す。HTML、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、任意のヘッドレス描画の順。403 とログインは止め、`netkeiba track returned 403` または `netkeiba track requires login`。失敗しても HTTP は 200 で、この形の JSON を返す。`cli track --json` は見出しを混ぜず、このオブジェクトだけを出す。クッション値・含水率・馬場状態は 403 本文やレース名からは作らない。
 
