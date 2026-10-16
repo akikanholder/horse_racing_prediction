@@ -20,6 +20,7 @@ TOKYO_DAY2 = "202605040211"  # 2026 東京 4回 2日 11R。日次 02 は函館�
 KYOTO_DAY2 = "202608040211"  # 2026 京都 4回 2日 11R
 BABA_TOKYO = "https://www.jra.go.jp/keiba/baba/index.html"
 BABA_KYOTO = "https://www.jra.go.jp/keiba/baba/index2.html"
+BABA_NIIGATA = "https://www.jra.go.jp/keiba/baba/index3.html"
 
 
 def _http_error(status: int) -> requests.HTTPError:
@@ -166,6 +167,73 @@ def test_jra_matching_meeting_copies_venue_and_only_parsed_numbers():
     assert quiet.turf.moisture is None
     assert quiet.dirt is not None
     assert quiet.dirt.moisture is None
+
+
+def _with_meeting_tab(venue: str, body: str, tabs: list[tuple[str, str]]) -> str:
+    tab_html = "".join(f'<div><a href="{href}">{label}</a></div>' for href, label in tabs)
+    return _baba(
+        venue,
+        f'<div class="kaisai_tab"><div class="nav tab">{tab_html}</div></div>'
+        f'<a href="/facilities/race/niigata/">新潟競馬場</a>{body}',
+    )
+
+
+def test_niigata_meeting_follows_the_kaisai_tab_not_a_venue_url():
+    tokyo = _with_meeting_tab(
+        "東京",
+        "<p>クッション値 9.8</p>",
+        [
+            ("index.html", "東京競馬場"),
+            ("index2.html", "京都競馬場"),
+            ("index3.html", "新潟競馬場"),
+        ],
+    )
+    niigata = _baba(
+        "新潟",
+        """
+        <p>クッション値 10.2</p>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>11.5</td><td>12.6</td></tr>
+          <tr><td>ダート</td><td>5.5</td><td>6.3</td></tr>
+        </table>
+        """,
+    )
+    client = _Gets(
+        gets={
+            BABA_TOKYO: tokyo,
+            BABA_KYOTO: _baba("京都", "<p>クッション値 8.4</p>"),
+            BABA_NIIGATA: niigata,
+        }
+    )
+    info = JRATrackScraper(http_client=client).scrape("niigata")  # type: ignore[arg-type]
+    assert info.racecourse == "新潟"
+    assert info.warning is None
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.value == 10.2
+    assert info.turf.moisture is not None
+    assert info.turf.moisture.goal_front == 11.5
+    assert info.turf.moisture.fourth_corner == 12.6
+    assert info.dirt is not None and info.dirt.moisture is not None
+    assert info.dirt.moisture.goal_front == 5.5
+    assert info.dirt.moisture.fourth_corner == 6.3
+    assert client.urls == [BABA_TOKYO, BABA_KYOTO, BABA_NIIGATA]
+    assert all("niigata.html" not in url and "facilities" not in url for url in client.urls)
+
+    tokyo_only = _Gets(
+        gets={
+            BABA_TOKYO: _with_meeting_tab(
+                "東京",
+                "<p>クッション値 9.8</p>",
+                [("index3.html", "新潟競馬場")],
+            ),
+            BABA_KYOTO: _baba("京都"),
+            BABA_NIIGATA: niigata,
+        }
+    )
+    kept = JRATrackScraper(http_client=tokyo_only).scrape("tokyo")  # type: ignore[arg-type]
+    assert kept.racecourse == "東京"
+    assert tokyo_only.urls == [BABA_TOKYO, BABA_KYOTO]
 
 
 def test_service_and_cli_emit_trackinfo_json_when_both_sources_fail(capsys, monkeypatch):

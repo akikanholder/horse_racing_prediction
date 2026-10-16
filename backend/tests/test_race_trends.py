@@ -415,6 +415,24 @@ def test_jockey_and_sire_are_split_by_surface():
     assert omissions["pedigree not on profile or ped page"] == 1
 
 
+def test_jump_race_is_outside_the_turf_and_dirt_splits():
+    jump = _race(
+        "202608040604",
+        runners=[_finisher(1, rank=1, odds=3.0, jockey="ルメール", horse_id="h1")],
+        surface=None,
+        flat=False,
+    )
+    turf = _race(
+        "202505030801",
+        runners=[_finisher(1, rank=1, odds=2.0, jockey="ルメール", horse_id="h2")],
+        surface="芝",
+    )
+    report = _report([jump, turf])
+    assert {(row.jockey_name, row.surface) for row in report.by_jockey} == {("ルメール", "芝")}
+    assert all(row.sample_size == 1 for row in report.by_jockey)
+    assert report.by_sire == [] or all(row.surface in {"芝", "ダート"} for row in report.by_sire)
+
+
 def test_sire_id_missing_stays_null():
     race = _race(runners=[_finisher(1, rank=1, horse_id="h1")])
     report = _report(

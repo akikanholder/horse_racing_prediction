@@ -24,6 +24,8 @@
 ワイドは ``data.odds["5"]``。キーは ``0307`` のような馬番2桁の連結で、
 値は ``[下限, 上限, 人気]``。組み合わせは ``3-7``（小さい順）。
 下限または上限が無い行は捨てる。片方の数値から範囲は作らない。
+掲載上限 ``9,999.9`` で2列目が ``0`` または負の変動のときは、両端がその上限の点範囲。
+``2.9`` / ``0.0`` のような片側だけの行は従来どおり捨てる。
 馬連は ``data.odds["4"]``。キーはワイドと同じ馬番2桁の連結で、
 値は単勝と同じ ``[オッズ, 変動, 人気]``。組み合わせは ``3-7``（小さい順）。
 変動は範囲ではないので ``odds_min`` / ``odds_max`` には入れない。
@@ -711,6 +713,8 @@ def _quotes_from_wide_map(
 
     ``----`` or ``取消`` keeps the pair and nulls both ends. One missing end
     still drops the pair. The present end is not copied into a range.
+    The published ceiling ``9,999.9`` with a non-positive second field is
+    both ends.
     """
     candidates: list[tuple[tuple[int, int, int, str], str, RangeCell]] = []
     for key, raw in wide_map.items():

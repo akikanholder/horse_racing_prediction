@@ -927,6 +927,157 @@ def test_race_list_403_is_not_swallowed():
         scraper.get_races_by_date(date(2025, 3, 1))
 
 
+def test_race_list_follows_the_date_script_and_not_a_made_up_group():
+    shell = """
+    <html><body>
+    <script>getDateList("race_list_get_date_list.html", selectDate, function(resp) {});</script>
+    </body></html>
+    """
+    dates = """
+    <ul>
+      <li date="20261011">
+        <a href="race_list_sub.html?kaisai_date=20261011&current_group=9#racelist_top_a">10/11</a>
+      </li>
+      <li class="Active" date="20261017">
+        <a href="race_list_sub.html?kaisai_date=20261017&current_group=1020261017#racelist_top_a">10/17</a>
+      </li>
+    </ul>
+    """
+    sub = """
+    <dl>
+      <dt><p class="RaceList_DataTitle"><small>4回</small> 東京 <small>6日目</small></p></dt>
+      <dd><ul>
+        <li class="RaceList_DataItem">
+          <a href="../race/shutuba.html?race_id=202605040601&rf=race_list">
+            <span class="ItemTitle">2歳未勝利</span>
+            <div class="RaceData">
+              <span class="RaceList_Itemtime">10:05</span>
+              <span class="RaceList_ItemLong">ダ1400m</span>
+              <span class="RaceList_Itemnumber">12頭</span>
+            </div>
+          </a>
+          <a href="../race/movie.html?race_id=202605040601">movie</a>
+        </li>
+      </ul></dd>
+    </dl>
+    <dl>
+      <dt><p class="RaceList_DataTitle"><small>4回</small> 京都 <small>6日目</small></p></dt>
+      <dd><ul>
+        <li class="RaceList_DataItem">
+          <a href="../race/shutuba.html?race_id=202608040604">
+            <span class="ItemTitle">3歳以上障害未勝利</span>
+            <div class="RaceData">
+              <span class="RaceList_Itemtime">11:25</span>
+              <span>障2910m</span>
+              <span class="RaceList_Itemnumber">8頭</span>
+            </div>
+          </a>
+        </li>
+      </ul></dd>
+    </dl>
+    """
+
+    class _HTTP:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls.append({"url": url, "params": params, "encoding": encoding})
+            if url.endswith("/top/race_list.html"):
+                return shell
+            if url.endswith("race_list_get_date_list.html"):
+                return dates
+            if "race_list_sub.html" in url:
+                assert "current_group=1020261017" in url
+                assert "kaisai_date=20261011" not in url
+                assert "#" not in url
+                return sub
+            raise AssertionError(url)
+
+    http = _HTTP()
+    scraper = NetkeibaScraper(http_client=http, headless_render="off")  # type: ignore[arg-type]
+    races = scraper.get_races_by_date(date(2026, 10, 17))
+    by_id = {race.race_id: race for race in races}
+    assert set(by_id) == {"202605040601", "202608040604"}
+    tokyo = by_id["202605040601"]
+    assert tokyo.venue == "東京"
+    assert tokyo.distance == 1400
+    assert tokyo.track_type == "ダート"
+    assert tokyo.post_time is None
+    assert tokyo.entry_count == 12
+    assert tokyo.round_number == 4
+    assert tokyo.day_number == 6
+    kyoto = by_id["202608040604"]
+    assert kyoto.venue == "京都"
+    assert kyoto.track_type == "障害"
+    assert kyoto.distance == 2910
+    assert kyoto.race_name == "3歳以上障害未勝利"
+    assert kyoto.race_number == 4
+    assert http.calls[1]["params"]["kaisai_date"] == "20261017"
+    assert http.calls[1]["params"]["encoding"] == "UTF-8"
+    assert http.calls[1]["encoding"] == "utf-8"
+    assert http.calls[2]["encoding"] == "utf-8"
+
+
+def test_race_list_with_links_does_not_open_the_date_script():
+    html = """
+    <div class="RaceList_DataList">
+      <a href="/race/shutuba.html?race_id=202605030811">11R 芝1600m</a>
+    </div>
+    <script>getDateList("race_list_get_date_list.html", selectDate, function(){});</script>
+    """
+
+    class _HTTP:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.urls.append(url)
+            return html
+
+    http = _HTTP()
+    scraper = NetkeibaScraper(http_client=http, headless_render="off")  # type: ignore[arg-type]
+    races = scraper.get_races_by_date(date(2026, 10, 17))
+    assert [race.race_id for race in races] == ["202605030811"]
+    assert http.urls == ["https://race.netkeiba.com/top/race_list.html"]
+
+
+def test_race_list_sub_403_is_not_swallowed():
+    shell = '<html><script>getDateList("race_list_get_date_list.html");</script></html>'
+
+    class _HTTP:
+        def get(self, url, params=None, headers=None, encoding=None):
+            if url.endswith("/top/race_list.html"):
+                return shell
+            raise _http_error(403)
+
+    scraper = NetkeibaScraper(http_client=_HTTP(), headless_render="off")  # type: ignore[arg-type]
+    with pytest.raises(requests.HTTPError):
+        scraper.get_races_by_date(date(2026, 10, 17))
+
+
+def test_weekly_races_stop_on_403_and_do_not_keep_the_top_page(monkeypatch):
+    monkeypatch.setattr(
+        "backend.scrapers.netkeiba_scraper.get_current_week_dates",
+        lambda: (date(2026, 10, 17), date(2026, 10, 18)),
+    )
+    seen: list[date] = []
+    scraper = NetkeibaScraper(headless_render="off")
+
+    def by_date(day: date) -> list[Race]:
+        seen.append(day)
+        if day == date(2026, 10, 17):
+            raise _http_error(403)
+        raise AssertionError(day)
+
+    scraper.get_races_by_date = by_date  # type: ignore[method-assign]
+    schedule = scraper.get_weekly_races()
+    assert seen == [date(2026, 10, 17)]
+    assert schedule.races == []
+    assert schedule.week_start == date(2026, 10, 17)
+    assert schedule.week_end == date(2026, 10, 18)
+
+
 def test_resume_from_skips_earlier_races_that_are_not_cached():
     seen: list[str] = []
 

@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Literal
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup, Tag
 
@@ -47,6 +47,34 @@ from backend.scrapers.track_readings import (
 from backend.utils.date_utils import normalize_tokyo_clock, parse_measurement_time, tokyo_now
 
 logger = logging.getLogger(__name__)
+
+_INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
+
+
+def baba_meeting_tab_urls(html: str, page_url: str) -> list[str]:
+    """``indexN.html`` links inside ``.kaisai_tab``.
+
+    A third meeting is ``index3.html`` on that tab. Facility pages and
+    ``/keiba/baba/{venue}.html`` are not followed.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    found: list[str] = []
+    seen: set[str] = set()
+    for link in soup.select(".kaisai_tab a[href]"):
+        href = str(link.get("href") or "").strip()
+        if not href:
+            continue
+        joined = urljoin(page_url, href)
+        parsed = urlparse(joined)
+        name = parsed.path.rsplit("/", 1)[-1]
+        if _INDEX_TAB.fullmatch(name) is None:
+            continue
+        clean = urlunparse(parsed._replace(query="", fragment=""))
+        if clean in seen:
+            continue
+        seen.add(clean)
+        found.append(clean)
+    return found
 
 
 class JRATrackScraper(BaseScraper):
@@ -151,23 +179,7 @@ class JRATrackScraper(BaseScraper):
         requested = self._requested_name(racecourse)
         if racecourse and requested is None:
             return empty_track_info("JRA", self.BABA_UNPARSEABLE)
-        pages: list[tuple[str, str]] = []
-        sources: dict[str, str] = {}
-        saw_403 = False
-        saw_error = False
-        for url in self.BABA_INDEX_URLS:
-            try:
-                html = self.http_client.get(url, encoding=self.BABA_ENCODING)
-            except Exception as e:
-                status = getattr(getattr(e, "response", None), "status_code", None)
-                if status == 403:
-                    saw_403 = True
-                else:
-                    saw_error = True
-                logger.info("JRA baba fetch failed for %s (%s)", url, e)
-                continue
-            pages.append((url, html))
-            sources[url] = "headless" if self._transport.used_headless else "jra_html"
+        pages, sources, saw_403, saw_error = self._load_meeting_tabs(requested)
 
         chosen = self._choose_page(pages, requested)
         if chosen is None:
@@ -185,6 +197,54 @@ class JRATrackScraper(BaseScraper):
         if extra:
             info = info.model_copy(update={"warning": join_warnings(info.warning, extra)})
         return info
+
+    def _load_meeting_tabs(
+        self, requested: str | None
+    ) -> tuple[list[tuple[str, str]], dict[str, str], bool, bool]:
+        """The two known tabs, then further ``indexN.html`` links when needed.
+
+        A requested meeting that is already on ``index.html`` or ``index2.html``
+        does not open another tab. When it is on neither, tabs named inside
+        ``.kaisai_tab`` are fetched. Direct venue URLs are not requested.
+        """
+        pages: list[tuple[str, str]] = []
+        sources: dict[str, str] = {}
+        saw_403 = False
+        saw_error = False
+        seen: set[str] = set()
+
+        def fetch(url: str) -> str | None:
+            nonlocal saw_403, saw_error
+            if url in seen:
+                return None
+            seen.add(url)
+            try:
+                html = self.http_client.get(url, encoding=self.BABA_ENCODING)
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 403:
+                    saw_403 = True
+                else:
+                    saw_error = True
+                logger.info("JRA baba fetch failed for %s (%s)", url, e)
+                return None
+            pages.append((url, html))
+            sources[url] = "headless" if self._transport.used_headless else "jra_html"
+            return html
+
+        for url in self.BABA_INDEX_URLS:
+            fetch(url)
+        if requested and self._choose_page(pages, requested) is None:
+            extras: list[str] = []
+            for url, html in list(pages):
+                for extra in baba_meeting_tab_urls(html, url):
+                    if extra not in seen and extra not in extras:
+                        extras.append(extra)
+            for url in extras:
+                html = fetch(url)
+                if html and self._title_venue(html) == requested:
+                    break
+        return pages, sources, saw_403, saw_error
 
     def _requested_name(self, racecourse: str | None) -> str | None:
         """Japanese meeting name for a code or name. Unknown codes stay unset."""

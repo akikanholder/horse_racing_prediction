@@ -47,6 +47,11 @@ _NON_RUNNER = frozenset({"scratched", "excluded", "unknown"})
 _PLACEHOLDERS = frozenset({"", "-", "--", "---", "**", "*", "----", "---.-", "－", "―"})
 _WITHHELD = frozenset({"----", "－－－－"})
 _STATUS_CLASS = ("cancel", "scratch", "exclude", "jogai", "torikeshi", "nonrunner", "non-runner")
+# A past-race finish and the non-selected-horse block are not this race's mark.
+_IGNORED_STATUS_CONTEXT = frozenset({"past", "exclusion_block"})
+_CLASS_SPLIT = re.compile(r"[-_\s]+")
+_CEILING_ODDS = 9999.9
+_CEILING_TOLERANCE = 0.05
 _RUNNER_KEYS = ("runners", "horses", "entries", "non_runners", "scratched", "cancels")
 _JSON_URL = re.compile(r"""(?:url|URL|href)\s*[:=]\s*['"]([^'"]+)['"]""")
 _STATUS_PATH = re.compile(r"(shutuba|scratch|cancel|nonrunner|odds|access[do])", re.IGNORECASE)
@@ -122,14 +127,14 @@ def row_status(row: Tag) -> tuple[CardRunnerStatus, str] | None:
     (the caller may then record ``entered``).
     """
     for cell in row.find_all(["td", "th", "span", "div", "p"]):
-        if not isinstance(cell, Tag):
+        if not isinstance(cell, Tag) or _ignored_status_context(cell):
             continue
         own = compact("".join(str(piece) for piece in cell.find_all(string=True, recursive=False)))
         hit = status_from_token(own) or status_from_token(compact(cell.get_text(" ", strip=True)))
         if hit is not None and _short_status_cell(cell):
             return hit
     for cell in row.find_all(True):
-        if not isinstance(cell, Tag):
+        if not isinstance(cell, Tag) or _ignored_status_context(cell):
             continue
         if not _status_element(cell):
             continue
@@ -159,9 +164,40 @@ def _short_status_cell(cell: Tag) -> bool:
     return status_from_token(text) is not None
 
 
+def _class_tokens(node: Tag) -> set[str]:
+    """Class names, plus the pieces of ``Cancel_Txt`` and ``non-runner``.
+
+    ``exclusion_block`` stays ``exclusion`` and ``block``. It does not match
+    the status token ``exclude``.
+    """
+    raw = node.get("class") or []
+    if isinstance(raw, str):
+        raw = raw.split()
+    tokens: set[str] = set()
+    for item in raw:
+        text = str(item).lower()
+        if not text:
+            continue
+        tokens.add(text)
+        for part in _CLASS_SPLIT.split(text):
+            if part:
+                tokens.add(part)
+    return tokens
+
+
+def _ignored_status_context(node: Tag) -> bool:
+    """True when this node sits in a past run or the non-selected block."""
+    current: Tag | None = node
+    while isinstance(current, Tag):
+        if _class_tokens(current) & _IGNORED_STATUS_CONTEXT:
+            return True
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return False
+
+
 def _status_element(cell: Tag) -> bool:
-    classes = " ".join(cell.get("class") or []).lower()
-    if any(token in classes for token in _STATUS_CLASS):
+    if any(token in _class_tokens(cell) for token in _STATUS_CLASS):
         return True
     return cell.get("data-runner-status") is not None or cell.get("data-status") is not None
 
@@ -745,16 +781,52 @@ class RangeCell:
     status_label: str | None
 
 
+def _non_positive_number(value: object) -> bool:
+    """True for ``0`` or a negative change. A blank or a scratch label is not."""
+    if isinstance(value, bool) or isinstance(value, list | tuple):
+        return False
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in _PLACEHOLDERS or status_from_token(text) or is_withheld_token(text):
+            return False
+        try:
+            number = float(text.replace(",", ""))
+        except ValueError:
+            return False
+    elif isinstance(value, int | float):
+        number = float(value)
+    else:
+        return False
+    return number <= 0
+
+
+def _ceiling_point(left: PriceCell | None, raw_right: object) -> bool:
+    """The published wide ceiling with a non-positive second field.
+
+    ``9,999.9`` / ``0`` and ``9,999.9`` / ``-2`` are a point range.
+    ``2.9`` / ``0.0`` is a missing end and stays dropped.
+    """
+    if left is None or left.withheld or left.odds is None:
+        return False
+    if abs(left.odds - _CEILING_ODDS) > _CEILING_TOLERANCE:
+        return False
+    return _non_positive_number(raw_right)
+
+
 def read_range_cell(value: object) -> RangeCell | None:
     """Read ``[odds_min, odds_max, popularity]``.
 
     ``----`` or ``取消`` on either end keeps the pair and nulls both ends.
     One number and one empty end drops the pair. The missing end is not copied.
+    The published ceiling ``9,999.9`` with a non-positive second field is both
+    ends. A normal one-sided row such as ``2.9`` / ``0.0`` is still dropped.
     """
     if not isinstance(value, list | tuple) or len(value) < 2:
         return None
     left = read_price_cell(value[0])
     right = read_price_cell(value[1])
+    if left is not None and left.odds is not None and _ceiling_point(left, value[1]):
+        return RangeCell(left.odds, left.odds, False, False, None)
     if left is None or right is None:
         return None
     if left.withheld or right.withheld:

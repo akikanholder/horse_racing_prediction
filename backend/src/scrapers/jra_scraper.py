@@ -35,9 +35,11 @@ from backend.scrapers.runner_status import (
     join_warnings,
     marks_from_html,
     marks_from_json,
+    compact,
     records_from_entries,
     row_status,
     same_site_status_urls,
+    status_from_token,
 )
 from backend.scrapers.runner_status import (
     page_records as _page_records,
@@ -135,6 +137,20 @@ class _RaceLookup:
         return meeting.race_date == self.race_date
 
 
+def _row_in_exclusion_block(row: Tag) -> bool:
+    """True when the row is inside ``非当選・非抽選馬情報``."""
+    current: Tag | None = row
+    while isinstance(current, Tag):
+        classes = current.get("class") or []
+        if isinstance(classes, str):
+            classes = classes.split()
+        if "exclusion_block" in [str(token) for token in classes]:
+            return True
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return False
+
+
 class JRAScraper(BaseScraper):
     """Scraper for JRA official website (https://jra.jp)."""
 
@@ -195,7 +211,7 @@ class JRAScraper(BaseScraper):
         week_start, week_end = get_current_week_dates()
         races: list[Race] = []
 
-        soup = self.fetch_page(f"{self.BASE_URL}/keiba/")
+        soup = self._fetch_keiba_menu()
 
         schedule_section = soup.find("div", class_="schedule") or soup.find(
             "section", id="schedule"
@@ -373,12 +389,12 @@ class JRAScraper(BaseScraper):
         if distance_match:
             distance = int(distance_match.group(1))
 
-        if "芝" in text:
+        if "障" in text:
+            track_type = "障害"
+        elif "芝" in text:
             track_type = "芝"
         elif "ダート" in text or "ダ" in text:
             track_type = "ダート"
-        elif "障" in text:
-            track_type = "障害"
 
         return distance, track_type
 
@@ -396,7 +412,7 @@ class JRAScraper(BaseScraper):
         schedules: list[WeeklyVenueSchedule] = []
         week_start, week_end = get_current_week_dates()
 
-        soup = self.fetch_page(f"{self.BASE_URL}/keiba/")
+        soup = self._fetch_keiba_menu()
 
         for venue_name, venue_code in self.VENUE_CODES.items():
             text = soup.get_text()
@@ -1257,16 +1273,68 @@ class JRAScraper(BaseScraper):
         source: str,
         fetched_at: datetime,
     ) -> list[RaceEntry]:
-        """Parse starter rows from the shutuba table."""
+        """Parse starter rows from the shutuba table.
+
+        ``非当選・非抽選馬情報`` is not a starter row. A number cell that
+        prints ``取消`` keeps that row; the number is the missing integer
+        in the table order.
+        """
         entries: list[RaceEntry] = []
         page_source = as_page_source(source)
+        rows: list[Tag] = []
         for row in soup.select("table tr"):
+            if not isinstance(row, Tag) or _row_in_exclusion_block(row):
+                continue
             if row.select_one("td.waku") is None or row.select_one("td.horse") is None:
                 continue
-            entry = self._parse_shutuba_row(row, source=page_source, fetched_at=fetched_at)
+            rows.append(row)
+        numbers = self._shutuba_horse_numbers(rows)
+        for row, number in zip(rows, numbers, strict=True):
+            entry = self._parse_shutuba_row(
+                row,
+                source=page_source,
+                fetched_at=fetched_at,
+                horse_number=number,
+            )
             if entry is not None:
                 entries.append(entry)
         return entries
+
+    def _shutuba_horse_numbers(self, rows: list[Tag]) -> list[int | None]:
+        """Horse numbers as printed, filling a status cell from the gap.
+
+        ``1, 2, 3, 4, 取消, 6`` gives 5 only because 5 is the single integer
+        strictly between 4 and 6. A gap that would collide is left unset.
+        """
+        printed: list[int | None] = []
+        gap: list[bool] = []
+        for row in rows:
+            text = compact(self._cell_text(row, "td.num"))
+            if status_from_token(text) is not None:
+                printed.append(None)
+                gap.append(True)
+                continue
+            number = self.extract_number(text)
+            printed.append(number if number is not None and 1 <= number <= 18 else None)
+            gap.append(False)
+        assigned = list(printed)
+        for index, is_gap in enumerate(gap):
+            if not is_gap:
+                continue
+            previous = 0
+            for earlier in assigned[:index]:
+                if earlier is not None:
+                    previous = earlier
+            candidate = previous + 1
+            nxt = next((later for later in printed[index + 1 :] if later is not None), None)
+            if not 1 <= candidate <= 18:
+                continue
+            if nxt is not None and candidate >= nxt:
+                continue
+            if candidate in assigned:
+                continue
+            assigned[index] = candidate
+        return assigned
 
     def _parse_shutuba_row(
         self,
@@ -1274,10 +1342,12 @@ class JRAScraper(BaseScraper):
         *,
         source: str,
         fetched_at: datetime,
+        horse_number: int | None = None,
     ) -> RaceEntry | None:
         """Parse one starter row."""
         bracket_number = self._bracket_number(row.select_one("td.waku"))
-        horse_number = self.extract_number(self._cell_text(row, "td.num"))
+        if horse_number is None:
+            horse_number = self.extract_number(self._cell_text(row, "td.num"))
         horse_cell = row.select_one("td.horse")
         jockey_cell = row.select_one("td.jockey")
         if (
@@ -1359,29 +1429,41 @@ class JRAScraper(BaseScraper):
         node = header.select_one(".cell.time")
         return parse_post_time(self._node_text(node))
 
+    def _fetch_keiba_menu(self) -> BeautifulSoup:
+        """The public keiba menu. The page is cp932, not UTF-8."""
+        html = self.http_client.get(f"{self.BASE_URL}/keiba/", encoding="cp932")
+        return BeautifulSoup(html, "lxml")
+
     def _header_course(self, header: Tag) -> tuple[int | None, str | None, str | None]:
-        """Extract distance, surface and direction from the course cell."""
-        text = self._node_text(header.select_one(".type .cell.course"))
+        """Extract distance, surface and direction from the course cell.
+
+        A steeplechase whose course cell says ``芝→ダート`` is still ``障害``
+        when the category or the race name says 障. Direction stays on the
+        course cell.
+        """
+        course = self._node_text(header.select_one(".type .cell.course"))
+        category = self._node_text(header.select_one(".type .cell.category"))
+        race_name = self._header_text(header, ".race_name") or ""
         distance = None
-        distance_match = re.search(r"([\d,]+)\s*メートル", text)
+        distance_match = re.search(r"([\d,]+)\s*メートル", course)
         if distance_match:
             distance = int(distance_match.group(1).replace(",", ""))
 
-        if "障" in text:
+        if any("障" in text for text in (course, category, race_name)):
             track_type = "障害"
-        elif "ダート" in text or "ダ" in text:
+        elif "ダート" in course or "ダ" in course:
             track_type = "ダート"
-        elif "芝" in text:
+        elif "芝" in course:
             track_type = "芝"
         else:
             track_type = None
 
         direction = None
-        if "直線" in text:
+        if "直線" in course:
             direction = "直線"
-        elif "右" in text:
+        elif "右" in course:
             direction = "右"
-        elif "左" in text:
+        elif "左" in course:
             direction = "左"
         return distance, track_type, direction
 
