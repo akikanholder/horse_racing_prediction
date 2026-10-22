@@ -24,6 +24,7 @@ from backend.scrapers.page_fallback import (
     HeadlessUnavailableError,
     looks_like_login_wall,
 )
+from backend.scrapers.track_freshness import cached_copy_warning, fresh_track_headers
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class HeadlessSession:
         self._last = 0.0
         self._playwright: Any = None
         self._browser: Any = None
+        self.last_response_headers: dict[str, str] = {}
+        self.served_cached_copy = False
 
     def close(self) -> None:
         if self._browser is not None:
@@ -140,6 +143,7 @@ class HeadlessSession:
             navigate(page)
             response = getattr(page, "_last_response", None)
             status = response.status if response is not None else None
+            self._remember_headers(response)
             body = str(page.content())
             self._count_json(page)
         finally:
@@ -176,8 +180,18 @@ class HeadlessSession:
         if isinstance(payloads, int) and payloads:
             logger.debug("Headless document inlined %s JSON script(s)", payloads)
 
+    def _remember_headers(self, response: object) -> None:
+        raw = getattr(response, "headers", None) if response is not None else None
+        headers = {str(key).lower(): str(value) for key, value in dict(raw or {}).items()}
+        self.last_response_headers = headers
+        if cached_copy_warning(headers):
+            self.served_cached_copy = True
+
     @staticmethod
     def _goto(page: Any, url: str) -> None:
+        fresh = fresh_track_headers(url)
+        if fresh and hasattr(page, "set_extra_http_headers"):
+            page.set_extra_http_headers(fresh)
         response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         page._last_response = response
 
@@ -225,6 +239,8 @@ class HeadlessTransport:
         self._session = session
         self.used_headless = False
         self.fallback_warning: str | None = None
+        self.last_response_headers: dict[str, str] = {}
+        self.served_cached_copy = False
 
     def _mode(self) -> str:
         mode = self._mode_of()
@@ -277,6 +293,16 @@ class HeadlessTransport:
         self.used_headless = True
         return body
 
+    def _capture_headers(self) -> None:
+        if self.used_headless and self._session is not None:
+            source = self._session
+        else:
+            source = self._inner
+        headers = getattr(source, "last_response_headers", None)
+        self.last_response_headers = dict(headers or {})
+        if getattr(source, "served_cached_copy", False):
+            self.served_cached_copy = True
+
     def get(
         self,
         url: str,
@@ -284,7 +310,10 @@ class HeadlessTransport:
         headers: dict[str, str] | None = None,
         encoding: str | None = None,
     ) -> str:
-        return self._call("get", url, params=params, headers=headers, encoding=encoding)
+        try:
+            return self._call("get", url, params=params, headers=headers, encoding=encoding)
+        finally:
+            self._capture_headers()
 
     def post(
         self,
@@ -293,7 +322,10 @@ class HeadlessTransport:
         headers: dict[str, str] | None = None,
         encoding: str | None = None,
     ) -> str:
-        return self._call("post", url, data=data, headers=headers, encoding=encoding)
+        try:
+            return self._call("post", url, data=data, headers=headers, encoding=encoding)
+        finally:
+            self._capture_headers()
 
     def close(self) -> None:
         closer = getattr(self._inner, "close", None)

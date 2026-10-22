@@ -372,10 +372,18 @@ def _moisture_text(moisture) -> str:
 def cmd_track(args):
     """Get detailed track (baba) information."""
     with _open_service(TrackInfoService, args) as service:
+        kwargs = {}
+        if getattr(args, "wait_fresh", False):
+            kwargs = {
+                "wait_fresh": True,
+                "retry_interval": getattr(args, "retry_interval", 60),
+                "max_wait": getattr(args, "max_wait", 600),
+            }
         results = service.get_track_info(
             racecourse=args.venue,
             date=args.date,
             merge=args.merge,
+            **kwargs,
         )
 
     if args.json:
@@ -396,6 +404,12 @@ def cmd_track(args):
             print(
                 f"  発走: {info.post_time} ({info.post_time_source}, {info.post_time_fetched_at})"
             )
+        if info.measured_at is not None:
+            print(f"  測定: {info.measured_at.isoformat()}")
+        if info.stale is True:
+            print("  測定日: レース日と違う")
+        elif info.is_today is True:
+            print("  測定日: 今日")
         if info.warning:
             print(f"  警告: {info.warning}")
         if info.warning and info.racecourse is None:
@@ -500,8 +514,15 @@ def cmd_result(args):
     This is post-race settlement for mark × finish logs.
     ``cli horse`` is that horse's past runs and is not this command.
     """
+    kwargs = {}
+    if getattr(args, "wait_complete", False):
+        kwargs = {
+            "wait_complete": True,
+            "retry_interval": getattr(args, "retry_interval", 60),
+            "max_wait": getattr(args, "max_wait", 600),
+        }
     with _open_service(RaceService, args) as service:
-        settled = service.get_settled_race_result(args.race_id)
+        settled = service.get_settled_race_result(args.race_id, **kwargs)
 
     if args.json:
         print_json(settled)
@@ -847,6 +868,23 @@ def main():
         "--merge", action="store_true", help="JRAとnetkeibaのデータを統合する"
     )
     track_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    track_parser.add_argument(
+        "--wait-fresh",
+        action="store_true",
+        help="測定日がレース日になるまで取り直す。403 とログインは取り直さない",
+    )
+    track_parser.add_argument(
+        "--retry-interval",
+        type=float,
+        default=60,
+        help="再取得の間隔（秒）。60秒未満は60秒にする",
+    )
+    track_parser.add_argument(
+        "--max-wait",
+        type=float,
+        default=600,
+        help="待ちの上限（秒）",
+    )
     track_parser.set_defaults(func=cmd_track)
 
     result_parser = subparsers.add_parser(
@@ -861,6 +899,23 @@ def main():
     )
     result_parser.add_argument("race_id", help="レースID")
     result_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    result_parser.add_argument(
+        "--wait-complete",
+        action="store_true",
+        help="着順が出走頭数に揃うまで取り直す。403 とログインは取り直さない",
+    )
+    result_parser.add_argument(
+        "--retry-interval",
+        type=float,
+        default=60,
+        help="再取得の間隔（秒）。60秒未満は60秒にする",
+    )
+    result_parser.add_argument(
+        "--max-wait",
+        type=float,
+        default=600,
+        help="待ちの上限（秒）",
+    )
     result_parser.set_defaults(func=cmd_result)
 
     odds_parser = subparsers.add_parser(

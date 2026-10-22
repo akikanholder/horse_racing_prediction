@@ -175,6 +175,18 @@ class TrackInfo(BaseModel):
         default_factory=list, description="週間天候情報"
     )
     source: str = Field(..., description="データソース (JRA/Netkeiba)")
+    measured_at: datetime | None = Field(
+        None,
+        description="ページに印字された測定時刻。Asia/Tokyo。印字が無ければ null。fetched_at からは作らない",
+    )
+    is_today: bool | None = Field(
+        None,
+        description="測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null",
+    )
+    stale: bool | None = Field(
+        None,
+        description="測定日がレース日と違うとき true。測定時刻が無い、またはレース日が読めないときは null",
+    )
     warning: str | None = Field(
         None, description="取得できない理由。取れたときは null"
     )

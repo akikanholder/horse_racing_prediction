@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.scrapers.page_fallback import looks_like_login_wall
+from backend.scrapers.track_freshness import should_bypass_page_cache
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
@@ -70,11 +71,13 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("GET", url, params, None)
-        cached = self._body(key)
-        if cached is not None:
-            return cached
+        if not should_bypass_page_cache(url, params):
+            cached = self._body(key)
+            if cached is not None:
+                return cached
         body = self._fetch("get", url, params=params, data=None, headers=headers, encoding=encoding)
-        self._store(key, url, body)
+        if not should_bypass_page_cache(url, params):
+            self._store(key, url, body)
         return body
 
     def post(
@@ -85,11 +88,13 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("POST", url, None, data)
-        cached = self._body(key)
-        if cached is not None:
-            return cached
+        if not should_bypass_page_cache(url, data):
+            cached = self._body(key)
+            if cached is not None:
+                return cached
         body = self._fetch("post", url, params=None, data=data, headers=headers, encoding=encoding)
-        self._store(key, url, body)
+        if not should_bypass_page_cache(url, data):
+            self._store(key, url, body)
         return body
 
     def _fetch(

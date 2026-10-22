@@ -375,7 +375,10 @@ class SettledRaceResult(BaseModel):
     )
     complete: bool = Field(
         False,
-        description="返した頭数がページの出走頭数と一致し、各馬に status があるときだけ true",
+        description=(
+            "走った頭数（取消・除外を除く）がページの N頭から取消・除外を引いた数と一致し、"
+            "各馬に status があり、速報の上位表だけではないとき true"
+        ),
     )
     result_phase: ResultPhase | None = Field(
         None,

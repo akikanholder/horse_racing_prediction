@@ -52,6 +52,8 @@ class HTTPClient:
         self._extra_headers = dict(headers or {})
         self._last_request_time: float = 0
         self._session: requests.Session | None = None
+        self.last_response_headers: dict[str, str] = {}
+        self.served_cached_copy = False
 
     def update_headers(self, headers: dict[str, str]) -> None:
         """Store headers on the Session so later requests send them."""
@@ -131,6 +133,7 @@ class HTTPClient:
                 response.encoding = "utf-8"
 
             self._last_request_time = time.time()
+            self._remember_response(response)
             return response.text
 
         except requests.RequestException as e:
@@ -176,11 +179,21 @@ class HTTPClient:
                 response.encoding = "utf-8"
 
             self._last_request_time = time.time()
+            self._remember_response(response)
             return response.text
 
         except requests.RequestException as e:
             logger.error(f"Request failed for {url}: {e}")
             raise
+
+    def _remember_response(self, response: requests.Response) -> None:
+        """Keep the headers of the last response. A cache HIT is sticky until cleared."""
+        from backend.scrapers.track_freshness import cached_copy_warning
+
+        headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+        self.last_response_headers = headers
+        if cached_copy_warning(headers):
+            self.served_cached_copy = True
 
     def close(self) -> None:
         """Close the session."""

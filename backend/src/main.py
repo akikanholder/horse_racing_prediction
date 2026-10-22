@@ -329,7 +329,13 @@ async def get_race_card(race_id: str, fetch_mode: JraFetchMode = "html"):
 
 
 @app.get("/api/races/{race_id}/result", response_model=SettledRaceResult, tags=["Races"])
-async def get_race_result(race_id: str, fetch_mode: JraFetchMode = "html"):
+async def get_race_result(
+    race_id: str,
+    fetch_mode: JraFetchMode = "html",
+    wait_complete: bool = False,
+    retry_interval: float = 60,
+    max_wait: float = 600,
+):
     """確定した1レースの着順と払戻を取得する。
 
     ``cli horse`` や ``/api/horses/{horse_id}`` の近走成績ではない。
@@ -347,7 +353,14 @@ async def get_race_result(race_id: str, fetch_mode: JraFetchMode = "html"):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        return race_service.get_settled_race_result(race_id, **_mode_arg(fetch_mode))
+        extra: dict[str, object] = {}
+        if wait_complete:
+            extra = {
+                "wait_complete": True,
+                "retry_interval": retry_interval,
+                "max_wait": max_wait,
+            }
+        return race_service.get_settled_race_result(race_id, **_mode_arg(fetch_mode), **extra)
     except Exception as e:
         logger.error(f"Failed to get race result for {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -630,6 +643,9 @@ async def get_track_info(
     date: str | None = None,
     merge: bool = False,
     fetch_mode: JraFetchMode = "html",
+    wait_fresh: bool = False,
+    retry_interval: float = 60,
+    max_wait: float = 600,
 ):
     """馬場情報（馬場状態、含水率、クッション値）を取得する。
 
@@ -644,8 +660,15 @@ async def get_track_info(
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
+        extra: dict[str, object] = {}
+        if wait_fresh:
+            extra = {
+                "wait_fresh": True,
+                "retry_interval": retry_interval,
+                "max_wait": max_wait,
+            }
         results = track_info_service.get_track_info(
-            racecourse=venue, date=date, merge=merge, **_mode_arg(fetch_mode)
+            racecourse=venue, date=date, merge=merge, **_mode_arg(fetch_mode), **extra
         )
         if not results:
             raise HTTPException(status_code=404, detail="Track info not found")

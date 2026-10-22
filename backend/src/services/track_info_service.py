@@ -1,14 +1,23 @@
 """Track information service that aggregates data from multiple sources."""
 
 import logging
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 from backend.models.track import CourseInfo, TrackInfo, empty_track_info
 from backend.scrapers.jra_headless import close_shared
 from backend.scrapers.jra_track_scraper import JRATrackScraper
 from backend.scrapers.netkeiba_track_scraper import NetkeibaTrackScraper
+from backend.scrapers.track_freshness import (
+    apply_measurement_freshness,
+    needs_fresh_wait,
+    parse_race_day,
+    polite_interval,
+    track_blocked,
+    wait_budget_spent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +78,14 @@ class TrackInfoService:
             self._netkeiba_scraper = NetkeibaTrackScraper()
         return self._netkeiba_scraper
 
-    def get_track_info_from_jra(self, racecourse: str | None = None) -> TrackInfo:
+    def get_track_info_from_jra(
+        self,
+        racecourse: str | None = None,
+        *,
+        race_date: date | None = None,
+        today: date | None = None,
+        race_date_warning: str | None = None,
+    ) -> TrackInfo:
         """Get track information from JRA.
 
         Args:
@@ -80,10 +96,21 @@ class TrackInfoService:
             TrackInfo from JRA
         """
         jra_code = self._get_jra_code(racecourse)
-        return self.jra_scraper.scrape(jra_code)
+        return self.jra_scraper.scrape(
+            jra_code,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
 
     def get_track_info_from_netkeiba(
-        self, racecourse: str | None = None, date: str | None = None
+        self,
+        racecourse: str | None = None,
+        date: str | None = None,
+        *,
+        race_date: date | None = None,
+        today: date | None = None,
+        race_date_warning: str | None = None,
     ) -> TrackInfo:
         """Get track information from Netkeiba.
 
@@ -96,7 +123,13 @@ class TrackInfoService:
             TrackInfo from Netkeiba
         """
         netkeiba_id = self._get_netkeiba_id(racecourse)
-        return self.netkeiba_scraper.scrape(netkeiba_id, date)
+        return self.netkeiba_scraper.scrape(
+            netkeiba_id,
+            date,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
 
     def get_track_info(
         self,
@@ -105,15 +138,26 @@ class TrackInfoService:
         sources: list[str] | None = None,
         merge: bool = False,
         fetch_mode: str | None = None,
+        wait_fresh: bool = False,
+        retry_interval: float = 60,
+        max_wait: float = 600,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        today: date | None = None,
     ) -> dict[str, TrackInfo]:
         """Get track information from specified sources.
 
         Args:
             racecourse: Racecourse name in Japanese or source-specific code
-            date: Date in YYYYMMDD format (for Netkeiba)
+            date: Date in YYYYMMDD format (for Netkeiba). Also the race date
+                  used to judge a stale measurement.
             sources: List of sources to use ('jra', 'netkeiba').
                     If None, both sources are used.
             merge: If True, returns a merged TrackInfo under 'merged' key
+            wait_fresh: Refetch while a printed measurement is not the race date.
+            retry_interval: Seconds between refetches. Raised to 60 when shorter.
+            max_wait: Stop once another wait would pass this many seconds.
+            today: Asia/Tokyo date used for ``is_today``. Defaults to today.
 
         Returns:
             Dictionary mapping source name to TrackInfo
@@ -122,7 +166,18 @@ class TrackInfoService:
             sources = ["jra", "netkeiba"]
 
         with self._using(fetch_mode):
-            return self._track_info(racecourse, date, sources, merge)
+            return self._track_info(
+                racecourse,
+                date,
+                sources,
+                merge,
+                wait_fresh=wait_fresh,
+                retry_interval=retry_interval,
+                max_wait=max_wait,
+                sleeper=sleeper,
+                clock=clock,
+                today=today,
+            )
 
     def _track_info(
         self,
@@ -130,28 +185,84 @@ class TrackInfoService:
         date: str | None,
         sources: list[str],
         merge: bool,
+        *,
+        wait_fresh: bool = False,
+        retry_interval: float = 60,
+        max_wait: float = 600,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        today: date | None = None,
     ) -> dict[str, TrackInfo]:
-        results = {}
+        race_day, race_warning = parse_race_day(date)
+        interval = polite_interval(retry_interval)
+        mono = clock or time.monotonic
+        pause = sleeper or time.sleep
+        started = mono()
+        while True:
+            results = self._fetch_track_info(
+                racecourse,
+                date,
+                sources,
+                merge,
+                race_day=race_day,
+                race_warning=race_warning,
+                today=today,
+            )
+            if not wait_fresh or any(track_blocked(info) for info in results.values()):
+                return results
+            if not needs_fresh_wait(results):
+                return results
+            if wait_budget_spent(started, mono(), interval, max_wait):
+                return results
+            pause(interval)
+
+    def _fetch_track_info(
+        self,
+        racecourse: str | None,
+        date: str | None,
+        sources: list[str],
+        merge: bool,
+        *,
+        race_day: date | None,
+        race_warning: str | None,
+        today: date | None,
+    ) -> dict[str, TrackInfo]:
+        results: dict[str, TrackInfo] = {}
         errors = {}
+        fresh = {
+            "race_date": race_day,
+            "today": today,
+            "race_date_warning": race_warning,
+        }
 
         if "jra" in sources:
             try:
-                results["jra"] = self.get_track_info_from_jra(racecourse)
+                results["jra"] = self.get_track_info_from_jra(racecourse, **fresh)
             except Exception as e:
                 logger.warning(f"Failed to get JRA track info: {e}")
                 errors["jra"] = str(e)
-                results["jra"] = empty_track_info("JRA", "JRA baba fetch failed")
+                results["jra"] = apply_measurement_freshness(
+                    empty_track_info("JRA", "JRA baba fetch failed"),
+                    race_date=race_day,
+                    today=today,
+                    race_date_warning=race_warning,
+                )
 
         # JRA 403, a foreign tab, or a page with no cushion number falls back to
         # netkeiba's public track page for the same venue and date. The JRA
         # payload stays the failure. Values copied from netkeiba name that source.
         if "netkeiba" in sources or _jra_needs_netkeiba(results.get("jra")):
             try:
-                results["netkeiba"] = self.get_track_info_from_netkeiba(racecourse, date)
+                results["netkeiba"] = self.get_track_info_from_netkeiba(racecourse, date, **fresh)
             except Exception as e:
                 logger.warning(f"Failed to get Netkeiba track info: {e}")
                 errors["netkeiba"] = str(e)
-                results["netkeiba"] = empty_track_info("Netkeiba", "netkeiba track fetch failed")
+                results["netkeiba"] = apply_measurement_freshness(
+                    empty_track_info("Netkeiba", "netkeiba track fetch failed"),
+                    race_date=race_day,
+                    today=today,
+                    race_date_warning=race_warning,
+                )
 
         jra_info = results.get("jra")
         netkeiba_info = results.get("netkeiba")
@@ -161,7 +272,12 @@ class TrackInfoService:
             and netkeiba_info is not None
             and (jra_info.racecourse or netkeiba_info.racecourse)
         ):
-            results["merged"] = self._merge_track_info(jra_info, netkeiba_info)
+            results["merged"] = apply_measurement_freshness(
+                self._merge_track_info(jra_info, netkeiba_info),
+                race_date=race_day,
+                today=today,
+                race_date_warning=race_warning,
+            )
 
         if errors:
             logger.info(f"Errors during scraping: {errors}")
