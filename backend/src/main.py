@@ -257,8 +257,14 @@ async def get_race_trends(
         str | None,
         Query(alias="date", description="その日だけ。YYYYMMDD または YYYY-MM-DD"),
     ] = None,
-    date_from: Annotated[date | None, Query(description="開始日。含む")] = None,
-    date_to: Annotated[date | None, Query(description="終了日。含む")] = None,
+    date_from: Annotated[
+        str | None,
+        Query(description="開始日。含む。YYYYMMDD または YYYY-MM-DD"),
+    ] = None,
+    date_to: Annotated[
+        str | None,
+        Query(description="終了日。含む。YYYYMMDD または YYYY-MM-DD"),
+    ] = None,
     venue: Annotated[list[str] | None, Query(description="競馬場。繰り返す")] = None,
     surface: Annotated[Literal["芝", "ダート"] | None, Query(description="芝またはダート")] = None,
     distance: Annotated[int | None, Query(ge=1, description="距離 (m)")] = None,
@@ -286,12 +292,14 @@ async def get_race_trends(
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
     meeting_day = _meeting_day(on_date)
-    if today and (meeting_day or date_from or date_to or recent_meeting or as_of):
+    start = _meeting_day(date_from)
+    end = _meeting_day(date_to)
+    if today and (meeting_day or start or end or recent_meeting or as_of):
         raise HTTPException(
             status_code=400,
             detail="today is the Asia/Tokyo meeting day and does not take another date",
         )
-    if not today and not recent_meeting and meeting_day is None and date_from is None:
+    if not today and not recent_meeting and meeting_day is None and start is None:
         raise HTTPException(status_code=400, detail="date or date_from is required")
     try:
         return race_service.get_race_trends(
@@ -301,8 +309,8 @@ async def get_race_trends(
             race_class=race_class,
             going=going,
             on_date=meeting_day,
-            date_from=date_from,
-            date_to=date_to,
+            date_from=start,
+            date_to=end,
             recent_meeting=recent_meeting,
             as_of=as_of,
             today=today,

@@ -732,6 +732,47 @@ def test_todays_race_list_is_not_replayed(tmp_path: Path, monkeypatch):
     assert calls == [sub, sub]
 
 
+def test_today_jra_pages_and_prerace_odds_are_not_replayed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.scrapers.page_cache.tokyo_now",
+        lambda: datetime(2026, 10, 18, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+    calls: list[str] = []
+
+    class _Transport:
+        def get(self, url, params=None, headers=None, encoding=None):
+            calls.append(url)
+            return '{"status":"middle","data":""}'
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            calls.append(str((data or {}).get("cname") or url))
+            return "<html></html>"
+
+    client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    payout = "https://www.jra.go.jp/JRADB/accessH.html"
+    today = {"cname": "pw01hde10052026040820261018/A4"}
+    past = {"cname": "pw01hde10052026040820261017/A4"}
+    client.post(payout, data=today)
+    client.post(payout, data=today)
+    client.post(payout, data=past)
+    client.post(payout, data=past)
+    odds = "https://race.netkeiba.com/api/api_get_jra_odds.html"
+    client.get(odds, params={"race_id": "202605040801", "type": "1"})
+    client.get(odds, params={"race_id": "202605040801", "type": "1"})
+    card = "https://www.jra.go.jp/JRADB/accessD.html"
+    client.post(card, data={"cname": "pw01dli00/F3"})
+    client.post(card, data={"cname": "pw01dli00/F3"})
+    assert calls == [
+        "pw01hde10052026040820261018/A4",
+        "pw01hde10052026040820261018/A4",
+        "pw01hde10052026040820261017/A4",
+        odds,
+        odds,
+        "pw01dli00/F3",
+        "pw01dli00/F3",
+    ]
+
+
 def test_login_wall_is_not_cached(tmp_path: Path):
     calls: list[int] = []
 
@@ -1340,6 +1381,26 @@ def test_date_range_includes_the_end_day():
     assert seen == [date(2026, 10, 17), date(2026, 10, 18)]
     assert batch.date_from == date(2026, 10, 17)
     assert batch.date_to == date(2026, 10, 18)
+    assert batch.races == []
+    assert batch.warning == "no meeting on 2026-10-17; no meeting on 2026-10-18"
+
+
+def test_race_list_failure_is_not_reported_as_an_empty_meeting():
+    class _List:
+        def get_races_by_date(self, target):
+            raise RuntimeError("down")
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2026, 10, 18))
+    assert batch.warning == "race list failed for 2026-10-18"
     assert batch.races == []
 
 

@@ -2,7 +2,7 @@
 
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,9 @@ from backend.models.race_trends import (
 )
 from backend.models.running_style import STYLE_BASIS
 from backend.scrapers.final_odds import PublicOddsPages
+from backend.scrapers.jra_payout import JRA_PAYOUT_UNREACHABLE
+from backend.scrapers.jra_scraper import JRAScraper
+from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
 from backend.scrapers.page_fallback import AccessBlocked
@@ -476,10 +479,55 @@ def test_provisional_race_is_excluded():
     assert report.sample_size == 0
     assert report.races_pending == 1
     assert report.excluded[0].reason == RESULT_PHASE_PROVISIONAL
-    assert report.warning is not None
-    assert "1 race is not final and was left out" in report.warning
+    assert report.warning == "1 race is not final and was left out: 202505030801"
     assert report.by_popularity[0].sample_size == 0
     assert report.by_popularity[0].win_rate is None
+
+
+def test_pending_warning_names_every_race_id():
+    report = _report(
+        [
+            _race(phase="provisional"),
+            _race("202505030802", complete=False),
+            _race("202505030803"),
+        ]
+    )
+    assert report.races_pending == 2
+    assert report.sample_size == 1
+    assert report.warning == ("2 races are not final and were left out: 202505030801, 202505030802")
+
+
+def test_tables_split_by_surface_when_surface_is_omitted():
+    turf = _race(
+        "202605040801",
+        runners=[_finisher(1, rank=1, odds=2.4, popularity=2, bracket=2, passing="1-1")],
+        surface="芝",
+    )
+    dirt = _race(
+        "202605040802",
+        runners=[_finisher(3, rank=1, odds=3.1, popularity=1, bracket=4, passing="3-3")],
+        surface="ダート",
+    )
+    report = _report([turf, dirt])
+    assert [item.surface for item in report.by_surface] == ["芝", "ダート"]
+    turf_pop = {row.band: row.sample_size for row in report.by_surface[0].by_popularity}
+    dirt_pop = {row.band: row.sample_size for row in report.by_surface[1].by_popularity}
+    assert turf_pop["2"] == 1
+    assert turf_pop["1"] == 0
+    assert dirt_pop["1"] == 1
+    assert dirt_pop["2"] == 0
+    combined = {row.band: row.sample_size for row in report.by_popularity}
+    assert combined["1"] == 1
+    assert combined["2"] == 1
+    turf_gate = {row.horse_number: row.sample_size for row in report.by_surface[0].by_gate}
+    dirt_frame = {row.bracket_number: row.sample_size for row in report.by_surface[1].by_frame}
+    assert turf_gate == {1: 1}
+    assert dirt_frame == {4: 1}
+    assert {row.horse_number for row in report.by_gate} == {1, 3}
+    only = _report([turf, dirt], surface="芝")
+    assert [item.surface for item in only.by_surface] == ["芝"]
+    assert only.sample_size == 1
+    assert {row.band: row.sample_size for row in only.by_popularity}["2"] == 1
 
 
 def test_confirmed_but_incomplete_race_is_pending_and_not_counted():
@@ -805,15 +853,24 @@ def test_trends_api_accepts_today_and_yyyymmdd(monkeypatch):
         compact = client.get("/api/races/trends", params={"date": "20261018", "venue": "東京"})
         today = client.get("/api/races/trends", params={"today": "true"})
         bad = client.get("/api/races/trends", params={"date": "18-10-2026"})
+        span = client.get(
+            "/api/races/trends",
+            params={"date_from": "20250601", "date_to": "20250608"},
+        )
+        bad_from = client.get("/api/races/trends", params={"date_from": "2025-13-40"})
     assert conflict.status_code == 400
     assert bad.status_code == 400
+    assert bad_from.status_code == 400
     assert compact.status_code == 200
     assert today.status_code == 200
+    assert span.status_code == 200
     assert captured[0]["on_date"] == date(2026, 10, 18)
     assert captured[0]["today"] is False
     assert captured[0]["venues"] == ["東京"]
     assert captured[1]["today"] is True
     assert captured[1]["on_date"] is None
+    assert captured[2]["date_from"] == date(2025, 6, 1)
+    assert captured[2]["date_to"] == date(2025, 6, 8)
 
 
 def test_today_uses_asia_tokyo_and_refuses_another_date():
@@ -986,6 +1043,175 @@ def test_same_day_rerun_includes_a_race_that_settles_later(tmp_path: Path, monke
     third = _open().get(today=True, venues=["東京"], sires={})
     assert result_gets == [race_id, race_id]
     assert third.included_race_ids == [race_id]
+
+
+def test_midday_rerun_refetches_today_jra_payout_odds_and_card(tmp_path: Path, monkeypatch):
+    """A morning payout page and pre-race odds must not be replayed after noon.
+
+    The JRA scraper and the odds API client are the real ones. Only the HTTP
+    transport is a fixture. The clock is 2026-10-18 in Asia/Tokyo, so the
+    year+kai+day digits inside the cname are not treated as a past meeting.
+    """
+    meeting = date(2026, 10, 18)
+    race_id = "202605040801"
+    monkeypatch.setattr(
+        "backend.scrapers.page_cache.tokyo_now",
+        lambda: datetime(2026, 10, 18, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+    day_cname = "pw01hde10052026040820261018/A4"
+    meeting_cname = "pw01drl10052026040820261018/AB"
+    card_cname = "pw01dde1005202604080120261018/AB"
+    odds_cname = "pw01ode0105202604080120261018/AB"
+    phase = {"payout": "morning", "odds": "middle"}
+    payout_posts: list[str] = []
+    odds_posts: list[str] = []
+    card_posts: list[str] = []
+    odds_api: list[str] = []
+    confirmed = """<!DOCTYPE html><html><head>
+<title>未勝利 結果・払戻 | 2026年10月18日 東京1R レース情報(JRA) - netkeiba</title>
+</head><body>
+<div class="RaceList_Item02">
+<h1 class="RaceName">未勝利</h1>
+<p class="RaceResultState">確定</p>
+<div class="RaceData01"><span>芝1600m</span> / 天候:晴 <span class="Item03">/ 馬場:良</span></div>
+<div class="RaceData02"><span>4回</span><span>東京</span><span>8日目</span>
+<span>未勝利</span><span>1頭</span></div>
+</div>
+<table summary="全着順" class="Table_Show_All"><tr>
+<th>着順</th><th>枠</th><th>馬番</th><th>馬名</th><th>斤量</th><th>騎手</th>
+<th>タイム</th><th>着差</th><th>人気</th><th>単勝オッズ</th><th>後3F</th><th>コーナー通過順</th>
+</tr>
+<tr class="HorseList">
+<td class="Result_Num"><div class="Rank">1</div></td>
+<td><div>1</div></td><td><div>1</div></td>
+<td class="Horse_Info"><a href="https://db.netkeiba.com/horse/0000000001">アルファ</a></td>
+<td>55.0</td><td>ルメール</td><td>1:33.0</td><td></td><td>1</td><td>2.4</td><td>34.0</td><td>1-1</td>
+</tr>
+</table>
+<table class="Payout_Detail_Table"><tr><th>単勝</th>
+<td class="Result"><div><span>1</span></div></td>
+<td class="Payout"><span>240円</span></td><td class="Ninki"><span>1人気</span></td></tr>
+</table>
+</body></html>"""
+    listing = """
+    <dl>
+      <dt><p class="RaceList_DataTitle"><small>4回</small> 東京 <small>8日目</small></p></dt>
+      <dd><ul>
+        <li class="RaceList_DataItem">
+          <a href="../race/shutuba.html?race_id=202605040801">
+            <span class="ItemTitle">未勝利</span>
+            <div class="RaceData"><span>芝1600m</span><span class="RaceList_Itemnumber">1頭</span></div>
+          </a>
+        </li>
+      </ul></dd>
+    </dl>
+    """
+    morning_payout = '<img src="/img/race_number_main/race_num_1.png" alt="1R">'
+    afternoon_payout = """
+    <img src="/img/race_number_main/race_num_1.png" alt="1R">
+    <div class="refund_unit"><ul><li><dl><dt>単勝</dt><dd>
+      <div class="line"><span class="num">1</span><span class="yen">240円</span>
+      <span class="pop">1番人気</span></div>
+    </dd></dl></li></ul></div>
+    """
+
+    class _Transport:
+        def get(self, url, params=None, headers=None, encoding=None):
+            if "api_get_jra_odds.html" in url:
+                bet = str((params or {}).get("type") or "")
+                odds_api.append(bet)
+                if phase["odds"] != "result":
+                    return json.dumps({"status": "middle", "data": ""})
+                if bet == "1":
+                    return json.dumps({"status": "result", "data": {"odds": {"1": {"1": "2.4"}}}})
+                return json.dumps({"status": "result", "data": {"odds": {}}})
+            if "result.html" in url:
+                return confirmed
+            if "race_list" in url:
+                return listing
+            return "<html></html>"
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            cname = str((data or {}).get("cname") or "")
+            if "accessH.html" in url:
+                payout_posts.append(cname)
+                if cname == day_cname and phase["payout"] == "afternoon":
+                    return afternoon_payout
+                if cname == day_cname:
+                    return morning_payout
+                if cname == "pw01hli00/03":
+                    return (
+                        '<html><body><a onclick="doAction('
+                        f"'/JRADB/accessH.html','{day_cname}');\">払戻</a></body></html>"
+                    )
+            if "accessD.html" in url:
+                card_posts.append(cname)
+                if cname == "pw01dli00/F3":
+                    return (
+                        '<html><body><a onclick="doAction('
+                        f"'/JRADB/accessD.html','{meeting_cname}');\">開催</a></body></html>"
+                    )
+                if cname == meeting_cname:
+                    return (
+                        '<html><body><a onclick="doAction('
+                        f"'/JRADB/accessD.html','{card_cname}');\">1R</a></body></html>"
+                    )
+                if cname == card_cname:
+                    return (
+                        '<html><body><a onclick="doAction('
+                        f"'/JRADB/accessO.html','{odds_cname}');\">オッズ</a></body></html>"
+                    )
+            if "accessO.html" in url:
+                odds_posts.append(cname)
+                return '<table><tr><td class="odds">2.4</td></tr></table>'
+            return "<html></html>"
+
+    http = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    batches: list[HistoricalBatch] = []
+
+    def _open() -> RaceTrendService:
+        history = HistoricalService(
+            netkeiba=NetkeibaScraper(http_client=http, headless_render="off"),
+            jra=JRAScraper(http, headless_render="off", fetch_mode="html"),
+            odds=NetkeibaOddsScraper(http),
+            delay_seconds=0,
+        )
+        original = history.get
+
+        def _record(**kwargs: object) -> HistoricalBatch:
+            batch = original(**kwargs)  # type: ignore[arg-type]
+            batches.append(batch)
+            return batch
+
+        history.get = _record  # type: ignore[method-assign]
+        return RaceTrendService(historical=history, clock=lambda: meeting)
+
+    first = _open().get(today=True, venues=["東京"], sires={})
+    assert first.sample_size == 1
+    assert first.included_race_ids == [race_id]
+    assert batches[0].races[0].warning is not None
+    assert JRA_PAYOUT_UNREACHABLE in batches[0].races[0].warning
+    assert payout_posts.count(day_cname) == 1
+    assert odds_posts == [odds_cname]
+    assert card_posts.count(card_cname) == 1
+    assert odds_api == ["1"]
+
+    phase["payout"] = "afternoon"
+    phase["odds"] = "result"
+    second = _open().get(today=True, venues=["東京"], sires={})
+    assert payout_posts.count(day_cname) == 2
+    assert odds_posts == [odds_cname, odds_cname]
+    assert card_posts.count(card_cname) == 2
+    assert odds_api[0] == "1"
+    assert "1" in odds_api[1:]
+    assert len(odds_api) > 2
+    assert second.sample_size == 1
+    assert second.included_race_ids == [race_id]
+    assert batches[1].races[0].warning is None or (
+        JRA_PAYOUT_UNREACHABLE not in batches[1].races[0].warning
+    )
+    assert second.included_races[0].fetched_at is not None
+    assert second.included_races[0].fetched_at.utcoffset() == timedelta(hours=9)
 
 
 class _Hist:

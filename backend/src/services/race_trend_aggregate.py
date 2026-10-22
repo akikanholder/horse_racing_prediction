@@ -56,6 +56,7 @@ from backend.models.race_trends import (
     RunnerOmission,
     RunningStyleRow,
     SireSurfaceRow,
+    SurfaceTrendTables,
     TrendFilter,
     pending_races_warning,
     running_style_definition,
@@ -160,7 +161,7 @@ def aggregate_race_trends(
     fetched_min = min(fetched) if fetched else None
     fetched_max = max(fetched) if fetched else None
     same_fetch = fetched_min is not None and fetched_min == fetched_max
-    pending = sum(1 for item in excluded if _is_pending(item.reason))
+    pending_ids = [item.race_id for item in excluded if _is_pending(item.reason)]
     notes = [
         batch_warning,
         None if recent_meeting is None else recent_meeting.warning,
@@ -168,7 +169,7 @@ def aggregate_race_trends(
         None
         if not included or _join_source(*(race.source for race in included))
         else ("source was not on the included races"),
-        pending_races_warning(pending),
+        pending_races_warning(pending_ids),
     ]
     included_rows = [
         IncludedRace(race_id=race.race_id, source=race.source, fetched_at=race.fetched_at)
@@ -182,7 +183,7 @@ def aggregate_race_trends(
         runner_sample_size=len(flat),
         included_races=included_rows,
         included_race_ids=[row.race_id for row in included_rows],
-        races_pending=pending,
+        races_pending=len(pending_ids),
         excluded=excluded,
         history_skipped=history_skipped,
         runner_omissions=_omission_rows(omissions),
@@ -191,6 +192,7 @@ def aggregate_race_trends(
         by_frame=_frames(flat),
         running_style_definition=running_style_definition(),
         by_running_style=_styles(flat),
+        by_surface=_by_surface(flat, filt.surface),
         by_jockey=_jockeys(flat),
         by_sire=_sires(flat, sires or {}, sire_unfetched or {}),
         source=_join_source(*(race.source for race in included)),
@@ -378,6 +380,27 @@ def _sire_reason(
     if not _text(pedigree.sire.name) and not pedigree.sire.horse_id:
         return pedigree.warning or SIRE_UNAVAILABLE
     return None
+
+
+def _by_surface(rows: Sequence[_Counted], only: FlatSurface | None) -> list[SurfaceTrendTables]:
+    """人気、馬番、枠、脚質を面ごとに分ける。障害はここに来ない。
+
+    ``only`` が無いときは芝とダートの両方。上の表は両面を合わせたまま。
+    """
+    names: tuple[FlatSurface, ...] = (only,) if only in {"芝", "ダート"} else ("芝", "ダート")
+    tables: list[SurfaceTrendTables] = []
+    for name in names:
+        group = [row for row in rows if row.surface == name]
+        tables.append(
+            SurfaceTrendTables(
+                surface=name,
+                by_popularity=_popularity(group),
+                by_gate=_gates(group),
+                by_frame=_frames(group),
+                by_running_style=_styles(group),
+            )
+        )
+    return tables
 
 
 def _popularity(rows: Sequence[_Counted]) -> list[PopularityBandRow]:

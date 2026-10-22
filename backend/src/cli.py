@@ -775,15 +775,28 @@ def _print_trends(report: RaceTrendReport) -> None:
         print("除外:")
         for item in report.excluded:
             print(f"  {item.race_id}: {item.reason}")
-    _print_trend_rows("人気", report.by_popularity, lambda row: row.band)
-    _print_trend_rows("馬番", report.by_gate, lambda row: f"{row.horse_number}番")
-    _print_trend_rows("枠", report.by_frame, lambda row: f"{row.bracket_number}枠")
+    combined = "（芝とダート）" if len(report.by_surface) > 1 else ""
+    _print_trend_rows(f"人気{combined}", report.by_popularity, lambda row: row.band)
+    _print_trend_rows(f"馬番{combined}", report.by_gate, lambda row: f"{row.horse_number}番")
+    _print_trend_rows(f"枠{combined}", report.by_frame, lambda row: f"{row.bracket_number}枠")
     print(f"脚質の定義: {report.running_style_definition.position}")
     print(f"  逃げ: {report.running_style_definition.escape}")
     print(f"  先行: {report.running_style_definition.front_end}")
     print(f"  差し: {report.running_style_definition.mid_end}")
     print(f"  追込: {report.running_style_definition.closer}")
-    _print_trend_rows("脚質", report.by_running_style, lambda row: row.label)
+    _print_trend_rows(f"脚質{combined}", report.by_running_style, lambda row: row.label)
+    if len(report.by_surface) > 1:
+        for table in report.by_surface:
+            _print_trend_rows(f"人気 {table.surface}", table.by_popularity, lambda row: row.band)
+            _print_trend_rows(
+                f"馬番 {table.surface}", table.by_gate, lambda row: f"{row.horse_number}番"
+            )
+            _print_trend_rows(
+                f"枠 {table.surface}", table.by_frame, lambda row: f"{row.bracket_number}枠"
+            )
+            _print_trend_rows(
+                f"脚質 {table.surface}", table.by_running_style, lambda row: row.label
+            )
     _print_trend_rows(
         "騎手",
         report.by_jockey,
@@ -1057,7 +1070,8 @@ def main():
         help="確定レースの人気・枠・脚質・騎手・父の勝率と回収を集計する",
         description=(
             "history の確定着順・確定オッズ・払戻と、ローカルキャッシュから集計する。"
-            "人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分けて出す。"
+            "人気帯、馬番、枠、脚質、騎手、父。surface を付けないときは人気・馬番・枠・脚質を"
+            "芝とダートに分け、合わせた表も出す。騎手と父も面を分けて出す。"
             "脚質は通過順の最初の数字と頭数の三等分。4コーナーは使わない。"
             "少ない標本も sample_size 付きで残す。計算できない値は null と warning。"
             "入れるのは result_phase が confirmed かつ complete が true のレースだけ。"

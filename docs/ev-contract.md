@@ -550,7 +550,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 単勝の確定オッズと、単勝・ワイド・馬連・三連複の払戻が揃えばバックテストに足りる。組み合わせの確定オッズはページにあるときだけ。
 
-日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、確定かつ complete の `result.html` は開き直さない。保存時に `replayable` を付ける。結果以外のページは、その印があるとき本文をパースし直さない。`result.html` は印があっても本文を見る。判断はパスと mtime ごとに一度。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。403 とログイン画面はキャッシュしない。
+日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、確定かつ complete の `result.html` は開き直さない。保存時に `replayable` を付ける。結果以外のページは、その印があるとき本文をパースし直さない。`result.html` は印があっても本文を見る。判断はパスと mtime ごとに一度。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。今日以降の JRA `accessH`（払戻）、`accessO`（オッズ）、`accessD`（出馬表）と、日付の無いそれらのメニューも保存しない。cname の `ymd` が今日より前のページは保存してよい。netkeiba のオッズ API（`api_get_jra_odds.html`）は `status` が `result` のときだけ保存する。`middle` や `yoso` は保存せず、次の実行が取り直す。403 とログイン画面はキャッシュしない。
 
 結果ページが `race result returned 403` または `race result requires login` のとき、そのレースのオッズも、それより後のレースも開かない。同じ実行ではその URL を再試行しない。User-Agent の差し替え、captcha、ログインはしない。開催一覧が 403 またはログイン画面のときは、その日以降の一覧を開かない。すでに並んだレースだけ取り、`warning` は `race list returned 403` または `race list requires login`。JRA のオッズだけが 403 のときは、そのレースの netkeiba に一度だけ進み、日付範囲は止めない。JRA の次のページは開かない。
 
@@ -574,7 +574,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 ## レース傾向 `RaceTrendReport`
 
-確定したレースの集計。予想の入力に混ぜない。行は `history` と同じ確定着順・確定オッズ・払戻。ページは `backend/.cache/pages` を使う。確定かつ complete の `result.html` は開き直さない。未確定の `result.html` と、今日（Asia/Tokyo）以降の開催一覧は開き直す。日付範囲の終了日は含む。今日を落とす past-only は無い。`progress.json` は history の書き出しが作るだけで、trends は読まない。
+確定したレースの集計。予想の入力に混ぜない。行は `history` と同じ確定着順・確定オッズ・払戻。ページは `backend/.cache/pages` を使う。確定かつ complete の `result.html` は開き直さない。未確定の `result.html` と、今日（Asia/Tokyo）以降の開催一覧、今日以降の JRA 払戻・オッズ・出馬表、`status` が `result` でないオッズ API は開き直す。日付範囲の終了日は含む。今日を落とす past-only は無い。`progress.json` は history の書き出しが作るだけで、trends は読まない。開催一覧が空の日は `no meeting on YYYY-MM-DD`。一覧の取得に失敗した日は `race list failed for YYYY-MM-DD`。403 とログイン画面は今までどおり止める。
 
 ```bash
 python -m backend.cli trends --today --venue 東京 --json
@@ -594,7 +594,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 | `going` | 良 / 稍重 / 重 / 不良 |
 | `today` | true のとき、開催日は今日（Asia/Tokyo）の1日。`date` や `date_from` とは一緒に使えない |
 | `date` | その開催日だけ。`YYYYMMDD` または `YYYY-MM-DD`。読めない文字列は 400 |
-| `date_from` / `date_to` | 開催日。含む。`date_to` の当日も範囲に入る |
+| `date_from` / `date_to` | 開催日。含む。`YYYYMMDD` または `YYYY-MM-DD`。読めない文字列は 400。`date_to` の当日も範囲に入る |
 | `recent_meeting` | true のとき、当日の確定とその競馬場の前開催日だけ。当日の既定は今日（Asia/Tokyo） |
 | `as_of` | recent meeting の当日。無ければ今日（Asia/Tokyo） |
 
@@ -602,18 +602,19 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 `--recent-meeting` は競馬場が一つ必要。前開催日は、当日の前日以前でその競馬場のレースが並んだ最も近い日。空の日は飛ばす。一覧が 403 またはログイン画面のときは、それより前の日も、レースページも開かない。User-Agent の差し替え、captcha、ログインはしない。120日見ても無いときは `previous_meeting_date` は null。
 
-集計に入れるのは `result_phase` が `confirmed` かつ `complete` が true で、出走馬ごとに単勝の確定オッズがあるレース。最終結果でないレースは `excluded` に理由を書き、`races_pending` に数える。着順やオッズは作らない。理由の例: `race not yet settled`、`result phase is provisional`、`result phase was not on the page`、`race result is not complete`、`race result incomplete: …`。`warning` は `1 race is not final and was left out` または `N races are not final and were left out`。403 とログイン画面は `excluded` に書くが `races_pending` には入れない。確定かつ complete でも単勝の確定オッズが無いレースは `excluded`（`final win odds were not on the page`）で、pending ではない。フィルタと印字が違うレースは除外一覧に入れない。印字が無くてフィルタを適用できないレースは入れる（`distance was not on the page` など）。
+集計に入れるのは `result_phase` が `confirmed` かつ `complete` が true で、出走馬ごとに単勝の確定オッズがあるレース。最終結果でないレースは `excluded` に理由を書き、`races_pending` に数える。着順やオッズは作らない。理由の例: `race not yet settled`、`result phase is provisional`、`result phase was not on the page`、`race result is not complete`、`race result incomplete: …`。`warning` は `1 race is not final and was left out: {race_id}` または `N races are not final and were left out: {race_id}, …`。件数のあとにレースIDを書く。403 とログイン画面は `excluded` に書くが `races_pending` には入れない。確定かつ complete でも単勝の確定オッズが無いレースは `excluded`（`final win odds were not on the page`）で、pending ではない。フィルタと印字が違うレースは除外一覧に入れない。印字が無くてフィルタを適用できないレースは入れる（`distance was not on the page` など）。
 
-`included_races` は入れたレースごとに `race_id`、`source`、`fetched_at`。`included_race_ids` はその `race_id` だけで、同じ順。`source` と `fetched_at`（レポート全体）は入れたレースをまとめたもの。時刻が違うときは `fetched_at` は null。
+`included_races` は入れたレースごとに `race_id`、`source`、`fetched_at`。`fetched_at` は Asia/Tokyo のオフセット `+09:00` を持つ。`included_race_ids` はその `race_id` だけで、同じ順。`source` と `fetched_at`（レポート全体）は入れたレースをまとめたもの。時刻が違うときは `fetched_at` は null。
 
 各表の `sample_size` は出走馬数。取消・除外は入れない。`sample_size` が 0 の rate と ROI は null。0.0 にはしない。1頭の区分も落とさない。
 
 | 表 | 区分 |
 |---|---|
-| `by_popularity` | 1 / 2 / 3 / 4-6 / 7-9 / 10+。空の帯も残す |
-| `by_gate` | 馬番。出た番だけ |
-| `by_frame` | 枠番。出た枠だけ |
-| `by_running_style` | 逃げ / 先行 / 差し / 追込。0頭でも残す |
+| `by_popularity` | 1 / 2 / 3 / 4-6 / 7-9 / 10+。空の帯も残す。`surface` を付けないときは芝とダートを合わせた数 |
+| `by_gate` | 馬番。出た番だけ。合わせた数 |
+| `by_frame` | 枠番。出た枠だけ。合わせた数 |
+| `by_running_style` | 逃げ / 先行 / 差し / 追込。0頭でも残す。合わせた数 |
+| `by_surface` | `surface` が `芝` または `ダート`。中に `by_popularity` / `by_gate` / `by_frame` / `by_running_style`。`surface` クエリが無いときは芝とダートの両方。指定したときはその面だけ。障害は入れない。0頭の面も残す |
 | `by_jockey` | 騎手 × 芝/ダート。面は混ぜない |
 | `by_sire` | 父 × 芝/ダート。父が取れない馬は行にしない |
 

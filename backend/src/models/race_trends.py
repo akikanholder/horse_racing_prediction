@@ -5,6 +5,7 @@ A missing price, sire, or running style stays null and carries a warning.
 Buckets with a small sample are kept. Their ``sample_size`` is the count.
 """
 
+from collections.abc import Sequence
 from datetime import date, datetime
 from typing import Literal
 
@@ -171,6 +172,16 @@ class SireSurfaceRow(TrendBucket):
     )
 
 
+class SurfaceTrendTables(BaseModel):
+    """人気、馬番、枠、脚質を芝またはダートだけで数えた表。"""
+
+    surface: FlatSurface = Field(..., description="芝またはダート")
+    by_popularity: list[PopularityBandRow] = Field(default_factory=list)
+    by_gate: list[GateRow] = Field(default_factory=list, description="馬番。この面だけ")
+    by_frame: list[FrameRow] = Field(default_factory=list, description="枠番。この面だけ")
+    by_running_style: list[RunningStyleRow] = Field(default_factory=list)
+
+
 class ExcludedRace(BaseModel):
     """A race that was in the fetch but not in the rates."""
 
@@ -245,6 +256,13 @@ class RaceTrendReport(BaseModel):
         ..., description="脚質の定義。通過順の最初の数字と閾値"
     )
     by_running_style: list[RunningStyleRow] = Field(default_factory=list)
+    by_surface: list[SurfaceTrendTables] = Field(
+        default_factory=list,
+        description=(
+            "人気・馬番・枠・脚質を面ごとに分けた表。surface を指定しないときは芝とダート。"
+            "上の by_popularity などは両面を合わせた表"
+        ),
+    )
     by_jockey: list[JockeySurfaceRow] = Field(
         default_factory=list, description="騎手。芝とダートは別の行"
     )
@@ -267,13 +285,18 @@ class RaceTrendReport(BaseModel):
     warning: str | None = Field(None, description="集計全体の欠測。複数は ; でつなぐ")
 
 
-def pending_races_warning(count: int) -> str | None:
-    """Warning when races were left out because they are not final."""
+def pending_races_warning(race_ids: Sequence[str]) -> str | None:
+    """Warning when races were left out because they are not final.
+
+    The count and the race ids are both in the text. An empty list is no warning.
+    """
+    count = len(race_ids)
     if count <= 0:
         return None
+    ids = ", ".join(race_ids)
     if count == 1:
-        return "1 race is not final and was left out"
-    return f"{count} races are not final and were left out"
+        return f"1 race is not final and was left out: {ids}"
+    return f"{count} races are not final and were left out: {ids}"
 
 
 def running_style_definition() -> RunningStyleDefinition:
