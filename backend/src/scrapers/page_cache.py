@@ -52,6 +52,8 @@ class CachingHTTPClient(HTTPClient):
         super().__init__(min_request_interval=min_request_interval)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_page_cache_dir()
         self._transport = transport
+        # Legacy files have no replayable mark. Remember the judgement per path and mtime.
+        self._replay_cache: dict[str, tuple[int, bool]] = {}
 
     def cached_fetched_at(
         self,
@@ -133,11 +135,46 @@ class CachingHTTPClient(HTTPClient):
         return body
 
     def _cached_body(self, key: str, url: str) -> str | None:
-        """A stored body. A flash or short result table is not replayed."""
-        body = self._body(key)
-        if body is None or _partial_result(url, body):
+        """A stored body. A flash or short result table is not replayed.
+
+        A non-result page this client stored is marked replayable, so a later
+        read does not parse it. ``result.html`` is judged from the body, once
+        per path and mtime, even when that mark is set.
+        """
+        path = self._path(key)
+        payload = self._load(path)
+        if payload is None:
+            return None
+        body = payload.get("body")
+        if not isinstance(body, str) or not body:
+            return None
+        if not self._replayable(path, url, payload, body):
             return None
         return body
+
+    def _replayable(self, path: Path, url: str, payload: dict[str, object], body: str) -> bool:
+        """False for a flash or short ``result.html``. Other stored pages are kept."""
+        marked = payload.get("replayable")
+        if "result.html" not in url and isinstance(marked, bool):
+            return marked
+        return self._body_is_complete(path, url, body)
+
+    def _body_is_complete(self, path: Path, url: str, body: str) -> bool:
+        """True when this file is not a flash or short ``result.html``.
+
+        The judgement is remembered for the path and mtime. A new write
+        changes the mtime, so the next read checks the new body.
+        """
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return not _partial_result(url, body)
+        cached = self._replay_cache.get(str(path))
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        ok = not _partial_result(url, body)
+        self._replay_cache[str(path)] = (mtime, ok)
+        return ok
 
     def _store(self, key: str, url: str, body: str) -> None:
         if not body or looks_like_login_wall(body) or _partial_result(url, body):
@@ -147,18 +184,11 @@ class CachingHTTPClient(HTTPClient):
         payload = {
             "url": url,
             "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "replayable": True,
             "body": body,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-    def _body(self, key: str) -> str | None:
-        payload = self._load(self._path(key))
-        if payload is None:
-            return None
-        body = payload.get("body")
-        if not isinstance(body, str) or not body:
-            return None
-        return body
+        self._replay_cache.pop(str(path), None)
 
     def _load(self, path: Path) -> dict[str, object] | None:
         if not path.is_file():

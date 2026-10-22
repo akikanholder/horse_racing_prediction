@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 import json
+import re
+from datetime import datetime
 
 import requests
 from fastapi.testclient import TestClient
@@ -96,6 +98,16 @@ def _shutuba(venue: str, going: str | None = None) -> str:
     """
 
 
+def _json_without_clocks(info: object) -> str:
+    """Drop ISO timestamps. ``19.804919`` must not look like the reading 9.8."""
+    text = info.model_dump_json()  # type: ignore[attr-defined]
+    return re.sub(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?",
+        "",
+        text,
+    )
+
+
 def _assert_null_measurement(info) -> None:
     payload = json.loads(info.model_dump_json())
     assert payload["racecourse"] is None
@@ -104,10 +116,11 @@ def _assert_null_measurement(info) -> None:
     assert payload["turf"]["moisture"] is None
     assert payload["dirt"]["moisture"] is None
     assert payload["warning"]
-    assert "函館" not in info.model_dump_json()
-    assert "9.9" not in info.model_dump_json()
-    assert "9.8" not in info.model_dump_json()
-    assert "8.1" not in info.model_dump_json()
+    blob = _json_without_clocks(info)
+    assert "函館" not in blob
+    assert "9.9" not in blob
+    assert "9.8" not in blob
+    assert "8.1" not in blob
 
 
 def test_jra_403_is_trackinfo_with_null_venue_and_measurements():
@@ -124,11 +137,13 @@ def test_jra_403_is_trackinfo_with_null_venue_and_measurements():
 
 
 def test_jra_non_html_body_does_not_copy_hakodate_or_invent_cushion():
-    client = _Gets(gets={BABA_TOKYO: _forbidden_body(), BABA_KYOTO: "not html 函館競馬場 クッション値 7.7"})
+    client = _Gets(
+        gets={BABA_TOKYO: _forbidden_body(), BABA_KYOTO: "not html 函館競馬場 クッション値 7.7"}
+    )
     info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
     _assert_null_measurement(info)
     assert info.warning == JRATrackScraper.BABA_UNPARSEABLE
-    assert "7.7" not in info.model_dump_json()
+    assert "7.7" not in _json_without_clocks(info)
 
 
 def test_jra_other_meeting_is_not_copied():
@@ -361,6 +376,14 @@ def test_project_race_id_still_uses_its_own_venue_code():
     assert card.race.track_bias is not None
     assert card.race.track_bias.venue == "中山"
     assert card.race.track_bias.going == "稍重"
+
+
+def test_null_measurement_check_ignores_a_clock_that_looks_like_a_reading():
+    info = empty_track_info("JRA", JRATrackScraper.BABA_403).model_copy(
+        update={"scraped_at": datetime.fromisoformat("2026-10-22T15:38:19.804919")}
+    )
+    _assert_null_measurement(info)
+    assert "9.8" in info.model_dump_json()
 
 
 def test_netkeiba_track_rejects_another_tabs_numbers():

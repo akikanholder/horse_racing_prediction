@@ -1,6 +1,7 @@
 """Cushion is the printed number. A JRA 403 falls back to netkeiba's public page."""
 
 import argparse
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from backend.services.track_info_service import TrackInfoService
 
 BABA_TOKYO = "https://www.jra.go.jp/keiba/baba/index.html"
 BABA_KYOTO = "https://www.jra.go.jp/keiba/baba/index2.html"
+
 
 def _http_error(status: int) -> requests.HTTPError:
     response = requests.Response()
@@ -41,6 +43,16 @@ class _Gets:
         if url in self.errors:
             raise self.errors[url]
         return self.gets.get(url, "")
+
+
+def _json_without_clocks(info: object) -> str:
+    """Drop ISO timestamps so ``T15:40:01`` is not the post time ``15:40``."""
+    text = info.model_dump_json()  # type: ignore[attr-defined]
+    return re.sub(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?",
+        "",
+        text,
+    )
 
 
 def _baba(venue: str, body: str = "") -> str:
@@ -329,7 +341,7 @@ def test_jra_403_falls_back_to_the_netkeiba_public_page():
     assert copied.post_time == "15:40+09:00"
     assert copied.post_time_source == "netkeiba_html"
     assert copied.post_time_fetched_at == copied.turf.cushion.fetched_at
-    assert "10.7" not in copied.model_dump_json()
+    assert "10.7" not in _json_without_clocks(copied)
     assert netkeiba.urls == [NK_TRACK]
 
 
@@ -408,9 +420,12 @@ def test_netkeiba_login_wall_stops_the_chain():
     assert info.warning == NetkeibaTrackScraper.TRACK_LOGIN
     assert info.racecourse is None
     assert info.post_time is None
-    dumped = info.model_dump_json()
+    dumped = _json_without_clocks(info)
     assert "9.9" not in dumped
     assert "15:40" not in dumped
+    stamped = info.model_copy(update={"scraped_at": datetime.fromisoformat("2026-10-22T15:40:01")})
+    assert "15:40" not in _json_without_clocks(stamped)
+    assert "15:40" in stamped.model_dump_json()
 
 
 def test_embedded_json_supplies_the_number_and_a_printed_grade():
