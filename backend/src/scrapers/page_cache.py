@@ -137,9 +137,9 @@ class CachingHTTPClient(HTTPClient):
     def _cached_body(self, key: str, url: str) -> str | None:
         """A stored body. A flash or short result table is not replayed.
 
-        A body this client stored is already marked replayable, so a later
-        read does not parse the HTML again. An older file is checked once
-        for that path and mtime.
+        A non-result page this client stored is marked replayable, so a later
+        read does not parse it. ``result.html`` is judged from the body, once
+        per path and mtime, even when that mark is set.
         """
         path = self._path(key)
         payload = self._load(path)
@@ -155,8 +155,16 @@ class CachingHTTPClient(HTTPClient):
     def _replayable(self, path: Path, url: str, payload: dict[str, object], body: str) -> bool:
         """False for a flash or short ``result.html``. Other stored pages are kept."""
         marked = payload.get("replayable")
-        if isinstance(marked, bool):
+        if "result.html" not in url and isinstance(marked, bool):
             return marked
+        return self._body_is_complete(path, url, body)
+
+    def _body_is_complete(self, path: Path, url: str, body: str) -> bool:
+        """True when this file is not a flash or short ``result.html``.
+
+        The judgement is remembered for the path and mtime. A new write
+        changes the mtime, so the next read checks the new body.
+        """
         try:
             mtime = path.stat().st_mtime_ns
         except OSError:

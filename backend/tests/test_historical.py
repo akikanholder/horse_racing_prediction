@@ -1,6 +1,7 @@
 """Historical flat races: final odds, payouts, and the full finish order."""
 
 import json
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -567,15 +568,17 @@ def test_cache_read_does_not_reparse_result_html(tmp_path: Path, monkeypatch: py
     transport = _Transport(full)
     client = CachingHTTPClient(tmp_path, transport=transport, min_request_interval=0)
     assert client.get(url, params=params) == full
-    assert parses == ["other", "other"]
+    stored = len(parses)
+    assert stored == 2
     client.get(url, params=params)
     client.get(url, params=params)
-    assert parses == ["other", "other"]
+    assert len(parses) == stored + 1
     assert transport.calls == 1
 
     fresh = CachingHTTPClient(tmp_path, transport=_Transport("unused"), min_request_interval=0)
     assert fresh.get(url, params=params) == full
-    assert parses == ["other", "other"]
+    assert fresh.get(url, params=params) == full
+    assert len(parses) == stored + 2
 
     key = client._cache_key("GET", url, params, None)
     path = client._path(key)
@@ -616,6 +619,27 @@ def test_cache_read_does_not_reparse_result_html(tmp_path: Path, monkeypatch: py
     assert reader.get(url, params=params) == full
     assert refused.calls == 2
     assert parses == ["other"]
+
+    path.write_text(
+        json.dumps(
+            {
+                "url": url,
+                "fetched_at": "2026-10-18T08:00:00",
+                "replayable": True,
+                "body": partial,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    parses.clear()
+    marked = _Transport(full)
+    checker = CachingHTTPClient(tmp_path, transport=marked, min_request_interval=0)
+    assert checker.get(url, params=params) == full
+    assert checker.get(url, params=params) == full
+    assert marked.calls == 1
+    assert parses.count("cached") == 1
 
 
 def test_partial_result_html_is_not_cached(tmp_path: Path):
