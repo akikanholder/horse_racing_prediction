@@ -28,6 +28,7 @@ JRA_PAYOUT_UNREACHABLE = "JRA official payout was not reachable"
 JRA_PAYOUT_FORBIDDEN = "JRA payout returned 403"
 JRA_PAYOUT_MISMATCH = "JRA payout mismatch"
 JRA_REFUND_MISMATCH = "JRA refund mismatch"
+JRA_POPULARITY_NOTE = "JRA popularity"
 
 ACCESS_H_URL = "https://www.jra.go.jp/JRADB/accessH.html"
 PAYOUT_INDEX_CNAME = "pw01hli00/03"
@@ -70,14 +71,31 @@ class OfficialRefund:
     bracket_numbers: tuple[int, ...] | None
 
 
+class PopularityNote(NamedTuple):
+    """One ticket whose 人気 is taken from JRA. The yen amount stays netkeiba's."""
+
+    bet_type: str
+    combination: str
+    payout: int
+    netkeiba: int | None
+    official: int
+
+
 class PayoutCheck(NamedTuple):
-    """Official comparison. ``http_status`` is set only when the payout fetch was refused."""
+    """Official comparison. ``http_status`` is set only when the payout fetch was refused.
+
+    ``phase`` is set when this payout page shows a 確定 / 確定前 label or a
+    payout table for the race. ``popularity`` lists tickets whose 人気 is
+    replaced by JRA. A popularity-only difference is not ``warning``.
+    """
 
     warning: str | None
     refunds: list[OfficialRefund] | None
     source: str
     http_status: int | None = None
     login_required: bool = False
+    phase: str | None = None
+    popularity: tuple[PopularityNote, ...] = ()
 
 
 def cross_check_payouts(
@@ -90,12 +108,15 @@ def cross_check_payouts(
 ) -> PayoutCheck:
     """Return a payout warning, any 返還 block, and the JRA source token.
 
-    ``payouts`` is the netkeiba list. This function does not invent replacements.
-    Several rows of one bet type are kept. A missing popularity on one side is
-    not a mismatch. ``None`` refunds means the page printed no 返還 block.
-    The source is ``headless`` only when the browser returned the documents.
-    A 403 is not fetched again through HTTP. ``http_status`` is that refusal,
-    not a yen amount that happens to contain 403.
+    ``payouts`` is the netkeiba list. This function does not invent prices.
+    Several rows of one bet type are kept. A missing popularity on one side,
+    and a popularity that differs while the combination and yen match, are not
+    mismatches. JRA's popularity is returned for the caller to record. ``None``
+    refunds means the page printed no 返還 block. The source is ``headless``
+    only when the browser returned the documents. A 403 is not fetched again
+    through HTTP. ``http_status`` is that refusal, not a yen amount that
+    happens to contain 403. ``phase`` is confirmed when this page has the
+    race's payout table, or the short 確定 / 確定前 label in that race block.
     """
     if key is None:
         return PayoutCheck(JRA_PAYOUT_UNREACHABLE, None, "jra_html")
@@ -117,12 +138,25 @@ def cross_check_payouts(
         logger.warning("JRA payout day page was not reachable: %s", exc)
         return _failure_check(exc, extra(), source_of())
     refunds = _race_refunds(day_html, key.race_number)
+    phase = _official_phase(day_html, key.race_number)
     if not payouts:
-        return PayoutCheck(extra(), refunds, source_of())
+        return PayoutCheck(extra(), refunds, source_of(), phase=phase)
     official = _race_tickets(day_html, key.race_number)
     if official is None:
-        return PayoutCheck(_join_note(JRA_PAYOUT_UNREACHABLE, extra()), refunds, source_of())
-    return PayoutCheck(_join_note(_mismatch(payouts, official), extra()), refunds, source_of())
+        return PayoutCheck(
+            _join_note(JRA_PAYOUT_UNREACHABLE, extra()),
+            refunds,
+            source_of(),
+            phase=phase,
+        )
+    warning, notes = _compare(payouts, official)
+    return PayoutCheck(
+        _join_note(warning, extra()),
+        refunds,
+        source_of(),
+        phase=phase,
+        popularity=notes,
+    )
 
 
 def _join_note(warning: str | None, extra: str | None) -> str | None:
@@ -372,94 +406,114 @@ def _core(ticket: _Ticket) -> tuple[str, str, int]:
     return (ticket.bet_type, ticket.combination, ticket.payout)
 
 
-def _pop_groups(tickets: list[_Ticket]) -> dict[tuple[str, str, int], list[int | None]]:
-    groups: dict[tuple[str, str, int], list[int | None]] = {}
-    for ticket in tickets:
-        groups.setdefault(_core(ticket), []).append(ticket.popularity)
-    return groups
+def _exact_phase(text: str) -> str | None:
+    compact = "".join(text.split())
+    if compact in {"確定前", "結果確定前", "未確定", "暫定", "provisional"}:
+        return "provisional"
+    if compact in {"結果確定", "確定", "confirmed"}:
+        return "confirmed"
+    return None
 
 
-def _tie_prices(tickets: list[_Ticket]) -> set[tuple[str, int]]:
-    """Bet types whose rows share one yen amount. Order of 人気 on a tie is not a mismatch."""
-    counts: dict[tuple[str, int], int] = {}
-    for ticket in tickets:
-        key = (ticket.bet_type, ticket.payout)
-        counts[key] = counts.get(key, 0) + 1
-    return {key for key, count in counts.items() if count > 1}
+def _official_phase(html: str, race_number: int) -> str | None:
+    """Phase printed on this race of the payout page, else the payout table.
 
-
-def _popularities_compatible(left: list[_Ticket], right: list[_Ticket]) -> bool:
-    """Same money rows. A blank popularity does not disagree with a printed one.
-
-    Two 複勝 at the same yen with swapped 人気 are the same multiset. A single
-    ticket whose 人気 differs still disagrees.
+    ``レース結果`` and a top-three table are not a phase. A short 確定 / 確定前
+    label wins. Otherwise a payout table with yen amounts is confirmed.
     """
-    left_groups = _pop_groups(left)
-    right_groups = _pop_groups(right)
-    if set(left_groups) != set(right_groups):
-        return False
-    tied = _tie_prices(left)
-    if tied != _tie_prices(right):
-        return False
-    for key, pops in left_groups.items():
-        bet_type, _combination, payout = key
-        if (bet_type, payout) in tied:
+    block = _race_block(html, race_number)
+    if block is None:
+        return None
+    soup = BeautifulSoup(block, "lxml")
+    for node in soup.find_all(True):
+        if not isinstance(node, Tag):
             continue
-        if not _pop_counts_fit(pops, right_groups[key]):
-            return False
-    for bet_type, payout in tied:
-        left_pops = [
-            ticket.popularity
-            for ticket in left
-            if ticket.bet_type == bet_type and ticket.payout == payout
-        ]
-        right_pops = [
-            ticket.popularity
-            for ticket in right
-            if ticket.bet_type == bet_type and ticket.payout == payout
-        ]
-        if not _pop_counts_fit(left_pops, right_pops):
-            return False
-    return True
+        own = "".join(str(piece) for piece in node.find_all(string=True, recursive=False))
+        phase = _exact_phase(own)
+        if phase is not None:
+            return phase
+    if _race_tickets(html, race_number):
+        return "confirmed"
+    return None
 
 
-def _pop_counts_fit(left: list[int | None], right: list[int | None]) -> bool:
-    left_known = [value for value in left if value is not None]
-    right_known = [value for value in right if value is not None]
-    extra_left = len(left_known)
-    extra_right = len(right_known)
-    for value in set(left_known) & set(right_known):
-        shared = min(left_known.count(value), right_known.count(value))
-        extra_left -= shared
-        extra_right -= shared
-    return extra_left <= right.count(None) and extra_right <= left.count(None)
+def _take_same_core(ticket: _Ticket, official: list[_Ticket], used: list[bool]) -> int | None:
+    """Index of an unused official row with the same bet, combination, and yen."""
+    fallback: int | None = None
+    for index, other in enumerate(official):
+        if used[index] or _core(ticket) != _core(other):
+            continue
+        if ticket.popularity == other.popularity:
+            used[index] = True
+            return index
+        if fallback is None:
+            fallback = index
+    if fallback is None:
+        return None
+    used[fallback] = True
+    return fallback
 
 
-def _mismatch(
+def _compare(
     netkeiba: list[tuple[str, str, int, int | None]],
     official: list[_Ticket],
-) -> str | None:
+) -> tuple[str | None, tuple[PopularityNote, ...]]:
+    """Mismatch text for combination or yen only, plus JRA popularities to record.
+
+    Tickets that match on bet, combination, and yen are not listed, even when
+    人気 differs. The warning names only the unpaired tickets.
+    """
     left = [_Ticket(bet, combo, payout, pop) for bet, combo, payout, pop in netkeiba]
     right = list(official)
-    left_cores = sorted(_core(ticket) for ticket in left)
-    right_cores = sorted(_core(ticket) for ticket in right)
-    if left_cores == right_cores and _popularities_compatible(left, right):
-        return None
-    left_sorted = sorted(left, key=_ticket_order)
-    right_sorted = sorted(right, key=_ticket_order)
-    only_net = [ticket for ticket in left_sorted if _core(ticket) not in right_cores]
-    only_jra = [ticket for ticket in right_sorted if _core(ticket) not in left_cores]
-    if left_cores == right_cores:
-        only_net = left_sorted
-        only_jra = right_sorted
+    used = [False] * len(right)
+    only_net: list[_Ticket] = []
+    notes: list[PopularityNote] = []
+    for ticket in left:
+        index = _take_same_core(ticket, right, used)
+        if index is None:
+            only_net.append(ticket)
+            continue
+        official_pop = right[index].popularity
+        if official_pop is None or official_pop == ticket.popularity:
+            continue
+        notes.append(
+            PopularityNote(
+                ticket.bet_type,
+                ticket.combination,
+                ticket.payout,
+                ticket.popularity,
+                official_pop,
+            )
+        )
+    only_jra = [ticket for index, ticket in enumerate(right) if not used[index]]
+    only_net.sort(key=_ticket_order)
+    only_jra.sort(key=_ticket_order)
     parts: list[str] = []
     if only_net:
         parts.append("netkeibaのみ: " + "、".join(_fmt(ticket) for ticket in only_net))
     if only_jra:
         parts.append("JRAのみ: " + "、".join(_fmt(ticket) for ticket in only_jra))
-    if not parts:
-        return JRA_PAYOUT_MISMATCH
-    return f"{JRA_PAYOUT_MISMATCH}: " + "; ".join(parts)
+    warning = f"{JRA_PAYOUT_MISMATCH}: " + "; ".join(parts) if parts else None
+    return warning, tuple(notes)
+
+
+def format_popularity_note(notes: tuple[PopularityNote, ...] | list[PopularityNote]) -> str | None:
+    """Light note for printed popularities that differ. A blank side is silent."""
+    printed = [
+        note
+        for note in notes
+        if note.netkeiba is not None and note.netkeiba != note.official
+    ]
+    if not printed:
+        return None
+    body = "、".join(
+        (
+            f"{note.bet_type} {note.combination} {note.payout}円 "
+            f"netkeiba {note.netkeiba}人気, JRA {note.official}人気"
+        )
+        for note in printed
+    )
+    return f"{JRA_POPULARITY_NOTE}: {body}"
 
 
 def _fmt(ticket: _Ticket) -> str:

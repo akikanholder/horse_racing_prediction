@@ -254,7 +254,7 @@ python -m backend.cli result 202605030811 --json
 | `login_required` | ログイン画面で止まったとき true | 既定 false |
 | `source` | 着順を得た方法。`netkeiba_html` / `netkeiba_js` / `headless`。混ざるときは `netkeiba_html+netkeiba_js` | 失敗時 null |
 | `complete` | 走った頭数（取消・除外を除く）が `N頭` から取消・除外を引いた数と一致し、各馬に `status` があり、速報の上位表だけではないとき true | 失敗時 false |
-| `result_phase` | ページに印字された `confirmed`（確定）か `provisional`（確定前・暫定・未確定） | 印字が無ければ null |
+| `result_phase` | `confirmed`（確定）か `provisional`（確定前・暫定・未確定）。印字、払戻表と全着順、または JRA の払戻表 | 決められなければ null。払戻が無く局面も null なら警告を出す。最終結果は `result_phase` が `confirmed` かつ `complete` が true のときだけ |
 | `results` | `SettledFinisher`。結果表の並び。未入着も含む | 失敗時 `[]` |
 | `payouts` | `RacePayout`。金額がある馬券種だけ | 失敗時 `[]` |
 | `payout_note` | 金額を作らなかった馬券種の注記 | 無ければ null |
@@ -270,7 +270,13 @@ python -m backend.cli result 202605030811 --json
 
 `--wait-complete`（API は `wait_complete=true`）は `complete` になるまで同じ結果ページを取り直す。`--retry-interval` の既定は 60 秒で、それより短い指定は 60 秒に上げる。`--max-wait` の既定は 600 秒。どちらも 0 以上の有限値だけ受け付ける。`nan` と `inf` と負数は CLI が拒否し、API は 422。次の間隔が上限を超えるときは待たず、その時点の結果を返す。待ちを止めるのは取得側の `http_status`（401 / 403）か `login_required` で、警告文に `403` という数字があるだけでは止めない。払戻が `403円` や `1403円` でも待ちは続く。公式払戻の取得そのものが HTTP 403 のときは `http_status: 403` と `JRA payout returned 403` で、待たずに止める。既定の `result` は1回だけ取る。
 
-`result_phase` は結果ヘッダの印字だけ（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `確定前` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が無ければ null と `result phase was not on the page`。複数の取得元が食い違うときは null と `result phase sources disagree`。
+`result_phase` は、まず結果ヘッダの印字（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `確定前` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が `確定前` のときは、払戻表があっても `provisional` のまま。出典は着順と同じ `source` と `fetched_at`。
+
+印字が無いとき、払戻表に円の金額があり、着順が全頭（速報の `FirstDisplay` だけの表ではなく、行数がページの `N頭` と一致する）なら `confirmed`。出典は同じく着順の `source` と `fetched_at`。
+
+結果ページで決まらないとき、JRA の払戻ページがそのレースの払戻表（金額のある行）を出していれば `confirmed`。そのレース塊に `確定` / `確定前` の短い印字があるときはその印字。このときだけ `source` に `jra_html` または `headless` を足す。`fetched_at` は結果取得の時刻。`レース結果` という見出しや上位3頭の表だけでは決めない。
+
+どちらでも決められないときは `result_phase` を null のままにし、`result phase was not on the page` を出す。着順が揃って `complete` が true でも、払戻が無く局面が null ならこの警告は残す。警告を出さないのは、印字、払戻表と全着順、または JRA の払戻表で局面が決まったときだけ。利用者は `result_phase` が `confirmed` で、かつ `complete` が true のときだけ、そのレースを最終結果として扱う。`complete` が true で `result_phase` が null の結果は確定ではない。複数の結果文書が食い違うときは null と `result phase sources disagree`。
 
 `SettledFinisher`:
 
@@ -300,9 +306,9 @@ python -m backend.cli result 202605030811 --json
 
 馬番が取消（`scratched`）か除外（`excluded`）と一致するときは、返還があること自体では `warning` を足さない。入着馬や中止・失格の馬番が返還に出たら `refund horses are not scratched or excluded: 2`。netkeiba と JRA の馬番が違うときは netkeiba を残し、`JRA refund mismatch: netkeibaのみ: 2番; JRAのみ: 5番`。JRA にしか印字が無いときは `source` は `jra_html`。ページに無い馬番は作らない。
 
-`RacePayout`: `bet_type` はページの表記（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）。`combination` はページの並び（馬単・3連単は着順どおり）。`payout` は円。`popularity` が無いときは null。ページに無い馬券種は要素にしない。各要素に `source`（`netkeiba_html` / `netkeiba_js` / `headless`）と `fetched_at`。
+`RacePayout`: `bet_type` はページの表記（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）。`combination` はページの並び（馬単・3連単は着順どおり）。`payout` は円。`popularity` が両方のページに無いときは null。ページに無い馬券種は要素にしない。各要素に `source`（`netkeiba_html` / `netkeiba_js` / `headless`。人気だけ JRA を記録したときは `netkeiba_html+jra_html`、ブラウザなら `+headless`）と `fetched_at`（結果取得の時刻。人気の採用もこの時刻）。
 
-払戻があるとき、結果ページに印字された競馬場・回・日・レース番号・開催日から JRA の公開払戻（`accessH`、メニューに印刷された cname）を突き合わせる。金額は置き換えない。同じ馬券種の行は全部残す（1着同着の単勝が2行、複勝やワイドが増える）。行の順番が違うこと、片方だけ人気が空であることは不一致にしない。金額か組み合わせが違うときは `JRA payout mismatch: netkeibaのみ: …; JRAのみ: …`。ページが取れない、開催が一つに決まらないときは `JRA official payout was not reachable`。401/403 は `JRA payout returned 403` で止め、次のページは開かない。金額は作らない。
+払戻があるとき、結果ページに印字された競馬場・回・日・レース番号・開催日から JRA の公開払戻（`accessH`、メニューに印刷された cname）を突き合わせる。金額は置き換えない。同じ馬券種の行は全部残す（1着同着の単勝が2行、複勝やワイドが増える）。行の順番が違うこと、片方だけ人気が空であることは不一致にしない。人気だけが違うときも不一致にしない。記録する人気は JRA の数字で、金額と組み合わせは結果ページのまま。`payout_note` に `JRA popularity: 複勝 2 140円 netkeiba 3人気, JRA 4人気` のように違う行だけ書く。片方の人気が空のときは注記しない。金額か組み合わせが違うときは `JRA payout mismatch: netkeibaのみ: …; JRAのみ: …`。警告に載せるのは違う馬券だけ。一致した馬券種は書かない。ページが取れない、開催が一つに決まらないときは `JRA official payout was not reachable`。401/403 は `JRA payout returned 403` で止め、次のページは開かない。金額は作らない。
 
 `warning`（取得そのものが失敗したときは、この文だけ。確定印や払戻の注記は足さない）:
 
@@ -320,7 +326,7 @@ python -m backend.cli result 202605030811 --json
 - `race result incomplete: 5 of 8 runners`（取消・除外を引いたあと。速報で `N頭` が残っているとき）
 - `race result incomplete: 5 runners on the early result, full order not on the page`（速報が頭数まで5にしているとき）
 - `race result incomplete: runner missing status: 2、7`
-- `result phase was not on the page`
+- `result phase was not on the page`（印字も払戻表と全着順も JRA の払戻表も局面を示さないとき。着順が揃っていても払戻が無ければ出す。出さないのは局面が決まったときだけ）
 - `result phase sources disagree`
 - `headless browser is not installed`（表がまだ短く、Playwright が無いときだけ。`headless` を切ったテストでは出さない）
 - `JRA official payout was not reachable`
@@ -589,7 +595,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 `--recent-meeting` は競馬場が一つ必要。前開催日は、当日の前日以前でその競馬場のレースが並んだ最も近い日。空の日は飛ばす。一覧が 403 またはログイン画面のときは、それより前の日も、レースページも開かない。User-Agent の差し替え、captcha、ログインはしない。120日見ても無いときは `previous_meeting_date` は null。
 
-集計に入れるのは `result_phase=confirmed` で、出走馬ごとに単勝の確定オッズがあるレース。無いレースは `excluded` に理由を書く。例: `final win odds were not on the page`、`race result returned 403`、`result phase is provisional`、`result phase was not on the page`。フィルタと印字が違うレースは除外一覧に入れない。印字が無くてフィルタを適用できないレースは入れる（`distance was not on the page` など）。
+集計に入れるのは `result_phase=confirmed` で、出走馬ごとに単勝の確定オッズがあるレース。無いレースは `excluded` に理由を書く。例: `final win odds were not on the page`、`race result returned 403`、`result phase is provisional`、`result phase was not on the page`（局面が null のときの除外理由。結果の `warning` にも、払戻が無く局面が null のときはこの文を出す）。最終結果として扱うのは `result_phase` が `confirmed` かつ `complete` が true のときだけ。フィルタと印字が違うレースは除外一覧に入れない。印字が無くてフィルタを適用できないレースは入れる（`distance was not on the page` など）。
 
 各表の `sample_size` は出走馬数。取消・除外は入れない。`sample_size` が 0 の rate と ROI は null。0.0 にはしない。1頭の区分も落とさない。
 
