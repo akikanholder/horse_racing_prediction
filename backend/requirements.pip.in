@@ -1,0 +1,2 @@
+# Pinned into requirements.lock so setup installs this pip instead of tracking latest.
+pip

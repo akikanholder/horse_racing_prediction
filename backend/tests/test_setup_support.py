@@ -18,12 +18,19 @@ _SPEC.loader.exec_module(setup_support)
 
 
 class FakeRun:
-    def __init__(self, versions: dict[str, str] | None = None, fail_substring: str | None = None):
+    def __init__(
+        self,
+        versions: dict[str, str] | None = None,
+        fail_substring: str | None = None,
+        fail_once: bool = False,
+    ):
         self.calls: list[list[str]] = []
         self.cwds: list[Path | None] = []
         self.versions = versions or {}
         self.fail_substring = fail_substring
+        self.fail_once = fail_once
         self.stderr = "failed"
+        self._failures = 0
 
     def __call__(self, args, *, cwd, capture):
         command = list(args)
@@ -31,7 +38,9 @@ class FakeRun:
         self.cwds.append(cwd)
         text = " ".join(command)
         if self.fail_substring and self.fail_substring in text:
-            return setup_support.CommandResult(1, "", self.stderr)
+            if not (self.fail_once and self._failures):
+                self._failures += 1
+                return setup_support.CommandResult(1, "", self.stderr)
         if len(command) >= 3 and command[1] == "-c" and "version_info" in command[2]:
             version = self.versions.get(command[0], "3.12.3")
             return setup_support.CommandResult(0, version + "\n", "")
@@ -45,7 +54,10 @@ def _repo(tmp_path: Path, *, lock: bool = True, requires: str = ">=3.11") -> Pat
     backend.mkdir()
     (backend / "pyproject.toml").write_text(f'requires-python = "{requires}"\n', encoding="utf-8")
     if lock:
-        (backend / "requirements.lock").write_text("requests==2.32.3\n", encoding="utf-8")
+        (backend / "requirements.lock").write_text(
+            "pip==24.3.1\nrequests==2.32.3\n",
+            encoding="utf-8",
+        )
     return tmp_path
 
 
@@ -112,10 +124,35 @@ def test_python_satisfies(version: tuple[int, int, int], spec: str, matches: boo
     assert setup_support.python_satisfies(parsed, spec) is matches
 
 
-def test_python_satisfies_rejects_unknown_operator() -> None:
+@pytest.mark.parametrize(
+    ("version", "spec", "matches"),
+    [
+        ((3, 11, 0), "~=3.11", True),
+        ((3, 19, 0), "~=3.11", True),
+        ((3, 10, 12), "~=3.11", False),
+        ((4, 0, 0), "~=3.11", False),
+        ((3, 11, 2), "~=3.11.2", True),
+        ((3, 11, 9), "~=3.11.2", True),
+        ((3, 12, 0), "~=3.11.2", False),
+        ((3, 11, 9), "==3.11.*", True),
+        ((3, 12, 0), "==3.11.*", False),
+        ((3, 11, 0), "3.11.*", True),
+        ((3, 11, 1), "!=3.11.*", False),
+        ((3, 12, 0), "!=3.11.*", True),
+    ],
+)
+def test_compatible_and_wildcard_specifiers(
+    version: tuple[int, int, int], spec: str, matches: bool
+) -> None:
+    parsed = setup_support.Version(*version)
+    assert setup_support.python_satisfies(parsed, spec) is matches
+
+
+@pytest.mark.parametrize("spec", ["===3.11", ">=3.11.*", "~=3.11.*"])
+def test_python_satisfies_rejects_unknown_operator(spec: str) -> None:
     version = setup_support.Version(3, 11, 0)
     with pytest.raises(ValueError, match="unsupported"):
-        setup_support.python_satisfies(version, "~=3.11")
+        setup_support.python_satisfies(version, spec)
 
 
 def test_read_requires_python_from_repo() -> None:
@@ -145,15 +182,18 @@ def test_venv_python_paths() -> None:
 
 def test_install_steps_use_the_lock_and_headless_extra(tmp_path: Path) -> None:
     lock = tmp_path / "requirements.lock"
-    lock.write_text("requests==1\n", encoding="utf-8")
+    lock.write_text("pip==24.3.1\nrequests==1\n", encoding="utf-8")
     steps = setup_support.install_steps("/venv/bin/python", lock)
     labels = [label for label, _args in steps]
     assert labels == [
-        "upgrading pip",
+        "installing pip",
         "installing pinned dependencies (including headless)",
         "installing Playwright Chromium",
     ]
+    assert "pip==24.3.1" in steps[0][1]
+    assert "--upgrade" not in steps[0][1]
     install = steps[1][1]
+    assert "--upgrade" in install
     assert install[install.index("--constraint") + 1] == str(lock.resolve())
     assert ".[headless,dev]" in install
     assert steps[2][1][-2:] == ["install", "chromium"]
@@ -220,9 +260,25 @@ def test_lock_lines_are_exact_pins() -> None:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        assert ">=" not in stripped
+        entries = setup_support.iter_lock_pins(stripped)
+        assert len(entries) == 1
+        _name, version, _marker = entries[0]
+        assert version
         assert "==" in stripped
-        assert setup_support.lock_pins(stripped)
+
+
+def test_lock_supports_python_311_and_windows() -> None:
+    text = setup_support.LOCK_FILE.read_text(encoding="utf-8")
+    pins = setup_support.iter_lock_pins(text)
+    pyee = [entry for entry in pins if entry[0] == "pyee"]
+    assert any(version.startswith("13.") and "<" in marker for _name, version, marker in pyee)
+    assert all(
+        "python_full_version >= '3.12'" in marker
+        for _name, version, marker in pyee
+        if version.startswith("14.")
+    )
+    assert any(name == "colorama" and "win32" in marker for name, _version, marker in pins)
+    assert any(name == "pip" for name, _version, _marker in pins)
 
 
 def test_format_command_hides_inline_scripts() -> None:
@@ -389,3 +445,137 @@ def test_parse_options_force_and_python() -> None:
     assert options.force is True
     assert options.python == "/usr/bin/python3.11"
     assert setup_support.parse_options([]).force is False
+
+
+def test_different_requested_python_recreates_the_venv(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    interpreter = _touch_interpreter(repo / "backend" / ".venv")
+    requested = "/opt/python3.11"
+    runner = FakeRun(versions={requested: "3.11.9", str(interpreter): "3.12.3"})
+    code, logs, removed, _runner = _run(repo, ["--python", requested], runner)
+    assert code == 0
+    assert removed == [repo / "backend" / ".venv"]
+    assert any("3.11.9" in line and "recreating" in line for line in logs)
+
+
+def test_broken_pip_in_a_reused_venv_is_recreated_once(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    interpreter = _touch_interpreter(repo / "backend" / ".venv")
+    runner = FakeRun(
+        versions={sys.executable: "3.12.3", str(interpreter): "3.12.3"},
+        fail_substring="pip==",
+        fail_once=True,
+    )
+    runner.stderr = "No module named pip"
+    code, logs, removed, runner = _run(repo, [], runner)
+    assert code == 0
+    assert removed == [repo / "backend" / ".venv"]
+    assert any("retrying once" in line for line in logs)
+    pip_calls = [call for call in runner.calls if any(arg.startswith("pip==") for arg in call)]
+    assert len(pip_calls) == 2
+    assert any("playwright install chromium" in " ".join(call) for call in runner.calls)
+
+
+def test_broken_pip_in_a_new_venv_tells_the_user_to_force(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    runner = FakeRun(fail_substring="pip==")
+    runner.stderr = "No module named pip"
+    code, logs, removed, runner = _run(repo, [], runner)
+    assert code == 1
+    assert removed == []
+    assert any("setup.sh --force" in line for line in logs)
+    assert not any("playwright" in " ".join(call) for call in runner.calls)
+
+
+def test_resolution_failure_does_not_recreate_the_venv(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    interpreter = _touch_interpreter(repo / "backend" / ".venv")
+    runner = FakeRun(
+        versions={sys.executable: "3.12.3", str(interpreter): "3.12.3"},
+        fail_substring="--constraint",
+    )
+    runner.stderr = "ERROR: ResolutionImpossible"
+    code, logs, removed, _runner = _run(repo, [], runner)
+    assert code == 1
+    assert removed == []
+    assert any("ResolutionImpossible" in line for line in logs)
+    assert not any("--force" in line for line in logs)
+
+
+def test_compatible_release_specifier_accepts_python_311(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, requires="~=3.11")
+    runner = FakeRun(versions={sys.executable: "3.11.4"})
+    code, logs, _removed, _runner = _run(repo, [], runner)
+    assert code == 0
+    assert any("satisfies ~=3.11" in line for line in logs)
+
+
+def test_wildcard_requires_python_accepts_a_matching_patch(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, requires="==3.11.*")
+    runner = FakeRun(versions={sys.executable: "3.11.9"})
+    code, _logs, _removed, _runner = _run(repo, [], runner)
+    assert code == 0
+
+
+def test_unparseable_requires_python_is_a_clear_failure(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, requires="===3.11")
+    runner = FakeRun()
+    code, logs, removed, _runner = _run(repo, [], runner)
+    assert code == 1
+    assert removed == []
+    assert any("cannot interpret requires-python" in line for line in logs)
+
+
+def test_symlink_venv_is_not_deleted(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    real = tmp_path / "real-venv"
+    _touch_interpreter(real)
+    link = repo / "backend" / ".venv"
+    link.symlink_to(real, target_is_directory=True)
+    runner = FakeRun()
+    code, logs, _removed, _runner = _run(repo, ["--force"], runner)
+    assert code == 1
+    assert link.is_symlink()
+    assert (real / "bin" / "python").is_file()
+    assert any("symlink" in line and line.startswith("[setup] FAIL") for line in logs)
+    assert not any("Errno None" in line for line in logs)
+
+
+def test_describe_remove_failure_hides_errno_none() -> None:
+    message = setup_support.describe_remove_failure(
+        OSError(None, "Cannot call rmtree on a symbolic link")
+    )
+    assert "symlink" in message
+    assert "Errno None" not in message
+
+
+def test_remove_path_refuses_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / ".venv"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(OSError, match="symlink"):
+        setup_support.remove_path(link)
+    assert link.is_symlink()
+    assert target.is_dir()
+
+
+def test_lock_without_a_pip_pin_fails_clearly(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "backend" / "requirements.lock").write_text("requests==2.32.3\n", encoding="utf-8")
+    runner = FakeRun()
+    code, logs, _removed, runner = _run(repo, [], runner)
+    assert code == 1
+    assert any("does not pin pip" in line for line in logs)
+    assert not any("playwright" in " ".join(call) for call in runner.calls)
+
+
+def test_setup_ps1_tries_py_launcher_before_python() -> None:
+    text = (Path(__file__).resolve().parents[2] / "scripts" / "setup.ps1").read_text(
+        encoding="utf-8"
+    )
+    py_index = text.index('Exe = "py"')
+    python_index = text.index('Exe = "python"')
+    assert py_index < python_index
+    assert "-3" in text
+    assert text.index('Exe = "python3"') < python_index

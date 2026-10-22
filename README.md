@@ -95,10 +95,16 @@ Windows の有効化は `backend\.venv\Scripts\Activate.ps1`。
 - `pytest -m "not integration"` の一部（`tests/test_csv_export.py`）
 - headless Chromium が `about:blank` を開けること
 
-`backend/requirements.txt` は最低版のメモ。セットアップはロックを使う。ロックを作り直すときは `backend/` で次を実行する。
+`backend/requirements.txt` は最低版のメモ。セットアップは `backend/requirements.lock` を使う。このロックは Python 3.11 を対象に、Windows を含む各 OS のマーカー付きで解いてある。Python 3.11 では `pyee` 13 を入れ、3.12 以降の `pyee` 14 はマーカーの向こうに置く。`colorama` のように Windows だけの依存もマーカー付きで入っている。pip の版もロックにある。
+
+既存の `backend/.venv` の Python が、今回使う `PYTHON` または `--python` と違うときは、その場で作り直す。pip や site-packages が壊れているときは一度作り直してやり直す。それでも壊れていれば `--force` を案内する。`.venv` がシンボリックリンクのときは消さず、その旨を表示する。
+
+ロックを作り直すときは `backend/` で次を実行する。
 
 ```bash
-pip-compile --extra=headless --extra=dev --output-file=requirements.lock pyproject.toml
+uv pip compile pyproject.toml requirements.pip.in \
+  --universal --python-version 3.11 --python python3.11 \
+  --extra headless --extra dev --output-file requirements.lock
 ```
 
 ### うまくいかないとき
@@ -637,7 +643,7 @@ backend/
 
 ## テスト
 
-`make setup` のあと、`backend/.venv` の Python で実行する。
+`make setup` のあと、`backend/.venv` の Python で実行する。GitHub Actions は Python 3.11 と 3.14 で setup と、この非統合テストを実行する。
 
 ```bash
 cd backend

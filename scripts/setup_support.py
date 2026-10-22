@@ -19,6 +19,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_DIR = REPO_ROOT / "backend"
@@ -64,7 +65,10 @@ _VERSION_RE = re.compile(r"(?:Python\s+)?(\d+)(?:\.(\d+))?(?:\.(\d+))?")
 _REQUIRES_RE = re.compile(r"""(?m)^requires-python\s*=\s*["']([^"']+)["']\s*$""")
 _REQ_NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)")
 _PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([^\s;\\]+)\s*(?:;.*)?$")
-_OPS = (">=", "<=", "!=", "==", ">", "<")
+_CLAUSE_RE = re.compile(
+    r"^(?P<op>>=|<=|!=|==|~=|>|<)?\s*"
+    r"(?P<major>\d+)(?:\.(?P<minor>\d+))?(?:\.(?P<micro>\d+))?(?P<wild>\.\*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -126,20 +130,81 @@ def read_requires_python(pyproject_text: str) -> str:
     return match.group(1).strip()
 
 
+@dataclass(frozen=True)
+class Clause:
+    op: str
+    major: int
+    minor: int | None
+    micro: int | None
+    wildcard: bool
+
+    @property
+    def precision(self) -> int:
+        if self.micro is not None:
+            return 3
+        if self.minor is not None:
+            return 2
+        return 1
+
+    def floor(self) -> tuple[int, int, int]:
+        return (self.major, self.minor or 0, self.micro or 0)
+
+
 def python_satisfies(version: Version, spec: str) -> bool:
-    """True when ``version`` matches a requires-python specifier of comparison clauses."""
+    """True when ``version`` matches a requires-python specifier."""
     clauses = [part.strip() for part in spec.split(",") if part.strip()]
     if not clauses:
         raise ValueError("empty requires-python")
     return all(_clause_matches(version, clause) for clause in clauses)
 
 
+def _parse_clause(clause: str) -> Clause:
+    match = _CLAUSE_RE.match(clause.strip())
+    if match is None:
+        raise ValueError(f"unsupported requires-python clause: {clause}")
+    minor = match.group("minor")
+    micro = match.group("micro")
+    return Clause(
+        op=match.group("op") or "==",
+        major=int(match.group("major")),
+        minor=int(minor) if minor is not None else None,
+        micro=int(micro) if micro is not None else None,
+        wildcard=match.group("wild") is not None,
+    )
+
+
 def _clause_matches(version: Version, clause: str) -> bool:
-    for op in _OPS:
-        if clause.startswith(op):
-            other = parse_python_version(clause[len(op) :].strip())
-            return _compare(version.as_tuple(), op, other.as_tuple())
-    raise ValueError(f"unsupported requires-python clause: {clause}")
+    parsed = _parse_clause(clause)
+    current = version.as_tuple()
+    if parsed.op == "~=":
+        if parsed.wildcard:
+            raise ValueError(f"unsupported requires-python clause: {clause}")
+        return _compatible_release(current, parsed)
+    if parsed.wildcard:
+        if parsed.op not in {"==", "!="}:
+            raise ValueError(f"unsupported requires-python clause: {clause}")
+        matched = _wildcard_match(current, parsed)
+        return matched if parsed.op == "==" else not matched
+    return _compare(current, parsed.op, parsed.floor())
+
+
+def _wildcard_match(current: tuple[int, int, int], parsed: Clause) -> bool:
+    if parsed.minor is None:
+        return current[0] == parsed.major
+    if parsed.micro is None:
+        return current[0] == parsed.major and current[1] == parsed.minor
+    return current == (parsed.major, parsed.minor, parsed.micro)
+
+
+def _compatible_release(current: tuple[int, int, int], parsed: Clause) -> bool:
+    """PEP 440 ``~=`` : ``~=3.11`` is ``>=3.11, ==3.*`` and ``~=3.11.2`` is ``>=3.11.2, ==3.11.*``."""
+    if current < parsed.floor():
+        return False
+    if parsed.precision == 1:
+        return current[0] == parsed.major
+    if parsed.precision == 2:
+        return current[0] == parsed.major
+    return current[0] == parsed.major and current[1] == parsed.minor
 
 
 def _compare(left: tuple[int, int, int], op: str, right: tuple[int, int, int]) -> bool:
@@ -171,9 +236,9 @@ def requirement_name(spec: str) -> str:
     return normalize_name(match.group(1))
 
 
-def lock_pins(lock_text: str) -> dict[str, str]:
-    """Map normalized project names to exact versions in a pip-compile lock."""
-    pins: dict[str, str] = {}
+def iter_lock_pins(lock_text: str) -> list[tuple[str, str, str]]:
+    """Exact pins as ``(name, version, marker)``. ``marker`` is empty when absent."""
+    entries: list[tuple[str, str, str]] = []
     for line in lock_text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -181,8 +246,28 @@ def lock_pins(lock_text: str) -> dict[str, str]:
         match = _PIN_RE.match(stripped)
         if match is None:
             continue
-        pins[normalize_name(match.group(1))] = match.group(2)
-    return pins
+        marker = stripped.split(";", 1)[1].strip() if ";" in stripped else ""
+        entries.append((normalize_name(match.group(1)), match.group(2), marker))
+    return entries
+
+
+def lock_pins(lock_text: str) -> dict[str, str]:
+    """Map normalized project names to exact versions.
+
+    When a name is pinned more than once, the last line wins. Use
+    ``iter_lock_pins`` to see every marker-specific pin.
+    """
+    return {name: version for name, version, _marker in iter_lock_pins(lock_text)}
+
+
+def pip_requirement(lock_text: str) -> str:
+    """The ``pip==X`` pin setup installs instead of upgrading to the newest pip."""
+    version = lock_pins(lock_text).get("pip")
+    if not version:
+        raise ValueError(
+            "backend/requirements.lock does not pin pip. Regenerate it so pip==... is included."
+        )
+    return f"pip=={version}"
 
 
 def venv_python(venv_dir: Path, platform: str | None = None) -> Path:
@@ -217,7 +302,7 @@ def install_steps(python: str, lock: Path) -> list[tuple[str, list[str]]]:
     """Pip and Playwright commands. The editable install runs with cwd=backend."""
     pip = [python, "-m", "pip", "install", "--disable-pip-version-check"]
     return [
-        ("upgrading pip", [*pip, "--upgrade", "pip"]),
+        ("installing pip", [*pip, pip_requirement(lock.read_text(encoding="utf-8"))]),
         (
             "installing pinned dependencies (including headless)",
             [
@@ -323,20 +408,29 @@ def default_runner(
 ) -> CommandResult:
     command = list(args)
     try:
-        if capture:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-            return CommandResult(completed.returncode, completed.stdout, completed.stderr)
-        print(note("running " + format_command(command)), flush=True)
-        completed = subprocess.run(command, cwd=cwd, check=False)
-        return CommandResult(completed.returncode, "", "")
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
     except FileNotFoundError:
         return CommandResult(127, "", f"command not found: {command[0]}")
+    if not capture:
+        print(note("running " + format_command(command)), flush=True)
+        _write_captured(sys.stdout, completed.stdout)
+        _write_captured(sys.stderr, completed.stderr)
+    return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def _write_captured(stream: TextIO, text: str) -> None:
+    if not text:
+        return
+    stream.write(text)
+    if not text.endswith("\n"):
+        stream.write("\n")
+    stream.flush()
 
 
 def probe_python_version(python: str, run: Runner) -> Version:
@@ -347,11 +441,48 @@ def probe_python_version(python: str, run: Runner) -> Version:
     return parse_python_version(result.stdout.strip())
 
 
+def describe_remove_failure(exc: OSError) -> str:
+    """Explain a refused or failed ``backend/.venv`` removal without ``[Errno None]``."""
+    detail = " ".join(part for part in (exc.strerror, str(exc)) if part).lower()
+    if "symlink" in detail or "symbolic link" in detail:
+        return (
+            "backend/.venv is a symlink. Setup left it in place. "
+            "Remove the symlink manually and rerun."
+        )
+    if exc.errno is None:
+        return f"could not remove backend/.venv: {exc.strerror or exc}"
+    return f"could not remove backend/.venv: {exc}"
+
+
 def remove_path(path: Path) -> None:
+    if path.is_symlink():
+        raise OSError(
+            "backend/.venv is a symlink. Setup left it in place. "
+            "Remove the symlink manually and rerun."
+        )
     if path.is_dir():
         shutil.rmtree(path)
     elif path.exists():
         path.unlink()
+
+
+def environment_is_broken(result: CommandResult) -> bool:
+    """True when pip or site-packages failed, rather than a dependency resolution."""
+    if result.returncode == 0:
+        return False
+    if result.returncode == 127:
+        return True
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    markers = (
+        "no module named pip",
+        "no module named 'pip'",
+        'no module named "pip"',
+        "bad interpreter",
+        "site-packages",
+        "modulenotfounderror",
+        "importerror",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _run_checked(
@@ -374,6 +505,93 @@ def _run_checked(
             log(result.stderr.strip())
         return 1
     return None
+
+
+def _recreate_venv(
+    action: str,
+    venv_dir: Path,
+    python: str,
+    repo_root: Path,
+    run: Runner,
+    log: Log,
+    remove: Callable[[Path], None],
+) -> int:
+    """Remove and create the virtualenv when needed. Return 0 on success."""
+    if action == "reuse":
+        return 0
+    if action == "recreate":
+        try:
+            remove(venv_dir)
+        except OSError as exc:
+            log(fail(describe_remove_failure(exc)))
+            return 1
+        log(ok("removed backend/.venv"))
+    creating = "creating backend/.venv" if action == "create" else "recreating backend/.venv"
+    log(note(creating))
+    created = run(venv_create_command(python, venv_dir), cwd=repo_root, capture=True)
+    if created.returncode != 0:
+        hint = venv_failure_hint(created.stderr)
+        log(fail(f"could not create backend/.venv (exit {created.returncode}). {hint}".strip()))
+        if created.stderr.strip():
+            log(created.stderr.strip())
+        return 1
+    log(ok(creating))
+    return 0
+
+
+def _install_dependencies(
+    steps: list[tuple[str, list[str]]],
+    *,
+    backend: Path,
+    venv_dir: Path,
+    python: str,
+    repo_root: Path,
+    run: Runner,
+    log: Log,
+    remove: Callable[[Path], None],
+    can_repair: bool,
+) -> int:
+    """Install pinned dependencies. Recreate once when a reused venv's pip is broken."""
+    repaired = False
+    while True:
+        failure: tuple[str, CommandResult] | None = None
+        for label, args in steps:
+            log(note(label))
+            blocked = command_blocked_host(args)
+            if blocked is not None:
+                log(fail(f"refusing {label}: command would contact {blocked}"))
+                return 1
+            result = run(args, cwd=backend, capture=False)
+            if result.returncode != 0:
+                failure = (label, result)
+                break
+            log(ok(label))
+        if failure is None:
+            return 0
+        label, result = failure
+        if can_repair and not repaired and environment_is_broken(result):
+            log(
+                note(
+                    "pip or site-packages in backend/.venv failed. "
+                    "Recreating the virtualenv and retrying once."
+                )
+            )
+            if _recreate_venv("recreate", venv_dir, python, repo_root, run, log, remove) != 0:
+                return 1
+            repaired = True
+            continue
+        log(fail(f"{label} failed (exit {result.returncode})."))
+        detail = (result.stderr or result.stdout).strip()
+        if detail:
+            log(detail)
+        if environment_is_broken(result):
+            log(
+                fail(
+                    "pip or site-packages in backend/.venv is broken. "
+                    "Run bash scripts/setup.sh --force to recreate it."
+                )
+            )
+        return 1
 
 
 def run_setup(
@@ -407,7 +625,12 @@ def run_setup(
         log(fail(f"could not run {python}: {exc}"))
         return 1
 
-    if not python_satisfies(version, spec):
+    try:
+        matches = python_satisfies(version, spec)
+    except ValueError as exc:
+        log(fail(f"cannot interpret requires-python {spec!r}: {exc}"))
+        return 1
+    if not matches:
         log(
             fail(
                 f"Python {version} ({python}) is outside requires-python {spec}. "
@@ -423,41 +646,33 @@ def run_setup(
     if interpreter.is_file():
         try:
             venv_version = probe_python_version(str(interpreter), run)
+            venv_matches = python_satisfies(venv_version, spec)
         except (OSError, ValueError, RuntimeError) as exc:
             log(note(f"existing backend/.venv did not run ({exc}); recreating"))
         else:
-            healthy = python_satisfies(venv_version, spec)
-            if exists and not healthy:
+            same_python = venv_version.as_tuple() == version.as_tuple()
+            healthy = venv_matches and same_python
+            if exists and not venv_matches:
                 log(
                     note(
                         f"existing backend/.venv has Python {venv_version}, "
                         f"outside {spec}; recreating"
                     )
                 )
+            elif exists and not same_python:
+                log(
+                    note(
+                        f"existing backend/.venv has Python {venv_version}; "
+                        f"{python} is Python {version}; recreating"
+                    )
+                )
     elif exists:
         log(note("existing backend/.venv is incomplete; recreating"))
 
     action = decide_venv_action(exists=exists, force=options.force, healthy=healthy)
-    if action == "recreate":
-        try:
-            remove(venv_dir)
-        except OSError as exc:
-            log(fail(f"could not remove backend/.venv: {exc}"))
-            return 1
-        log(ok("removed backend/.venv"))
-
-    if action in {"create", "recreate"}:
-        creating = "creating backend/.venv" if action == "create" else "recreating backend/.venv"
-        log(note(creating))
-        created = run(venv_create_command(python, venv_dir), cwd=repo_root, capture=True)
-        if created.returncode != 0:
-            hint = venv_failure_hint(created.stderr)
-            log(fail(f"could not create backend/.venv (exit {created.returncode}). {hint}".strip()))
-            if created.stderr.strip():
-                log(created.stderr.strip())
-            return 1
-        log(ok(creating))
-    else:
+    if _recreate_venv(action, venv_dir, python, repo_root, run, log, remove) != 0:
+        return 1
+    if action == "reuse":
         log(ok("reusing backend/.venv"))
 
     if not lock.is_file():
@@ -465,12 +680,26 @@ def run_setup(
         return 1
 
     venv_py = str(interpreter)
-    for label, args in install_steps(venv_py, lock):
-        log(note(label))
-        status = _run_checked(label, args, cwd=backend, run=run, log=log, capture=False)
-        if status is not None:
-            return status
-        log(ok(label))
+    try:
+        steps = install_steps(venv_py, lock)
+    except ValueError as exc:
+        log(fail(str(exc)))
+        return 1
+    if (
+        _install_dependencies(
+            steps,
+            backend=backend,
+            venv_dir=venv_dir,
+            python=python,
+            repo_root=repo_root,
+            run=run,
+            log=log,
+            remove=remove,
+            can_repair=action == "reuse",
+        )
+        != 0
+    ):
+        return 1
 
     log(describe_node(which, run))
 
