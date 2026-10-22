@@ -49,7 +49,9 @@ from backend.scrapers.jra_payout import (
     JRA_REFUND_MISMATCH,
     OfficialPayoutKey,
     OfficialRefund,
+    PopularityNote,
     cross_check_payouts,
+    format_popularity_note,
 )
 from backend.scrapers.page_fallback import (
     AccessBlocked,
@@ -745,6 +747,63 @@ def _join_warnings(*parts: str | None) -> str | None:
     return "; ".join(items)
 
 
+def _drop_warning(warning: str | None, clause: str) -> str | None:
+    if not warning:
+        return None
+    kept = [part for part in warning.split("; ") if part != clause]
+    return "; ".join(kept) or None
+
+
+def _plus_source(current: str | None, extra: str | None) -> str | None:
+    if not extra:
+        return current
+    parts = [] if not current else [part for part in current.split("+") if part]
+    if extra not in parts:
+        parts.append(extra)
+    return "+".join(parts) or None
+
+
+def _append_payout_note(current: str | None, extra: str | None) -> str | None:
+    if not extra:
+        return current
+    if not current:
+        return extra
+    return f"{current}; {extra}"
+
+
+def _popularity_note_matches(note: PopularityNote, payout: RacePayout) -> bool:
+    return (
+        note.bet_type == payout.bet_type
+        and note.combination == payout.combination
+        and note.payout == payout.payout
+        and note.netkeiba == payout.popularity
+    )
+
+
+def _adopt_jra_popularity(
+    payouts: list[RacePayout],
+    notes: tuple[PopularityNote, ...],
+    jra_source: str,
+) -> tuple[list[RacePayout], str | None]:
+    """Record JRA's 人気 on matching tickets. Amounts stay on the result page."""
+    pending = list(notes)
+    updated: list[RacePayout] = []
+    for payout in payouts:
+        if not pending or not _popularity_note_matches(pending[0], payout):
+            updated.append(payout)
+            continue
+        note = pending.pop(0)
+        updated.append(
+            payout.model_copy(
+                update={
+                    "popularity": note.official,
+                    "source": _plus_source(payout.source, jra_source),
+                }
+            )
+        )
+    return updated, format_popularity_note(notes)
+
+
 _REFUND_BET_NAMES = ("単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "3連複", "3連単")
 
 
@@ -1043,6 +1102,20 @@ def _race_class_on_page(data02: Tag) -> str | None:
 
 
 def _result_phase_on_page(soup: BeautifulSoup) -> str | None:
+    """Printed phase, or confirmed when payouts and the full order are both on the page.
+
+    A printed 確定前 wins over the payout table. The title 「結果・払戻」, the
+    meta 「速報」, and the nav 「ゴール後 30秒速報」 are not a phase.
+    """
+    labeled = _labeled_result_phase(soup)
+    if labeled is not None:
+        return labeled
+    if _confirmed_by_payout_and_full_order(soup):
+        return "confirmed"
+    return None
+
+
+def _labeled_result_phase(soup: BeautifulSoup) -> str | None:
     """Phase only from a status label on the race header, not from nav or meta text."""
     for node in soup.select(".RaceResultState, [data-result-phase]"):
         if not isinstance(node, Tag):
@@ -1067,6 +1140,31 @@ def _result_phase_on_page(soup: BeautifulSoup) -> str | None:
         if phase is not None:
             return phase
     return None
+
+
+_YEN_MARK = re.compile(r"\d[\d,]*円")
+
+
+def _confirmed_by_payout_and_full_order(soup: BeautifulSoup) -> bool:
+    """Payout yen plus every starter. The early five-row flash is not this."""
+    if _is_flash_table(soup):
+        return False
+    if not any(
+        isinstance(table, Tag) and _YEN_MARK.search(table.get_text())
+        for table in soup.select("table.Payout_Detail_Table")
+    ):
+        return False
+    table = _result_table(soup)
+    if table is None:
+        return False
+    rows = _data_rows(table)
+    header = soup.select_one(".RaceData02")
+    if not rows or not isinstance(header, Tag):
+        return False
+    match = re.search(r"(\d+)\s*頭", header.get_text(" ", strip=True))
+    if match is None:
+        return False
+    return len(rows) == int(match.group(1))
 
 
 def _race_number_on_page(soup: BeautifulSoup) -> int | None:
@@ -2645,7 +2743,7 @@ class NetkeibaScraper(BaseScraper):
         phase = None if phase_disagree else header.result_phase
         if phase_disagree:
             phase_warning = RACE_RESULT_PHASE_DISAGREE
-        elif phase is None:
+        elif phase is None and not complete:
             phase_warning = RACE_RESULT_PHASE_UNKNOWN
         return SettledRaceResult(
             race_id=race_id,
@@ -2672,10 +2770,18 @@ class NetkeibaScraper(BaseScraper):
     def _with_official_payouts(
         self, settled: SettledRaceResult, header: _SettledHeader
     ) -> SettledRaceResult:
-        """Warn when JRA's public payout list is missing or disagrees. Do not invent prices."""
+        """Warn when JRA's public payout list is missing or disagrees. Do not invent prices.
+
+        A popularity-only difference records JRA's 人気 and a light note. When
+        the result page did not expose a phase, the JRA payout table can.
+        """
         if settled.warning in _HARD_RESULT_WARNINGS:
             return settled
         refunds = settled.refunds
+        payouts = list(settled.payouts)
+        payout_note = settled.payout_note
+        phase = settled.result_phase
+        source = settled.source
         notes: list[str | None] = []
         payout_status: int | None = None
         payout_login = False
@@ -2698,6 +2804,13 @@ class NetkeibaScraper(BaseScraper):
                 official = checked.refunds
                 jra_source = checked.source
                 notes.append(checked.warning)
+                payouts, popularity_note = _adopt_jra_popularity(
+                    payouts, checked.popularity, jra_source
+                )
+                payout_note = _append_payout_note(payout_note, popularity_note)
+                if phase is None and checked.phase is not None:
+                    phase = _as_phase(checked.phase)
+                    source = _plus_source(source, jra_source)
                 if checked.http_status in {401, 403} or checked.login_required:
                     payout_status = checked.http_status
                     payout_login = checked.login_required
@@ -2707,11 +2820,21 @@ class NetkeibaScraper(BaseScraper):
             notes.append(refund_note)
         notes.append(_refund_status_warning(settled.results, refunds))
         warning = _join_warnings(settled.warning, *notes)
+        if phase is not None or settled.complete:
+            warning = _drop_warning(warning, RACE_RESULT_PHASE_UNKNOWN)
         update: dict[str, object] = {}
         if warning != settled.warning:
             update["warning"] = warning
         if refunds != settled.refunds:
             update["refunds"] = refunds
+        if payouts != list(settled.payouts):
+            update["payouts"] = payouts
+        if payout_note != settled.payout_note:
+            update["payout_note"] = payout_note
+        if phase != settled.result_phase:
+            update["result_phase"] = phase
+        if source != settled.source:
+            update["source"] = source
         if payout_status in {401, 403} or payout_login:
             update["http_status"] = payout_status
             update["login_required"] = payout_login

@@ -338,12 +338,18 @@ class RacePayout(BaseModel):
         ..., description="馬番または枠番。ページの並び。馬単・3連単は着順どおり"
     )
     payout: int = Field(..., description="払戻金（円）", gt=0)
-    popularity: int | None = Field(None, description="人気。ページに無いときは null")
-    source: ResultSource | None = Field(
+    popularity: int | None = Field(
         None,
-        description="この払戻を得た方法。netkeiba_html / netkeiba_js / headless",
+        description="人気。結果ページに無く JRA にも無いときは null。違うときは JRA の数字",
     )
-    fetched_at: datetime | None = Field(None, description="この払戻を得た時刻")
+    source: str | None = Field(
+        None,
+        description=(
+            "この払戻を得た方法。netkeiba_html / netkeiba_js / headless。"
+            "人気だけ JRA を記録したときは netkeiba_html+jra_html（ブラウザなら +headless）"
+        ),
+    )
+    fetched_at: datetime | None = Field(None, description="この払戻を得た時刻。人気の採用もこの時刻")
 
 
 class SettledRaceResult(BaseModel):
@@ -396,7 +402,12 @@ class SettledRaceResult(BaseModel):
     )
     result_phase: ResultPhase | None = Field(
         None,
-        description="ページが示す provisional（確定前・暫定）か confirmed（確定）。印字が無ければ null",
+        description=(
+            "provisional（確定前・暫定）か confirmed（確定）。"
+            "印字、または払戻表と全着順、または JRA の払戻表。決められなければ null。"
+            "結果ページ由来のときは source と fetched_at がその出典。"
+            "JRA の払戻表だけが示したときは source に jra_html または headless を足す"
+        ),
     )
     results: list[SettledFinisher] = Field(
         default_factory=list,
@@ -415,7 +426,10 @@ class SettledRaceResult(BaseModel):
     )
     payout_note: str | None = Field(
         None,
-        description="払戻が無い、または対応が取れない馬券種があるときの注記。金額は作らない",
+        description=(
+            "払戻が無い、対応が取れない馬券種、または人気だけ JRA と違うときの注記。"
+            "金額は作らない"
+        ),
     )
     warning: str | None = Field(
         None,
