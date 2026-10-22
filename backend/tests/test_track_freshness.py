@@ -354,6 +354,7 @@ def test_previous_line_announcement_does_not_hide_the_measurement():
         "東京",
         """
         <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>馬場状態</h2>
         <p>次回発表予定</p>
         <div class="content" id="cushion_num"><p><strong>9.1</strong></p></div>
         <p>10月18日 7時00分 測定</p>
@@ -370,8 +371,12 @@ def test_previous_line_announcement_does_not_hide_the_measurement():
 def test_hour_without_minutes_and_noon_are_measurements():
     eight = datetime(2026, 10, 18, 8, 0, tzinfo=TOKYO)
     noon = datetime(2026, 10, 18, 12, 0, tzinfo=TOKYO)
+    half = datetime(2026, 10, 18, 8, 30, tzinfo=TOKYO)
     assert page_measurement_time("10月18日 8時現在", 2026) == eight
+    assert page_measurement_time("10月18日 8時半現在", 2026) == half
     assert page_measurement_time("10月18日 正午現在", 2026) == noon
+    assert page_measurement_time("10月18日 15時40分 ブラジルC 発走", 2026) is None
+    assert page_measurement_time("発表予定 10月18日 8時半", 2026) is None
     assert page_measurement_time("10月18日 15:30", 2026) == datetime(
         2026, 10, 18, 15, 30, tzinfo=TOKYO
     )
@@ -403,6 +408,24 @@ def test_hour_without_minutes_and_noon_are_measurements():
     assert info.turf.cushion.measured_at == eight
     assert info.turf.cushion.source == "jra_html"
     assert info.turf.cushion.fetched_at == PINNED
+
+
+def test_weekly_info_clock_does_not_make_a_yesterday_baba_fresh():
+    html = (FIXTURES / "jra_baba_weekly_clock_20261018.html").read_text(encoding="utf-8")
+    info = _scrape(_Gets(gets={BABA_TOKYO: html, BABA_KYOTO: _baba("京都")}))
+    yesterday = datetime(2026, 10, 17, 7, 0, tzinfo=TOKYO)
+    assert info.measured_at == yesterday
+    assert info.is_today is False
+    assert info.stale is True
+    assert info.warning == f"{STALE_PREFIX}: 2026-10-17"
+    assert needs_fresh_wait({"jra": info}, race_date=RACE_DAY, today=RACE_DAY) is True
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.value == 9.2
+    assert info.turf.cushion.measured_at == yesterday
+    assert info.turf.cushion.source == "jra_html"
+    assert info.turf.cushion.fetched_at == PINNED
+    assert info.turf.moisture is not None
+    assert info.turf.moisture.measured_at == yesterday
 
 
 def test_announcement_time_is_not_a_measurement():

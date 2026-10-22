@@ -32,7 +32,7 @@ FRESH_REQUEST_HEADERS = {
     "Pragma": "no-cache",
 }
 
-# Minutes are optional: 「8時現在」 is 8:00 and 「正午現在」 is 12:00.
+# 「8時現在」 is 8:00, 「8時半」 is 8:30, and 「正午現在」 is 12:00.
 # A colon clock still needs minutes, matching 「15:00」.
 _STAMP = re.compile(
     r"(?:(?P<year>\d{4})\s*年\s*)?"
@@ -40,6 +40,7 @@ _STAMP = re.compile(
     r"(?:[^0-9\n]{0,16})"
     r"(?:"
     r"(?P<hour>\d{1,2})\s*[時:：]\s*(?P<minute>\d{1,2})"
+    r"|(?P<hour_half>\d{1,2})\s*時\s*半"
     r"|(?P<hour_only>\d{1,2})\s*時"
     r"|(?P<noon>正午)"
     r")"
@@ -74,12 +75,12 @@ _FUTURE_CLOCK = ("発走", "発表", "予定")
 
 
 def measurement_times(text: str, year: int | None) -> list[datetime]:
-    """Clocks printed as ``M月D日 H時M分``, ``H時``, or ``正午``.
+    """Clocks printed as ``M月D日 H時M分``, ``H時半``, ``H時``, or ``正午``.
 
-    ``H時`` with no minutes is ``H:00``. ``正午`` is ``12:00``. A 発走 or
-    発表予定 clock is not a measurement. That exclusion looks at the stamp
-    and the few characters beside it on the same line only. 発表予定 on the
-    previous line does not hide the measurement on the next line.
+    ``H時`` with no minutes is ``H:00``. ``H時半`` is ``H:30``. ``正午`` is
+    ``12:00``. A 発走 or 発表予定 clock is not a measurement. The whole line
+    is checked, so ``15時40分 ブラジルC 発走`` is not a measurement. A marker
+    on the previous or next line does not hide this line's clock.
 
     The year is the one printed in the same stamp, otherwise ``year``. A stamp
     with no year stays out of the list. Nothing is filled from the fetch time.
@@ -109,31 +110,29 @@ def measurement_times(text: str, year: int | None) -> list[datetime]:
 
 
 def _clock_hm(match: re.Match[str]) -> tuple[int, int]:
-    """Hour and minute. A bare ``H時`` is ``H:00``. ``正午`` is noon."""
+    """Hour and minute. A bare ``H時`` is ``H:00``. ``H時半`` is ``H:30``."""
     minute = match.group("minute")
     if match.group("hour") is not None and minute is not None:
         return int(match.group("hour")), int(minute)
+    if match.group("hour_half") is not None:
+        return int(match.group("hour_half")), 30
     if match.group("hour_only") is not None:
         return int(match.group("hour_only")), 0
     return 12, 0
 
 
 def _future_clock(text: str, match: re.Match[str]) -> bool:
-    """True when 発走, 発表, or 予定 sits on this stamp's line.
+    """True when 発走, 発表, or 予定 sits anywhere on this stamp's line.
 
-    Eight characters before the stamp and six after it are the windows.
-    The window does not cross a newline, so a previous line's 発表予定
-    cannot erase the measurement below it.
+    The next line's 発表予定, and the previous line's, do not count.
     """
     start, end = match.start(), match.end()
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
     if line_end < 0:
         line_end = len(text)
-    head = text[max(line_start, start - 8) : start]
-    tail = text[end : min(line_end, end + 6)]
-    around = head + match.group(0) + tail
-    return any(mark in around for mark in _FUTURE_CLOCK)
+    line = text[line_start:line_end]
+    return any(mark in line for mark in _FUTURE_CLOCK)
 
 
 def page_measurement_time(text: str, year: int | None) -> datetime | None:

@@ -58,6 +58,44 @@ from backend.utils.date_utils import normalize_tokyo_clock, parse_measurement_ti
 logger = logging.getLogger(__name__)
 
 _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
+_MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
+_SECTION_STOPS = ("使用コース", "芝コースの様子", "芝の状態")
+
+
+def measurement_sections(text: str) -> dict[str, str]:
+    """Text of the 馬場状態, cushion, and moisture sections.
+
+    週間情報 is a weather note. Its clock, including ``8時現在``, is not a
+    track measurement. A later heading ends the section before it.
+    """
+    buckets: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        heading = _section_heading(line)
+        if heading is not None:
+            current = heading
+        if current in _MEASUREMENT_SECTIONS:
+            buckets.setdefault(current, []).append(line)
+    return {name: "\n".join(lines) for name, lines in buckets.items()}
+
+
+def _section_heading(line: str) -> str | None:
+    """Section a line opens. A clock may share the line with its label."""
+    compact = re.sub(r"\s+", "", line)
+    if not compact:
+        return None
+    if "週間情報" in compact:
+        return "週間情報"
+    if "クッション値" in compact:
+        return "クッション値"
+    if "含水率" in compact:
+        return "含水率"
+    if compact.startswith("馬場状態"):
+        return "馬場状態"
+    for name in _SECTION_STOPS:
+        if compact == name or (compact.startswith(name) and len(compact) <= len(name) + 8):
+            return name
+    return None
 
 
 def baba_meeting_tab_urls(html: str, page_url: str) -> list[str]:
@@ -575,7 +613,11 @@ class JRATrackScraper(BaseScraper):
             soup, source, fetched_at, year
         )
         post = post_time_on_page(soup.get_text(" ", strip=True))
-        measured_at = page_measurement_time(soup.get_text("\n", strip=True), year)
+        sections = measurement_sections(soup.get_text("\n", strip=True))
+        measured_at = page_measurement_time(
+            "\n".join(sections.get(name, "") for name in _MEASUREMENT_SECTIONS),
+            year,
+        )
 
         turf_info = CourseInfo(
             course_type=CourseType.TURF,
@@ -790,15 +832,15 @@ class JRATrackScraper(BaseScraper):
     def _extract_measurement_time(
         self, soup: BeautifulSoup, section_name: str, year: int | None
     ) -> datetime | None:
-        """Measurement clock printed with ``section_name``. No year means null."""
-        lines = soup.get_text("\n", strip=True).splitlines()
-        for index, line in enumerate(lines):
-            if section_name not in line:
-                continue
-            window = " ".join(lines[index : index + 3])
-            times = measurement_times(window, year)
-            if times:
-                return times[0]
+        """Measurement clock printed in ``section_name``. No year means null.
+
+        週間情報 is not this section. A clock there is not the cushion or
+        moisture time.
+        """
+        text = measurement_sections(soup.get_text("\n", strip=True)).get(section_name, "")
+        times = measurement_times(text, year)
+        if times:
+            return times[0]
         return None
 
     def _extract_grass_info(self, soup: BeautifulSoup) -> GrassInfo | None:
