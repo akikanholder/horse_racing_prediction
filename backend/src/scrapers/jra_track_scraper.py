@@ -10,7 +10,7 @@ from datetime import date, datetime
 from typing import Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, Tag
 
 from backend.models.track import (
     CourseInfo,
@@ -60,13 +60,22 @@ logger = logging.getLogger(__name__)
 _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
 _MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
 _SECTION_STOPS = ("使用コース", "芝コースの様子", "芝の状態")
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_UNLISTED_HEADING = re.compile(
+    r"^[\u4e00-\u9fff々]{2,12}(?:情報|の様子|の状態)"
+)
+CUSHION_UNDATED = "cushion reading has no measurement time and is not current"
+MOISTURE_UNDATED = "moisture reading has no measurement time and is not current"
+_UNUSED_FETCHED_AT = datetime(1970, 1, 1)
 
 
 def measurement_sections(text: str) -> dict[str, str]:
     """Text of the 馬場状態, cushion, and moisture sections.
 
     週間情報 is a weather note. Its clock, including ``8時現在``, is not a
-    track measurement. A later heading ends the section before it.
+    track measurement. Any later heading ends the section, including one that
+    is not in the known list (``散水情報 10月18日 8時``). Clocks are collected
+    only from 馬場状態, クッション値, and 含水率.
     """
     buckets: dict[str, list[str]] = {}
     current: str | None = None
@@ -74,16 +83,70 @@ def measurement_sections(text: str) -> dict[str, str]:
         heading = _section_heading(line)
         if heading is not None:
             current = heading
+            if heading not in _MEASUREMENT_SECTIONS:
+                continue
         if current in _MEASUREMENT_SECTIONS:
-            buckets.setdefault(current, []).append(line)
+            cleaned = line[1:] if line.startswith("§") else line
+            buckets.setdefault(current, []).append(cleaned)
     return {name: "\n".join(lines) for name, lines in buckets.items()}
 
 
+def measurement_sections_from_soup(soup: BeautifulSoup) -> dict[str, str]:
+    """Section text from the document. An ``h1``–``h6`` is always a heading."""
+    return measurement_sections("\n".join(_section_lines(soup)))
+
+
+def _section_lines(soup: BeautifulSoup) -> list[str]:
+    """Visible lines. A heading tag is one line, marked so any title ends a section."""
+    lines: list[str] = []
+    emitted: set[int] = set()
+    for node in soup.find_all(string=True):
+        if isinstance(node, Comment):
+            continue
+        parent = node.parent
+        if not isinstance(parent, Tag):
+            continue
+        if parent.name in {"script", "style", "title"} or parent.find_parent(
+            ["script", "style", "title"]
+        ):
+            continue
+        text = str(node).strip()
+        if not text:
+            continue
+        heading = parent if parent.name in _HEADING_TAGS else parent.find_parent(_HEADING_TAGS)
+        if isinstance(heading, Tag):
+            if id(heading) in emitted:
+                continue
+            emitted.add(id(heading))
+            title = heading.get_text(" ", strip=True)
+            if title:
+                lines.append(f"§{title}")
+            continue
+        lines.append(text)
+    return lines
+
+
 def _section_heading(line: str) -> str | None:
-    """Section a line opens. A clock may share the line with its label."""
-    compact = re.sub(r"\s+", "", line)
+    """Section a line opens. A clock may share the line with its label.
+
+    A ``§`` prefix marks an HTML heading, so an unlisted title still ends the
+    previous section. Clocks are kept only for the three measurement sections.
+    """
+    raw = line.strip()
+    marked = raw.startswith("§")
+    compact = re.sub(r"\s+", "", raw[1:] if marked else raw)
     if not compact:
         return None
+    named = _named_section(compact)
+    if named is not None:
+        return named
+    if marked or _UNLISTED_HEADING.match(compact):
+        return "other"
+    return None
+
+
+def _named_section(compact: str) -> str | None:
+    """Known section name, or None when this line is not one of them."""
     if "週間情報" in compact:
         return "週間情報"
     if "クッション値" in compact:
@@ -155,6 +218,8 @@ class JRATrackScraper(BaseScraper):
     BABA_FETCH_FAILED = "JRA baba fetch failed"
     BABA_LOGIN = "JRA baba requires login"
     CUSHION_MISSING = CUSHION_MISSING
+    CUSHION_UNDATED = CUSHION_UNDATED
+    MOISTURE_UNDATED = MOISTURE_UNDATED
 
     def __init__(
         self,
@@ -213,9 +278,13 @@ class JRATrackScraper(BaseScraper):
         a different meeting returns TrackInfo with null racecourse, cushion,
         and moisture plus ``warning``. A 403 is not retried and is not evaded.
 
-        When the meeting page loads but ``#cushion_num`` is empty, the same-site
-        ``_data_cushion.html`` the page's own script calls is read next, then an
-        optional headless render. The hardness scale is not the cushion value.
+        When ``#cushion_num`` is empty, or a printed cushion or moisture number
+        has no measurement time and the page loads ``_data_cushion.html`` or
+        ``_data_moist.html``, that same-site file is read next. A dated reading
+        replaces the undated static numbers. Headless runs only when that chain
+        is already open and the time is still missing. The hardness scale is
+        not the cushion value. Undated numbers stay, with ``measured_at`` null
+        and a warning. They are not the current measurement.
 
         Args:
             racecourse: Racecourse code (e.g., 'nakayama', 'tokyo') or a
@@ -458,7 +527,7 @@ class JRATrackScraper(BaseScraper):
         *,
         document_source: str | None = None,
     ) -> object:
-        """Follow the page's own cushion fragment when the number slot is empty."""
+        """Follow the page's own data files when a reading has no measurement time."""
         fallback = PageFallback(
             self.http_client,
             site="jra",
@@ -471,8 +540,8 @@ class JRATrackScraper(BaseScraper):
             headers=dict(FRESH_REQUEST_HEADERS),
             encoding=self.BABA_ENCODING,
             fetched_at=fetched_at,
-            should_fallback=self._cushion_slot_empty,
-            still_incomplete=self._still_missing_cushion,
+            should_fallback=self._needs_dated_source,
+            still_incomplete=self._still_needs_dated_source,
             html_body=html,
             document_source=document_source,
         )
@@ -488,20 +557,56 @@ class JRATrackScraper(BaseScraper):
                 headers=dict(FRESH_REQUEST_HEADERS),
             )
 
-        return discover_jra_baba_urls(html, page_url, fetch)
+        return _select_baba_urls(html, discover_jra_baba_urls(html, page_url, fetch), self)
 
     def _cushion_slot_empty(self, html: str) -> bool:
         """True when the page has a cushion slot and the number is not in it."""
         reading = cushion_from_html(BeautifulSoup(html, "lxml"))
         return reading.slot and reading.value is None
 
-    def _still_missing_cushion(self, pages: list[FetchedBody]) -> bool:
-        """True when none of the documents printed a cushion number."""
+    def _needs_dated_source(self, html: str) -> bool:
+        """True when a same-site data file, or the empty cushion slot, should be read.
+
+        Undated static numbers with no ``_data_cushion.html`` / ``_data_moist.html``
+        reference do not open headless. A 403 later in the chain still stops it.
+        """
+        if self._cushion_slot_empty(html):
+            return True
+        if not _references_baba_data(html):
+            return False
+        soup = BeautifulSoup(html, "lxml")
+        year = self._page_year(soup)
+        return self._cushion_needs_source(html, soup, year) or self._moisture_needs_source(
+            html, soup, year
+        )
+
+    def _cushion_needs_source(self, html: str, soup: BeautifulSoup, year: int | None) -> bool:
+        """True when the cushion number is missing or has no measurement time."""
+        if self._cushion_slot_empty(html):
+            return True
+        cushion = self._extract_cushion_value(soup, "jra_html", _UNUSED_FETCHED_AT, year)
+        return cushion is not None and cushion.value is not None and cushion.measured_at is None
+
+    def _moisture_needs_source(self, html: str, soup: BeautifulSoup, year: int | None) -> bool:
+        """True when moisture numbers have no time, or the empty slot still needs them."""
+        turf_m, dirt_m = self._extract_moisture_content(
+            soup, "jra_html", _UNUSED_FETCHED_AT, year
+        )
+        if _moisture_undated(turf_m) or _moisture_undated(dirt_m):
+            return True
+        if _moisture_value_missing(turf_m) and _moisture_value_missing(dirt_m):
+            return self._cushion_slot_empty(html)
+        return False
+
+    def _still_needs_dated_source(self, pages: list[FetchedBody]) -> bool:
+        """True when headless might still supply a number or a measurement time."""
         venue = self._title_venue(pages[0].body) if pages else None
         if venue is None:
             return False
         info = self._from_pages(pages, venue)
-        return _cushion_number(info) is None
+        if _cushion_number(info) is None and self._cushion_slot_empty(pages[0].body):
+            return True
+        return _undated_reading_warning(info) is not None
 
     def _from_pages(self, pages: list[FetchedBody], venue: str) -> TrackInfo:
         """Merge the HTML tab with later fragments. Do not invent a number."""
@@ -514,36 +619,61 @@ class JRATrackScraper(BaseScraper):
             info = info.model_copy(
                 update={"warning": join_warnings(info.warning, self.CUSHION_MISSING)}
             )
+        undated = _undated_reading_warning(info)
+        if undated:
+            info = info.model_copy(update={"warning": join_warnings(info.warning, undated)})
         return info
 
     def _fill_from_page(self, info: TrackInfo, page: FetchedBody, venue: str) -> TrackInfo:
-        """Copy a missing cushion, or moisture that the HTML did not print."""
+        """Prefer a dated cushion or moisture over undated static numbers."""
         payload = json_object(page.body)
         if payload is not None:
             return self._fill_from_json(info, payload, page.source, page.fetched_at)
         soup = BeautifulSoup(page.body, "lxml")
         year = info.date.year if info.date is not None else printed_year(page.body)
-        if _cushion_number(info) is None:
-            cushion = self._cushion_from_fragment(soup, venue, year, page.source, page.fetched_at)
-            if cushion is None:
-                reading = cushion_from_html(soup)
-                if reading.value is not None or reading.grade is not None:
-                    cushion = CushionValue(
-                        value=reading.value,
-                        grade=reading.grade,
-                        source=page.source,
-                        fetched_at=page.fetched_at,
-                    )
-            if cushion is not None and info.turf is not None:
-                info = info.model_copy(
-                    update={"turf": info.turf.model_copy(update={"cushion": cushion})}
-                )
-        if _moisture_missing(info.turf) or _moisture_missing(info.dirt):
-            turf_m, dirt_m = self._moisture_from_fragment(
-                soup, venue, year, page.source, page.fetched_at
-            )
-            info = _fill_moisture(info, turf_m, dirt_m)
+        info = self._prefer_cushion_page(info, soup, venue, year, page.source, page.fetched_at)
+        turf_m, dirt_m = self._moisture_from_document(
+            soup, venue, year, page.source, page.fetched_at
+        )
+        info = _fill_moisture(info, turf_m, dirt_m)
         return _fill_post_time(info, soup.get_text(" ", strip=True), page.source, page.fetched_at)
+
+    def _prefer_cushion_page(
+        self,
+        info: TrackInfo,
+        soup: BeautifulSoup,
+        venue: str,
+        year: int | None,
+        source: str,
+        fetched_at: datetime,
+    ) -> TrackInfo:
+        """Keep the cushion that has a measurement time when one is printed."""
+        if info.turf is None:
+            return info
+        fragment = self._cushion_from_fragment(soup, venue, year, source, fetched_at)
+        extracted = self._extract_cushion_value(soup, source, fetched_at, year)
+        incoming = _prefer_cushion(extracted, fragment)
+        chosen = _prefer_cushion(info.turf.cushion, incoming)
+        if chosen is info.turf.cushion:
+            return info
+        return info.model_copy(update={"turf": info.turf.model_copy(update={"cushion": chosen})})
+
+    def _moisture_from_document(
+        self,
+        soup: BeautifulSoup,
+        venue: str,
+        year: int | None,
+        source: str,
+        fetched_at: datetime,
+    ) -> tuple[MoistureContent | None, MoistureContent | None]:
+        """Table cells, then a venue unit. A unit with its own clock wins."""
+        table_turf, table_dirt = self._extract_moisture_content(
+            soup, source, fetched_at, year
+        )
+        frag_turf, frag_dirt = self._moisture_from_fragment(
+            soup, venue, year, source, fetched_at
+        )
+        return _prefer_moisture(table_turf, frag_turf), _prefer_moisture(table_dirt, frag_dirt)
 
     def _fill_from_json(
         self,
@@ -613,7 +743,7 @@ class JRATrackScraper(BaseScraper):
             soup, source, fetched_at, year
         )
         post = post_time_on_page(soup.get_text(" ", strip=True))
-        sections = measurement_sections(soup.get_text("\n", strip=True))
+        sections = measurement_sections_from_soup(soup)
         measured_at = page_measurement_time(
             "\n".join(sections.get(name, "") for name in _MEASUREMENT_SECTIONS),
             year,
@@ -658,6 +788,13 @@ class JRATrackScraper(BaseScraper):
         if match is None:
             return None
         return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+    def _page_year(self, soup: BeautifulSoup) -> int | None:
+        """Year printed on the page. A page with no year stays unset."""
+        printed = self._printed_date(soup)
+        if printed is not None:
+            return printed.year
+        return printed_year(soup.get_text(" ", strip=True))
 
     def _extract_weather(self, soup: BeautifulSoup) -> Weather:
         """Extract the weather condition from the page."""
@@ -813,7 +950,7 @@ class JRATrackScraper(BaseScraper):
         source: str,
         fetched_at: datetime,
     ) -> tuple[MoistureContent | None, MoistureContent | None]:
-        """Latest moisture unit for this venue. Used only when the HTML cells are empty."""
+        """Latest moisture unit for this venue. A printed clock makes this the reading."""
         block = _venue_block(soup, venue)
         if block is None:
             return None, None
@@ -837,7 +974,7 @@ class JRATrackScraper(BaseScraper):
         週間情報 is not this section. A clock there is not the cushion or
         moisture time.
         """
-        text = measurement_sections(soup.get_text("\n", strip=True)).get(section_name, "")
+        text = measurement_sections_from_soup(soup).get(section_name, "")
         times = measurement_times(text, year)
         if times:
             return times[0]
@@ -972,13 +1109,6 @@ def _cushion_number(info: TrackInfo) -> float | None:
     return info.turf.cushion.value
 
 
-def _moisture_missing(course: CourseInfo | None) -> bool:
-    """True when this course has no printed moisture number."""
-    if course is None or course.moisture is None:
-        return True
-    return course.moisture.goal_front is None and course.moisture.fourth_corner is None
-
-
 def _venue_block(soup: BeautifulSoup, venue: str) -> Tag | None:
     """The ``rcA`` / ``rcB`` / ``rcC`` block titled with this venue."""
     for block in soup.find_all("div", id=re.compile(r"^rc[ABC]$")):
@@ -1012,21 +1142,117 @@ def _span_moisture(
     )
 
 
+def _references_baba_data(html: str) -> bool:
+    """True when the page itself points at the cushion or moisture fragment."""
+    return (
+        "_data_cushion.html" in html
+        or "_data_moist.html" in html
+        or "/keiba/baba/_js/" in html
+    )
+
+
+def _select_baba_urls(html: str, urls: list[str], scraper: JRATrackScraper) -> list[str]:
+    """Keep the data files that can still supply a missing or undated reading."""
+    soup = BeautifulSoup(html, "lxml")
+    year = scraper._page_year(soup)
+    need_cushion = scraper._cushion_needs_source(html, soup, year)
+    need_moisture = scraper._moisture_needs_source(html, soup, year)
+    selected: list[str] = []
+    for url in urls:
+        path = urlparse(url).path
+        if path.endswith("_data_cushion.html") and need_cushion:
+            selected.append(url)
+        elif path.endswith("_data_moist.html") and need_moisture:
+            selected.append(url)
+    return selected
+
+
+def _prefer_cushion(
+    current: CushionValue | None, incoming: CushionValue | None
+) -> CushionValue | None:
+    """A dated number replaces an undated one. An undated number does not."""
+    if incoming is None or (incoming.value is None and incoming.grade is None):
+        return current
+    if current is None or current.value is None:
+        if incoming.value is not None or current is None:
+            return incoming
+        return current
+    if incoming.measured_at is not None and (
+        current.measured_at is None or incoming.measured_at >= current.measured_at
+    ):
+        return incoming
+    return current
+
+
+def _prefer_moisture(
+    current: MoistureContent | None, incoming: MoistureContent | None
+) -> MoistureContent | None:
+    """A dated moisture reading replaces an undated one. Numbers are not invented."""
+    if _moisture_value_missing(incoming):
+        return current
+    if _moisture_value_missing(current):
+        return incoming
+    assert incoming is not None and current is not None
+    if incoming.measured_at is not None and (
+        current.measured_at is None or incoming.measured_at >= current.measured_at
+    ):
+        return incoming
+    return current
+
+
+def _moisture_value_missing(moisture: MoistureContent | None) -> bool:
+    """True when this reading has no goal or corner number."""
+    if moisture is None:
+        return True
+    return moisture.goal_front is None and moisture.fourth_corner is None
+
+
+def _moisture_undated(moisture: MoistureContent | None) -> bool:
+    """True when numbers are printed and no measurement time is attached."""
+    if _moisture_value_missing(moisture):
+        return False
+    assert moisture is not None
+    return moisture.measured_at is None
+
+
+def _undated_reading_warning(info: TrackInfo) -> str | None:
+    """Warn when a number has no measurement time. It is not the current reading."""
+    notes: list[str] = []
+    cushion = info.turf.cushion if info.turf is not None else None
+    if cushion is not None and cushion.value is not None and cushion.measured_at is None:
+        notes.append(CUSHION_UNDATED)
+    undated_moisture = False
+    for course in (info.turf, info.dirt):
+        if course is not None and _moisture_undated(course.moisture):
+            undated_moisture = True
+    if undated_moisture:
+        notes.append(MOISTURE_UNDATED)
+    return join_warnings(*notes)
+
+
 def _fill_moisture(
     info: TrackInfo,
     turf: MoistureContent | None,
     dirt: MoistureContent | None,
 ) -> TrackInfo:
-    """Fill moisture only where the HTML did not already print it."""
-    turf_update = info.turf
-    dirt_update = info.dirt
-    if turf is not None and _moisture_missing(info.turf) and info.turf is not None:
-        turf_update = info.turf.model_copy(update={"moisture": turf})
-    if dirt is not None and _moisture_missing(info.dirt) and info.dirt is not None:
-        dirt_update = info.dirt.model_copy(update={"moisture": dirt})
+    """Prefer a dated moisture reading. Undated numbers fill only an empty course."""
+    turf_update = _course_moisture(info.turf, turf)
+    dirt_update = _course_moisture(info.dirt, dirt)
     if turf_update is info.turf and dirt_update is info.dirt:
         return info
     return info.model_copy(update={"turf": turf_update, "dirt": dirt_update})
+
+
+def _course_moisture(
+    course: CourseInfo | None, incoming: MoistureContent | None
+) -> CourseInfo | None:
+    """Copy ``incoming`` onto ``course`` when it is the reading to keep."""
+    if course is None or _moisture_value_missing(incoming):
+        return course
+    chosen = _prefer_moisture(course.moisture, incoming)
+    if chosen is course.moisture:
+        return course
+    return course.model_copy(update={"moisture": chosen})
 
 
 def _apply_moisture(

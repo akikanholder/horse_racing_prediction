@@ -96,6 +96,29 @@ def looks_like_login_wall(html: str) -> bool:
     return "ログイン" in label or "login" in label
 
 
+def looks_like_forbidden_page(html: str) -> bool:
+    """True when the document is a 403, access-denied, or captcha page.
+
+    A payout of 403円 in the body is not a refusal. The title and the first
+    heading are what name the page.
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
+    heading = ""
+    h1 = soup.find("h1")
+    if h1 is not None:
+        heading = h1.get_text(" ", strip=True)
+    label = f"{title} {heading}".lower()
+    if any(token in label for token in ("403", "forbidden", "access denied", "captcha")):
+        return True
+    text = soup.get_text(" ", strip=True).lower()
+    if len(text) <= 80 and any(
+        token in text for token in ("403 forbidden", "access denied", "just a moment")
+    ):
+        return True
+    return False
+
+
 def headless_browser_installed() -> bool:
     """True when Playwright can launch a Chromium that is already installed."""
     try:

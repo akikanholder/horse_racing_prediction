@@ -686,7 +686,61 @@ def test_login_wall_is_not_cached(tmp_path: Path):
     assert calls == [1, 1]
 
 
-def test_jra_odds_chain_reads_same_site_json_and_stops_on_403():
+def test_cached_login_wall_and_forbidden_page_are_not_replayed(tmp_path: Path):
+    login = (
+        "<html><head><title>ログイン</title></head><body>"
+        "<form><input type='password'></form></body></html>"
+    )
+    forbidden = (
+        "<html><head><title>403 Forbidden</title></head>"
+        "<body><h1>Access Denied</h1></body></html>"
+    )
+    ok = "<html><head><title>結果</title></head><body>確定オッズ 403円</body></html>"
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls.append(url)
+            return ok
+
+    url = "https://example.test/kept"
+    transport = _Transport()
+    client = CachingHTTPClient(tmp_path, transport=transport, min_request_interval=0)
+    key = client._cache_key("GET", url, None, None)
+    path = client._path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def seed(body: str) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "url": url,
+                    "fetched_at": "2026-10-18T07:00:00",
+                    "replayable": True,
+                    "body": body,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    seed(login)
+    assert client.cached_fetched_at("GET", url) is None
+    assert client.get(url) == ok
+    assert transport.calls == [url]
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "確定オッズ" in stored["body"]
+    assert "password" not in stored["body"]
+
+    seed(forbidden)
+    assert client.get(url) == ok
+    assert transport.calls == [url, url]
+
+    client.get(url)
+    assert transport.calls == [url, url]
+    assert "403円" in client.get(url)
     shutuba = (
         "<html><body><a onclick=\"doAction('/JRADB/accessO.html','pw01ode0105202501010120250105/AB');\">"
         "オッズ</a></body></html>"

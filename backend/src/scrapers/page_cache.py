@@ -1,8 +1,9 @@
 """Local cache and a pause between public-page requests.
 
 Date ranges call sites one request at a time. A cached page is not fetched
-again. HTTP 403 and a login wall are not stored. This client does not change
-the User-Agent or send credentials.
+again. HTTP 403 and a login wall are not stored. A stored login wall or 403
+page is not replayed either. This client does not change the User-Agent or
+send credentials.
 """
 
 from __future__ import annotations
@@ -14,11 +15,18 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.scrapers.netkeiba_scraper import result_html_is_partial
-from backend.scrapers.page_fallback import looks_like_login_wall
+from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import should_bypass_page_cache
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
+
+
+def _refused_cache_body(body: object) -> bool:
+    """True when a stored body is a login wall or a 403 page and must not be replayed."""
+    if not isinstance(body, str) or not body:
+        return False
+    return looks_like_login_wall(body) or looks_like_forbidden_page(body)
 
 
 def _partial_result(url: str, body: str) -> bool:
@@ -65,7 +73,7 @@ class CachingHTTPClient(HTTPClient):
         """When this URL was fetched. None when it is not on disk."""
         path = self._path(self._cache_key(method, url, params, data))
         payload = self._load(path)
-        if payload is None:
+        if payload is None or _refused_cache_body(payload.get("body")):
             return None
         raw = payload.get("fetched_at")
         if not isinstance(raw, str):
@@ -148,6 +156,8 @@ class CachingHTTPClient(HTTPClient):
         body = payload.get("body")
         if not isinstance(body, str) or not body:
             return None
+        if looks_like_login_wall(body) or looks_like_forbidden_page(body):
+            return None
         if not self._replayable(path, url, payload, body):
             return None
         return body
@@ -177,7 +187,12 @@ class CachingHTTPClient(HTTPClient):
         return ok
 
     def _store(self, key: str, url: str, body: str) -> None:
-        if not body or looks_like_login_wall(body) or _partial_result(url, body):
+        if (
+            not body
+            or looks_like_login_wall(body)
+            or looks_like_forbidden_page(body)
+            or _partial_result(url, body)
+        ):
             return
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
