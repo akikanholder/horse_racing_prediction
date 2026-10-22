@@ -1,6 +1,7 @@
 """Historical flat races: final odds, payouts, and the full finish order."""
 
 import json
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 import requests
 from fastapi.testclient import TestClient
 
+import backend.scrapers.page_cache as page_cache
 from backend.cli import main as cli_main
 from backend.main import app
 from backend.models.odds import RaceOdds
@@ -538,6 +540,106 @@ def test_page_cache_skips_a_second_fetch_and_keeps_fetched_at(tmp_path: Path):
     assert calls == [url]
     stamped = client.cached_fetched_at("GET", url, {"race_id": RACE_ID})
     assert stamped is not None
+
+
+def test_cache_read_does_not_reparse_result_html(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    full = _load("netkeiba_race_result.html")
+    partial = _load("netkeiba_race_result_top5.html")
+    url = "https://race.netkeiba.com/race/result.html"
+    params = {"race_id": RACE_ID}
+    parses: list[str] = []
+    original = page_cache.result_html_is_partial
+
+    def counted(html: str) -> bool:
+        parses.append("cached" if html == partial else "other")
+        return original(html)
+
+    monkeypatch.setattr(page_cache, "result_html_is_partial", counted)
+
+    class _Transport:
+        def __init__(self, body: str):
+            self.body = body
+            self.calls = 0
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls += 1
+            return self.body
+
+    transport = _Transport(full)
+    client = CachingHTTPClient(tmp_path, transport=transport, min_request_interval=0)
+    assert client.get(url, params=params) == full
+    stored = len(parses)
+    assert stored == 2
+    client.get(url, params=params)
+    client.get(url, params=params)
+    assert len(parses) == stored + 1
+    assert transport.calls == 1
+
+    fresh = CachingHTTPClient(tmp_path, transport=_Transport("unused"), min_request_interval=0)
+    assert fresh.get(url, params=params) == full
+    assert fresh.get(url, params=params) == full
+    assert len(parses) == stored + 2
+
+    key = client._cache_key("GET", url, params, None)
+    path = client._path(key)
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    assert legacy["replayable"] is True
+    legacy.pop("replayable")
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    parses.clear()
+    replay = CachingHTTPClient(
+        tmp_path, transport=_Transport("should-not-fetch"), min_request_interval=0
+    )
+    assert replay.get(url, params=params) == full
+    assert replay.get(url, params=params) == full
+    assert parses == ["other"]
+
+    fetched = partial.replace("イチ", "別馬", 1)
+    seeded = {
+        "url": url,
+        "fetched_at": "2026-10-18T07:00:00",
+        "body": partial,
+    }
+    path.write_text(json.dumps(seeded, ensure_ascii=False), encoding="utf-8")
+    parses.clear()
+    refused = _Transport(fetched)
+    reader = CachingHTTPClient(tmp_path, transport=refused, min_request_interval=0)
+    assert reader.get(url, params=params) == fetched
+    assert reader.get(url, params=params) == fetched
+    assert refused.calls == 2
+    assert parses.count("cached") == 1
+
+    path.write_text(
+        json.dumps(
+            {"url": url, "fetched_at": "2026-10-18T12:00:00", "body": full}, ensure_ascii=False
+        ),
+        encoding="utf-8",
+    )
+    parses.clear()
+    assert reader.get(url, params=params) == full
+    assert refused.calls == 2
+    assert parses == ["other"]
+
+    path.write_text(
+        json.dumps(
+            {
+                "url": url,
+                "fetched_at": "2026-10-18T08:00:00",
+                "replayable": True,
+                "body": partial,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    parses.clear()
+    marked = _Transport(full)
+    checker = CachingHTTPClient(tmp_path, transport=marked, min_request_interval=0)
+    assert checker.get(url, params=params) == full
+    assert checker.get(url, params=params) == full
+    assert marked.calls == 1
+    assert parses.count("cached") == 1
 
 
 def test_partial_result_html_is_not_cached(tmp_path: Path):

@@ -267,7 +267,7 @@ python -m backend.cli result 202605030811 --json
 
 ヘッドレスは結果 URL で、`domcontentloaded` のあと着順表の行数が `N頭` 未満なら待ち、速報の5行ではないところまで待つ（15秒）。行数の比較は `rows.length < starters`。タイムアウトはその短い HTML をパースし、`complete: false` のまま返す。もう一度取りにはいかない。401/403 はこの待ちの前に止め、再試行しない。
 
-速報の `FirstDisplay` だけの `result.html`（`Table_Show_All` が無い、または走った頭数が `N頭` より短い）はページキャッシュに入れない。入れたあとに同じ URL を読んでも、その短い表は返さない。着順表の無い未確定ページは今までどおりキャッシュしてよい。`Table_Show_All` の無い5行だけの表は、本当の5頭立てと速報が同じ印字なので `complete: false` のままにする。普通の `HorseList` の5頭立ては complete。
+速報の `FirstDisplay` だけの `result.html`（`Table_Show_All` が無い、または走った頭数が `N頭` より短い）はページキャッシュに入れない。入れたあとに同じ URL を読んでも、その短い表は返さない。着順表の無い未確定ページと、`result_phase` が `provisional` のページも保存しない。すでに保存されていても再生しない。`Table_Show_All` の無い5行だけの表は、本当の5頭立てと速報が同じ印字なので `complete: false` のままにする。普通の `HorseList` の5頭立ては complete。
 
 `--wait-complete`（API は `wait_complete=true`）は `complete` になるまで同じ結果ページを取り直す。`--retry-interval` の既定は 60 秒で、それより短い指定は 60 秒に上げる。`--max-wait` の既定は 600 秒。どちらも 0 以上の有限値だけ受け付ける。`nan` と `inf` と負数は CLI が拒否し、API は 422。次の間隔が上限を超えるときは待たず、その時点の結果を返す。待ちを止めるのは取得側の `http_status`（401 / 403）か `login_required` で、警告文に `403` という数字があるだけでは止めない。払戻が `403円` や `1403円` でも待ちは続く。公式払戻の取得そのものが HTTP 403 のときは `http_status: 403` と `JRA payout returned 403` で、待たずに止める。既定の `result` は1回だけ取る。
 
@@ -550,7 +550,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 単勝の確定オッズと、単勝・ワイド・馬連・三連複の払戻が揃えばバックテストに足りる。組み合わせの確定オッズはページにあるときだけ。
 
-日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、確定かつ complete の `result.html` は開き直さない。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。403 とログイン画面はキャッシュしない。
+日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残し、確定かつ complete の `result.html` は開き直さない。保存時に `replayable` を付ける。結果以外のページは、その印があるとき本文をパースし直さない。`result.html` は印があっても本文を見る。判断はパスと mtime ごとに一度。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。403 とログイン画面はキャッシュしない。
 
 結果ページが `race result returned 403` または `race result requires login` のとき、そのレースのオッズも、それより後のレースも開かない。同じ実行ではその URL を再試行しない。User-Agent の差し替え、captcha、ログインはしない。開催一覧が 403 またはログイン画面のときは、その日以降の一覧を開かない。すでに並んだレースだけ取り、`warning` は `race list returned 403` または `race list requires login`。JRA のオッズだけが 403 のときは、そのレースの netkeiba に一度だけ進み、日付範囲は止めない。JRA の次のページは開かない。
 
@@ -866,7 +866,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 `http_status` と `login_required` は馬場ページの取得が HTTP 401 / 403 またはログイン画面で止まったときだけ付く。本文に `403` という数字があっても付けない。JRA が 403 のとき、このフラグが付いた JRA の値は null のまま、同じ場の netkeiba 公開ページへ戻る。その netkeiba のページに測定時刻が無ければ `stale` は null。`stale` が null なことは待ちの理由にしない。
 
-`measured_at` はページに印字された測定時刻（Asia/Tokyo の ISO、例 `2026-10-16T12:00:00+09:00`）。クッション値・含水率・ページ見出しのうち最も新しい印字。年が印字に無いときは null。`fetched_at` からは作らない。`発走` の時刻に加え、`発表予定` など発表・予定と印字された時刻も測定時刻にしない。各クッション値・含水率は自分の `measured_at` と `source` と `fetched_at` を持つ。`is_today` は測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null。`stale` は測定日がレース日と違うとき true。レース日は `--date`（`YYYYMMDD` または `YYYY-MM-DD`）。省略したときは今日。日付として読めない文字列は `stale` を null のまま `track race date was not a date`。馬場ページに印字された別の日をレース日には使わない。netkeiba の開催日は、選択中のタブの `kaisai_date` を優先する。`script` や `style` の中の日付（例 `2026/04/02`）は開催日にしない。
+`measured_at` はページに印字された測定時刻（Asia/Tokyo の ISO、例 `2026-10-16T12:00:00+09:00`）。JRA では馬場状態・クッション値・含水率の各節のうち最も新しい印字。週間情報の時刻（`10月18日（日曜） 8時現在` など）は測定にしない。年が印字に無いときは null。`fetched_at` からは作らない。`発走` の時刻に加え、`発表予定` など発表・予定と印字された時刻も測定時刻にしない。除外はその時刻と同じ行の全体を見る。`15時40分 ブラジルC 発走` のように行の後ろにある `発走` も測定にしない。前の行や次の行の `発表予定` は別の行の測定を消さない。分の無い `8時現在` は `08:00`、`8時半` は `08:30`、`正午現在` は `12:00`（Asia/Tokyo）。同じ行の `発走`・`発表`・`予定` は、分の無い時刻でも測定にしない。各クッション値・含水率は自分の `measured_at` と `source` と `fetched_at` を持つ。`is_today` は測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null。`stale` は測定日がレース日と違うとき true。レース日は `--date`（`YYYYMMDD` または `YYYY-MM-DD`）。省略したときは今日。日付として読めない文字列は `stale` を null のまま `track race date was not a date`。馬場ページに印字された別の日をレース日には使わない。netkeiba の開催日は、選択中のタブの `kaisai_date` を優先する。`script` や `style` の中の日付（例 `2026/04/02`）は開催日にしない。
 
 測定日がレース日でないときは `warning` に `track measurement is not the race date: YYYY-MM-DD`。応答ヘッダ（`x-cache` / `x-cache-status` / `cf-cache-status` / `x-akamai-cache`）が `HIT` のときは `track response was a cached copy`。`Age` だけでは HIT にしない。数値は HIT の本文のまま返す。
 

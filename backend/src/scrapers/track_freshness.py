@@ -32,11 +32,18 @@ FRESH_REQUEST_HEADERS = {
     "Pragma": "no-cache",
 }
 
+# 「8時現在」 is 8:00, 「8時半」 is 8:30, and 「正午現在」 is 12:00.
+# A colon clock still needs minutes, matching 「15:00」.
 _STAMP = re.compile(
-    r"(?:(\d{4})\s*年\s*)?"
-    r"(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+    r"(?:(?P<year>\d{4})\s*年\s*)?"
+    r"(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日"
     r"(?:[^0-9\n]{0,16})"
-    r"(\d{1,2})\s*[時:：]\s*(\d{1,2})"
+    r"(?:"
+    r"(?P<hour>\d{1,2})\s*[時:：]\s*(?P<minute>\d{1,2})"
+    r"|(?P<hour_half>\d{1,2})\s*時\s*半"
+    r"|(?P<hour_only>\d{1,2})\s*時"
+    r"|(?P<noon>正午)"
+    r")"
 )
 # Cloudflare says ``HIT``. Akamai says ``TCP_HIT`` / ``TCP_MEM_HIT``. A letter
 # glued on either side (``HITS``, ``WHITE``) is not a cache status.
@@ -68,39 +75,64 @@ _FUTURE_CLOCK = ("発走", "発表", "予定")
 
 
 def measurement_times(text: str, year: int | None) -> list[datetime]:
-    """Clocks printed as ``M月D日 H時M分``. A 発走 or 発表予定 clock is not a measurement.
+    """Clocks printed as ``M月D日 H時M分``, ``H時半``, ``H時``, or ``正午``.
+
+    ``H時`` with no minutes is ``H:00``. ``H時半`` is ``H:30``. ``正午`` is
+    ``12:00``. A 発走 or 発表予定 clock is not a measurement. The whole line
+    is checked, so ``15時40分 ブラジルC 発走`` is not a measurement. A marker
+    on the previous or next line does not hide this line's clock.
 
     The year is the one printed in the same stamp, otherwise ``year``. A stamp
     with no year stays out of the list. Nothing is filled from the fetch time.
-    A future clock is one whose stamp, or the few characters beside it, says
-    発走, 発表, or 予定.
     """
     found: list[datetime] = []
     for match in _STAMP.finditer(text):
-        # The next line's 発表予定 must not erase the clock above it.
-        # Six characters after the minutes is the same window used for 発走.
-        head = text[max(0, match.start() - 8) : match.start()]
-        tail = text[match.end() : match.end() + 6]
-        around = head + match.group(0) + tail
-        if any(mark in around for mark in _FUTURE_CLOCK):
+        if _future_clock(text, match):
             continue
-        printed_year = int(match.group(1)) if match.group(1) else year
+        printed_year = int(match.group("year")) if match.group("year") else year
         if printed_year is None:
             continue
+        hour, minute = _clock_hm(match)
         try:
             found.append(
                 datetime(
                     printed_year,
-                    int(match.group(2)),
-                    int(match.group(3)),
-                    int(match.group(4)),
-                    int(match.group(5)),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                    hour,
+                    minute,
                     tzinfo=TOKYO,
                 )
             )
         except ValueError:
             continue
     return found
+
+
+def _clock_hm(match: re.Match[str]) -> tuple[int, int]:
+    """Hour and minute. A bare ``H時`` is ``H:00``. ``H時半`` is ``H:30``."""
+    minute = match.group("minute")
+    if match.group("hour") is not None and minute is not None:
+        return int(match.group("hour")), int(minute)
+    if match.group("hour_half") is not None:
+        return int(match.group("hour_half")), 30
+    if match.group("hour_only") is not None:
+        return int(match.group("hour_only")), 0
+    return 12, 0
+
+
+def _future_clock(text: str, match: re.Match[str]) -> bool:
+    """True when 発走, 発表, or 予定 sits anywhere on this stamp's line.
+
+    The next line's 発表予定, and the previous line's, do not count.
+    """
+    start, end = match.start(), match.end()
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    return any(mark in line for mark in _FUTURE_CLOCK)
 
 
 def page_measurement_time(text: str, year: int | None) -> datetime | None:

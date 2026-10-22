@@ -17,7 +17,7 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from backend.scrapers.netkeiba_scraper import result_html_is_final
+from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
 from backend.utils.date_utils import tokyo_now
@@ -35,11 +35,14 @@ _RACE_LIST_URLS = (
 def _result_replayable(url: str, body: str) -> bool:
     """A result page is replayable only when it is confirmed and complete.
 
-    Flash, a short order, an unsettled page, and a provisional label are not.
-    Other URLs are replayable here; the live-list and track checks are separate.
+    A flash or short table fails first. An unsettled page and a provisional
+    label fail the finality check. Other URLs are replayable here; the
+    live-list and track checks are separate.
     """
     if "result.html" not in url:
         return True
+    if result_html_is_partial(body):
+        return False
     return result_html_is_final(body)
 
 
@@ -93,6 +96,8 @@ class CachingHTTPClient(HTTPClient):
         super().__init__(min_request_interval=min_request_interval)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_page_cache_dir()
         self._transport = transport
+        # Legacy files have no replayable mark. Remember the judgement per path and mtime.
+        self._replay_cache: dict[str, tuple[int, bool]] = {}
 
     def cached_fetched_at(
         self,
@@ -101,7 +106,7 @@ class CachingHTTPClient(HTTPClient):
         params: dict | None = None,
         data: dict | None = None,
     ) -> datetime | None:
-        """When this URL was fetched. None when it is not on disk."""
+        """When this URL was fetched. None when it is not a replayable page."""
         if should_bypass_page_cache(url, params) or live_race_list(url, params):
             return None
         path = self._path(self._cache_key(method, url, params, data))
@@ -109,7 +114,9 @@ class CachingHTTPClient(HTTPClient):
         if payload is None:
             return None
         body = payload.get("body")
-        if not isinstance(body, str) or not _result_replayable(url, body):
+        if not isinstance(body, str) or not body:
+            return None
+        if not self._replayable(path, url, payload, body):
             return None
         raw = payload.get("fetched_at")
         if not isinstance(raw, str):
@@ -184,11 +191,53 @@ class CachingHTTPClient(HTTPClient):
         return not should_bypass_page_cache(url, params) and not live_race_list(url, params)
 
     def _cached_body(self, key: str, url: str) -> str | None:
-        """A stored body. A non-final result page is not replayed."""
-        body = self._body(key)
-        if body is None or not _result_replayable(url, body):
+        """A stored body. A non-final result page is not replayed.
+
+        A non-result page this client stored is marked replayable, so a later
+        read does not parse it. ``result.html`` is judged from the body, once
+        per path and mtime, even when that mark is set. The body must be
+        confirmed and complete.
+        """
+        path = self._path(key)
+        payload = self._load(path)
+        if payload is None:
+            return None
+        body = payload.get("body")
+        if not isinstance(body, str) or not body:
+            return None
+        if not self._replayable(path, url, payload, body):
             return None
         return body
+
+    def _replayable(self, path: Path, url: str, payload: dict[str, object], body: str) -> bool:
+        """False when a result page is not confirmed and complete.
+
+        A non-result page with a replayable mark is kept without parsing.
+        ``result.html`` is always judged from the body, mark or not.
+        """
+        marked = payload.get("replayable")
+        if "result.html" not in url and isinstance(marked, bool):
+            return marked
+        return self._body_is_complete(path, url, body)
+
+    def _body_is_complete(self, path: Path, url: str, body: str) -> bool:
+        """True when this file may be replayed.
+
+        A result page must be confirmed and complete. That rejects a flash,
+        a short order, an unsettled page, and a provisional label. The
+        judgement is remembered for the path and mtime. A new write changes
+        the mtime, so the next read checks the new body.
+        """
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return _result_replayable(url, body)
+        cached = self._replay_cache.get(str(path))
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        ok = _result_replayable(url, body)
+        self._replay_cache[str(path)] = (mtime, ok)
+        return ok
 
     def _store(self, key: str, url: str, body: str) -> None:
         if not body or looks_like_login_wall(body) or not _result_replayable(url, body):
@@ -198,18 +247,11 @@ class CachingHTTPClient(HTTPClient):
         payload = {
             "url": url,
             "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "replayable": True,
             "body": body,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-    def _body(self, key: str) -> str | None:
-        payload = self._load(self._path(key))
-        if payload is None:
-            return None
-        body = payload.get("body")
-        if not isinstance(body, str) or not body:
-            return None
-        return body
+        self._replay_cache.pop(str(path), None)
 
     def _load(self, path: Path) -> dict[str, object] | None:
         if not path.is_file():
