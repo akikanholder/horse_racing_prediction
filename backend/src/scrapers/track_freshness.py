@@ -80,11 +80,13 @@ _TIME_TOKEN = re.compile(
     r"|正午"
 )
 # A label that introduces the next clock on the line. A bare 発走 stays with
-# the earlier clock (「15時40分 ブラジルC 発走」).
+# the earlier clock (「15時40分 ブラジルC 発走」). 「発走は15時40分」 points
+# at the following clock, so the earlier measurement stays.
 _NEXT_LABEL = re.compile(
     r"(?:[（(]\s*(?:次回\s*)?(?:発表予定|発表|予定|発走)"
     r"|次回\s*(?:発表予定|発表|予定|発走)"
-    r"|(?:発表予定|発表|予定))"
+    r"|(?:発表予定|発表|予定)"
+    r"|発走\s*[は:：](?:\s*\d{4}\s*年)?(?:\s*\d{1,2}\s*月\s*\d{1,2}\s*日)?)"
     r"\s*$"
 )
 
@@ -96,8 +98,10 @@ def measurement_times(text: str, year: int | None) -> list[datetime]:
     ``12:00``. A 発走 or 発表予定 clock is not a measurement. Only the text
     that belongs to that clock is checked: the span up to the next clock on
     the line, or the line end when there is no next clock. ``7時00分 測定
-    （次回発表 12時）`` keeps 07:00. ``15時40分 ブラジルC 発走`` does not. A
-    marker on the previous or next line does not hide this line's clock.
+    （次回発表 12時）`` keeps 07:00. ``5時30分 測定 発走は15時40分`` keeps
+    05:30, because 発走は names the following clock. ``15時40分 ブラジルC
+    発走`` does not. A marker on the previous or next line does not hide this
+    line's clock.
 
     The year is the one printed in the same stamp, otherwise ``year``. A stamp
     with no year stays out of the list. Nothing is filled from the fetch time.
@@ -143,7 +147,8 @@ def _future_clock(text: str, match: re.Match[str]) -> bool:
 
     The next line's 発表予定, and the previous line's, do not count. On one
     line, 「7時00分 測定（次回発表 12時）」 keeps 07:00: 発表 introduces 12時.
-    「15時40分 ブラジルC 発走」 does not keep 15:40.
+    「5時30分 測定 発走は15時40分」 keeps 05:30. 「15時40分 ブラジルC 発走」
+    does not keep 15:40.
     """
     owned = _clock_text(text, match)
     return any(mark in owned for mark in _FUTURE_CLOCK)
@@ -153,9 +158,10 @@ def _clock_text(text: str, match: re.Match[str]) -> str:
     """Text that labels this clock, not the next clock on the line.
 
     The span after this clock belongs to it until the next clock, except a
-    trailing 発表 / 予定 label, which belongs to that next clock. The span
-    before the first clock on the line belongs to the first clock, so
-    「発表予定 10月18日 8時」 is still excluded.
+    trailing 発表 / 予定 label or 「発走は」, which belongs to that next clock.
+    A bare 発走 stays with this clock. The span before the first clock on the
+    line belongs to the first clock, so 「発表予定 10月18日 8時」 is still
+    excluded.
     """
     start, end = match.start(), match.end()
     line_start = text.rfind("\n", 0, start) + 1

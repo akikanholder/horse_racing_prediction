@@ -26,7 +26,12 @@ from backend.models.track import (
 )
 from backend.scrapers.base_scraper import BaseScraper
 from backend.scrapers.jra_headless import HeadlessTransport
-from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
+from backend.scrapers.page_fallback import (
+    FetchedBody,
+    PageFallback,
+    looks_like_forbidden_page,
+    looks_like_login_wall,
+)
 from backend.scrapers.track_freshness import (
     CACHED_COPY,
     FRESH_REQUEST_HEADERS,
@@ -61,9 +66,9 @@ _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
 _MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
 _SECTION_STOPS = ("使用コース", "芝コースの様子", "芝の状態")
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
-_UNLISTED_HEADING = re.compile(
-    r"^[\u4e00-\u9fff々]{2,12}(?:情報|の様子|の状態)"
-)
+_HEADING_LEVEL = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+# A plain-text section name is the same level as the live page's h2 header.
+_TEXT_SECTION_LEVEL = 2
 CUSHION_UNDATED = "cushion reading has no measurement time and is not current"
 MOISTURE_UNDATED = "moisture reading has no measurement time and is not current"
 _UNUSED_FETCHED_AT = datetime(1970, 1, 1)
@@ -73,31 +78,38 @@ def measurement_sections(text: str) -> dict[str, str]:
     """Text of the 馬場状態, cushion, and moisture sections.
 
     週間情報 is a weather note. Its clock, including ``8時現在``, is not a
-    track measurement. Any later heading ends the section, including one that
-    is not in the known list (``散水情報 10月18日 8時``). Clocks are collected
-    only from 馬場状態, クッション値, and 含水率.
+    track measurement. A heading element ends the section only when it is the
+    same level or higher than the heading that opened it. An ``h4`` such as
+    測定時刻 inside an ``h2`` stays in the section, and so does the dropdown
+    under it. A data cell that merely contains 計測情報 is not a heading.
+    Clocks are collected only from 馬場状態, クッション値, and 含水率.
     """
     buckets: dict[str, list[str]] = {}
     current: str | None = None
+    current_level = _TEXT_SECTION_LEVEL
     for line in text.splitlines():
-        heading = _section_heading(line)
-        if heading is not None:
-            current = heading
-            if heading not in _MEASUREMENT_SECTIONS:
+        opened = _section_heading(line)
+        if opened is not None:
+            name, level = opened
+            if current in _MEASUREMENT_SECTIONS and level > current_level:
+                buckets.setdefault(current, []).append(_section_visible(line))
+                continue
+            current = name
+            current_level = level
+            if name not in _MEASUREMENT_SECTIONS:
                 continue
         if current in _MEASUREMENT_SECTIONS:
-            cleaned = line[1:] if line.startswith("§") else line
-            buckets.setdefault(current, []).append(cleaned)
+            buckets.setdefault(current, []).append(_section_visible(line))
     return {name: "\n".join(lines) for name, lines in buckets.items()}
 
 
 def measurement_sections_from_soup(soup: BeautifulSoup) -> dict[str, str]:
-    """Section text from the document. An ``h1``–``h6`` is always a heading."""
+    """Section text from the document. Heading tags carry their level."""
     return measurement_sections("\n".join(_section_lines(soup)))
 
 
 def _section_lines(soup: BeautifulSoup) -> list[str]:
-    """Visible lines. A heading tag is one line, marked so any title ends a section."""
+    """Visible lines. A heading tag is one line, marked with its level."""
     lines: list[str] = []
     emitted: set[int] = set()
     for node in soup.find_all(string=True):
@@ -120,28 +132,47 @@ def _section_lines(soup: BeautifulSoup) -> list[str]:
             emitted.add(id(heading))
             title = heading.get_text(" ", strip=True)
             if title:
-                lines.append(f"§{title}")
+                level = _HEADING_LEVEL.get(str(heading.name), _TEXT_SECTION_LEVEL)
+                lines.append(f"§{level}\t{title}")
             continue
         lines.append(text)
     return lines
 
 
-def _section_heading(line: str) -> str | None:
-    """Section a line opens. A clock may share the line with its label.
+def _section_visible(line: str) -> str:
+    """Drop the heading marker. The title itself can still hold a clock."""
+    if line.startswith("§"):
+        _level, _sep, title = line.partition("\t")
+        return title if title else line[1:]
+    return line
 
-    A ``§`` prefix marks an HTML heading, so an unlisted title still ends the
-    previous section. Clocks are kept only for the three measurement sections.
+
+def _section_heading(line: str) -> tuple[str, int] | None:
+    """Section a line opens, and the heading level that opened it.
+
+    A ``§`` prefix marks an HTML heading element. An unlisted title at the
+    same level or higher still ends the previous section. A word in a data
+    row does not. Clocks are kept only for the three measurement sections.
     """
     raw = line.strip()
-    marked = raw.startswith("§")
-    compact = re.sub(r"\s+", "", raw[1:] if marked else raw)
+    if raw.startswith("§"):
+        level_text, _sep, title = raw[1:].partition("\t")
+        try:
+            level = int(level_text)
+        except ValueError:
+            level = _TEXT_SECTION_LEVEL
+            title = raw[1:]
+        compact = re.sub(r"\s+", "", title)
+        if not compact:
+            return None
+        named = _named_section(compact)
+        return (named if named is not None else "other", level)
+    compact = re.sub(r"\s+", "", raw)
     if not compact:
         return None
     named = _named_section(compact)
     if named is not None:
-        return named
-    if marked or _UNLISTED_HEADING.match(compact):
-        return "other"
+        return named, _TEXT_SECTION_LEVEL
     return None
 
 
@@ -413,6 +444,10 @@ class JRATrackScraper(BaseScraper):
             if looks_like_login_wall(html):
                 saw_login = True
                 logger.info("JRA baba requires login for %s", url)
+                return None
+            if looks_like_forbidden_page(html):
+                saw_403 = True
+                logger.info("JRA baba returned a denied or challenge page for %s", url)
                 return None
             pages.append((url, html))
             sources[url] = "headless" if self._transport.used_headless else "jra_html"

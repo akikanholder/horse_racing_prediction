@@ -96,11 +96,34 @@ def looks_like_login_wall(html: str) -> bool:
     return "ログイン" in label or "login" in label
 
 
-def looks_like_forbidden_page(html: str) -> bool:
-    """True when the document is a 403, access-denied, or captcha page.
+# Status phrasing, not a digit sequence. 「第403回」 and 「403万円」 are not denials.
+# Cloudflare's interstitial title is 「Just a moment...」. That is a challenge.
+_DENIAL_LABEL = re.compile(
+    r"just\s+a\s+moment"
+    r"|\baccess\s+denied\b"
+    r"|\b403\s*forbidden\b"
+    r"|\bcaptcha\b",
+    re.IGNORECASE,
+)
+_SHORT_DENIAL = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
 
-    A payout of 403円 in the body is not a refusal. The title and the first
-    heading are what name the page.
+
+def _denial_label(label: str) -> bool:
+    """True when this title, heading, or short body is a refusal or a challenge."""
+    compact = " ".join(label.split())
+    if not compact:
+        return False
+    if _DENIAL_LABEL.search(compact):
+        return True
+    return _SHORT_DENIAL.fullmatch(compact) is not None
+
+
+def looks_like_forbidden_page(html: str) -> bool:
+    """True when the document is a 403, access-denied, captcha, or challenge page.
+
+    A payout of 403円, a title 「第403回」, or 「403万円」 is not a refusal.
+    The title and the first heading name the page. Cloudflare 「Just a moment...」
+    is a challenge: callers stop and do not try another identity.
     """
     soup = BeautifulSoup(html or "", "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
@@ -108,15 +131,10 @@ def looks_like_forbidden_page(html: str) -> bool:
     h1 = soup.find("h1")
     if h1 is not None:
         heading = h1.get_text(" ", strip=True)
-    label = f"{title} {heading}".lower()
-    if any(token in label for token in ("403", "forbidden", "access denied", "captcha")):
+    if _denial_label(title) or _denial_label(heading):
         return True
-    text = soup.get_text(" ", strip=True).lower()
-    if len(text) <= 80 and any(
-        token in text for token in ("403 forbidden", "access denied", "just a moment")
-    ):
-        return True
-    return False
+    text = soup.get_text(" ", strip=True)
+    return len(text) <= 80 and _denial_label(text)
 
 
 def headless_browser_installed() -> bool:
@@ -162,29 +180,56 @@ RESULT_TABLE_READY_JS = """() => {
 }"""
 
 
-def await_page_ready(page: object, url: str) -> None:
-    """Wait for a full result table. Other URLs return immediately.
+# The baba page fills ``#cushion_list`` / ``#moist_list`` from its own script
+# after DOMContentLoaded. A timeout is that shell. The caller parses it and
+# does not fetch again.
+BABA_READING_WAIT_MS = 12_000
+BABA_READING_READY_JS = """() => {
+  const nodes = ['#cushion_list', '#moist_list']
+    .map((sel) => document.querySelector(sel))
+    .filter(Boolean);
+  if (!nodes.length) return true;
+  return nodes.every((el) => el.options && el.options.length > 0);
+}"""
 
-    A timeout is the page still showing the early rows. The caller parses
-    that document and reports it incomplete. This does not fetch again.
+
+def await_page_ready(page: object, url: str) -> None:
+    """Wait until the document has the reading the page itself fills in.
+
+    A result URL waits for the full finishing table. A baba URL waits for the
+    measurement dropdown. Anything else returns immediately. A timeout is the
+    page still short. The caller parses that document and does not fetch again.
     """
-    if "/race/result.html" not in url:
+    if "/race/result.html" in url:
+        script, timeout, note = (
+            RESULT_TABLE_READY_JS,
+            RESULT_TABLE_WAIT_MS,
+            "Result table was still short",
+        )
+    elif "/keiba/baba/" in url:
+        script, timeout, note = (
+            BABA_READING_READY_JS,
+            BABA_READING_WAIT_MS,
+            "Baba measurement dropdown was still empty",
+        )
+    else:
         return
     waiter = getattr(page, "wait_for_function", None)
     if not callable(waiter):
         return
     try:
-        waiter(RESULT_TABLE_READY_JS, timeout=RESULT_TABLE_WAIT_MS)
+        waiter(script, timeout=timeout)
     except Exception as exc:
-        logger.info("Result table was still short for %s: %s", url, exc)
+        logger.info("%s for %s: %s", note, url, exc)
 
 
 def render_headless(url: str) -> str:
     """Render ``url`` in a headless browser.
 
     Uses the browser's own user agent. A 401/403 response is not retried.
-    A race result page waits for the full finishing table before the HTML
-    is read. A live track page sends ``Cache-Control: no-cache``.
+    A race result page waits for the full finishing table. A baba page waits
+    for the measurement dropdown the page itself fills. A live track page
+    sends ``Cache-Control: no-cache``.
     """
     if not headless_browser_installed():
         raise HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
@@ -209,6 +254,8 @@ def render_headless(url: str) -> str:
             browser.close()
     if looks_like_login_wall(html):
         raise AccessBlocked(401, PAGE_LOGIN)
+    if looks_like_forbidden_page(html):
+        raise AccessBlocked(403, PAGE_FORBIDDEN)
     return html
 
 
@@ -340,6 +387,8 @@ class PageFallback:
 
         if looks_like_login_wall(html):
             return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN))
+        if looks_like_forbidden_page(html):
+            return blocked_fetch(self.site, AccessBlocked(403, PAGE_FORBIDDEN))
 
         page_url = _with_query(url, params)
         first_source = document_source or f"{self.site}_html"
@@ -378,6 +427,8 @@ class PageFallback:
                 continue
             if looks_like_login_wall(body):
                 return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN), pages)
+            if looks_like_forbidden_page(body):
+                return blocked_fetch(self.site, AccessBlocked(403, PAGE_FORBIDDEN), pages)
             fragment_source = f"{self.site}_js"
             if document_source == "headless" and getattr(self.http_client, "used_headless", False):
                 fragment_source = "headless"

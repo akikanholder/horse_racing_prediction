@@ -522,6 +522,142 @@ def test_headless_dated_moisture_replaces_undated_static_numbers():
     assert JRATrackScraper.MOISTURE_UNDATED not in (info.warning or "")
 
 
+def test_headless_subheading_clock_replaces_undated_static_moisture():
+    """An h4 測定時刻 stays inside 含水率, so the rendered reading wins."""
+    page = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>クッション値</h2>
+        <div class="content" id="cushion_num"><p><strong>9.6</strong></p></div>
+        <p>10月18日 7時00分</p>
+        <h2>含水率</h2>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>14.0</td><td>12.7</td></tr>
+          <tr><td>ダート</td><td>2.1</td><td>2.2</td></tr>
+          <tr><td>計測情報</td><td>参考</td><td></td></tr>
+        </table>
+        <script src="/keiba/baba/_js/baba2025.js"></script>
+        """,
+    )
+    rendered = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>クッション値</h2>
+        <div class="content" id="cushion_num"><p><strong>9.6</strong></p></div>
+        <h4>測定時刻</h4>
+        <select><option>10月18日 7時00分</option></select>
+        <h2>含水率</h2>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>14.7</td><td>12.3</td></tr>
+          <tr><td>ダート</td><td>1.7</td><td>1.5</td></tr>
+          <tr><td>計測情報</td><td>参考</td><td></td></tr>
+        </table>
+        <h4>測定時刻</h4>
+        <select><option>10月18日 5時30分</option></select>
+        <h2>散水情報</h2>
+        <p>10月18日 8時</p>
+        """,
+    )
+    seen: list[str] = []
+
+    def render(url: str) -> str:
+        seen.append(url)
+        return rendered
+
+    client = _Gets(
+        gets={
+            BABA_TOKYO: page,
+            BABA_KYOTO: _baba("京都"),
+            BABA_JS: BABA_SCRIPT,
+            MOIST_URL: "<div id='rcA' title='東京'></div>",
+        }
+    )
+    info = JRATrackScraper(http_client=client, headless_render=render).scrape(  # type: ignore[arg-type]
+        "tokyo",
+        fetched_at=PINNED,
+        race_date=datetime(2026, 10, 18, tzinfo=TOKYO).date(),
+        today=datetime(2026, 10, 18, tzinfo=TOKYO).date(),
+    )
+    assert seen == [BABA_TOKYO]
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.measured_at == datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    assert info.turf.moisture is not None
+    assert info.turf.moisture.goal_front == 14.7
+    assert info.turf.moisture.fourth_corner == 12.3
+    assert info.turf.moisture.measured_at == datetime(2026, 10, 18, 5, 30, tzinfo=TOKYO)
+    assert info.turf.moisture.source == "headless"
+    assert info.turf.moisture.fetched_at == PINNED
+    assert info.dirt is not None and info.dirt.moisture is not None
+    assert info.dirt.moisture.goal_front == 1.7
+    assert info.dirt.moisture.fourth_corner == 1.5
+    assert info.dirt.moisture.measured_at == datetime(2026, 10, 18, 5, 30, tzinfo=TOKYO)
+    assert info.measured_at == datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    assert info.stale is False
+    assert JRATrackScraper.MOISTURE_UNDATED not in (info.warning or "")
+
+
+def test_empty_moist_file_keeps_rendered_page_readings():
+    """A rendered index with an h4 測定時刻 replaces undated static 14.0."""
+    rendered = (
+        Path(__file__).parent / "fixtures" / "jra_baba_rendered_index.html"
+    ).read_text(encoding="utf-8")
+    page = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>クッション値</h2>
+        <div class="content" id="cushion_num"><p><strong>9.6</strong></p></div>
+        <p>10月18日 7時00分</p>
+        <h2>含水率</h2>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>14.0</td><td>12.7</td></tr>
+          <tr><td>ダート</td><td>2.1</td><td>2.2</td></tr>
+        </table>
+        <script src="/keiba/baba/_js/baba2025.js"></script>
+        """,
+    )
+    seen: list[str] = []
+
+    def render(url: str) -> str:
+        seen.append(url)
+        return rendered
+
+    client = _Gets(
+        gets={
+            BABA_TOKYO: page,
+            BABA_KYOTO: _baba("京都"),
+            BABA_JS: BABA_SCRIPT,
+            MOIST_URL: "<div id='rcA' title='東京'></div>",
+        }
+    )
+    info = JRATrackScraper(http_client=client, headless_render=render).scrape(  # type: ignore[arg-type]
+        "tokyo",
+        fetched_at=PINNED,
+        race_date=datetime(2026, 10, 18, tzinfo=TOKYO).date(),
+        today=datetime(2026, 10, 18, tzinfo=TOKYO).date(),
+    )
+    assert seen == [BABA_TOKYO]
+    assert info.turf is not None and info.turf.moisture is not None
+    assert info.turf.moisture.goal_front == 14.7
+    assert info.turf.moisture.fourth_corner == 12.3
+    assert info.turf.moisture.measured_at == datetime(2026, 10, 18, 5, 30, tzinfo=TOKYO)
+    assert info.turf.moisture.source == "headless"
+    assert info.dirt is not None and info.dirt.moisture is not None
+    assert info.dirt.moisture.goal_front == 1.7
+    assert info.dirt.moisture.fourth_corner == 1.5
+    assert info.turf.cushion is not None
+    assert info.turf.cushion.value == 9.2
+    assert info.turf.cushion.measured_at == datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    assert info.turf.cushion.source == "headless"
+    assert info.measured_at == datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    assert info.stale is False
+
+
 def test_moist_fragment_403_stops_before_headless():
     page = _baba(
         "東京",

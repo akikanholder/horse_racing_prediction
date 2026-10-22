@@ -1,9 +1,11 @@
 """Local cache and a pause between public-page requests.
 
 Date ranges call sites one request at a time. A cached page is not fetched
-again. HTTP 403 and a login wall are not stored. A stored login wall or 403
-page is not replayed either. This client does not change the User-Agent or
-send credentials.
+again. HTTP 403, a login wall, and a challenge page are not stored. A legacy
+file with no replayable mark is checked again on read, so an old denial is
+not replayed. A file this client marked replayable was checked at write time
+and is not parsed again. This client does not change the User-Agent or send
+credentials.
 """
 
 from __future__ import annotations
@@ -23,10 +25,21 @@ logger = logging.getLogger(__name__)
 
 
 def _refused_cache_body(body: object) -> bool:
-    """True when a stored body is a login wall or a 403 page and must not be replayed."""
+    """True when a stored body is a login wall, a 403 page, or a challenge."""
     if not isinstance(body, str) or not body:
         return False
     return looks_like_login_wall(body) or looks_like_forbidden_page(body)
+
+
+def _legacy_refused(payload: dict[str, object]) -> bool:
+    """Check a denial only when this file predates the replayable mark.
+
+    A marked file was accepted at write time. Parsing it again on every read
+    walks the whole document.
+    """
+    if isinstance(payload.get("replayable"), bool):
+        return False
+    return _refused_cache_body(payload.get("body"))
 
 
 def _partial_result(url: str, body: str) -> bool:
@@ -73,7 +86,7 @@ class CachingHTTPClient(HTTPClient):
         """When this URL was fetched. None when it is not on disk."""
         path = self._path(self._cache_key(method, url, params, data))
         payload = self._load(path)
-        if payload is None or _refused_cache_body(payload.get("body")):
+        if payload is None or _legacy_refused(payload):
             return None
         raw = payload.get("fetched_at")
         if not isinstance(raw, str):
@@ -156,7 +169,7 @@ class CachingHTTPClient(HTTPClient):
         body = payload.get("body")
         if not isinstance(body, str) or not body:
             return None
-        if looks_like_login_wall(body) or looks_like_forbidden_page(body):
+        if _legacy_refused(payload):
             return None
         if not self._replayable(path, url, payload, body):
             return None
