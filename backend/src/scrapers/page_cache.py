@@ -1,8 +1,11 @@
 """Local cache and a pause between public-page requests.
 
-Date ranges call sites one request at a time. A cached page is not fetched
-again. HTTP 403 and a login wall are not stored. This client does not change
-the User-Agent or send credentials.
+Date ranges call sites one request at a time. A cached final page is not
+fetched again. A ``result.html`` that is not confirmed and complete is not
+stored and is not replayed, including a copy left from an earlier run.
+A race list for today or a later day in Asia/Tokyo is not stored either.
+HTTP 403 and a login wall are not stored. This client does not change the
+User-Agent or send credentials.
 """
 
 from __future__ import annotations
@@ -10,24 +13,62 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-from backend.scrapers.netkeiba_scraper import result_html_is_partial
+from backend.scrapers.netkeiba_scraper import result_html_is_final
 from backend.scrapers.page_fallback import looks_like_login_wall
-from backend.scrapers.track_freshness import should_bypass_page_cache
+from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
+from backend.utils.date_utils import tokyo_now
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
 
+_RACE_LIST_URLS = (
+    "/top/race_list.html",
+    "race_list_get_date_list.html",
+    "race_list_sub.html",
+)
 
-def _partial_result(url: str, body: str) -> bool:
-    """A flash or short ``result.html`` must not be stored or replayed.
 
-    An unsettled page with no finish table is not partial. Caching that
-    empty page is unchanged.
+def _result_replayable(url: str, body: str) -> bool:
+    """A result page is replayable only when it is confirmed and complete.
+
+    Flash, a short order, an unsettled page, and a provisional label are not.
+    Other URLs are replayable here; the live-list and track checks are separate.
     """
-    return "result.html" in url and result_html_is_partial(body)
+    if "result.html" not in url:
+        return True
+    return result_html_is_final(body)
+
+
+def _kaisai_date_text(url: str, params: dict | None) -> str | None:
+    if params:
+        raw = params.get("kaisai_date")
+        if raw:
+            return str(raw)
+    values = parse_qs(urlparse(url).query).get("kaisai_date") or []
+    if values:
+        return str(values[0])
+    return None
+
+
+def live_race_list(url: str, params: dict | None = None, *, today: date | None = None) -> bool:
+    """True when this race list is for today or later in Asia/Tokyo.
+
+    An undated list is live. A past ``kaisai_date`` may stay cached.
+    """
+    if not any(marker in url for marker in _RACE_LIST_URLS):
+        return False
+    raw = _kaisai_date_text(url, params)
+    if raw is None:
+        return True
+    day, warning = parse_race_day(raw)
+    if day is None or warning:
+        return True
+    current = today or tokyo_now().date()
+    return day >= current
 
 
 def default_page_cache_dir() -> Path:
@@ -61,9 +102,14 @@ class CachingHTTPClient(HTTPClient):
         data: dict | None = None,
     ) -> datetime | None:
         """When this URL was fetched. None when it is not on disk."""
+        if should_bypass_page_cache(url, params) or live_race_list(url, params):
+            return None
         path = self._path(self._cache_key(method, url, params, data))
         payload = self._load(path)
         if payload is None:
+            return None
+        body = payload.get("body")
+        if not isinstance(body, str) or not _result_replayable(url, body):
             return None
         raw = payload.get("fetched_at")
         if not isinstance(raw, str):
@@ -81,12 +127,12 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("GET", url, params, None)
-        if not should_bypass_page_cache(url, params):
+        if self._may_read_cache(url, params):
             cached = self._cached_body(key, url)
             if cached is not None:
                 return cached
         body = self._fetch("get", url, params=params, data=None, headers=headers, encoding=encoding)
-        if not should_bypass_page_cache(url, params) and not _partial_result(url, body):
+        if self._may_read_cache(url, params) and _result_replayable(url, body):
             self._store(key, url, body)
         return body
 
@@ -98,12 +144,12 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("POST", url, None, data)
-        if not should_bypass_page_cache(url, data):
+        if self._may_read_cache(url, data):
             cached = self._cached_body(key, url)
             if cached is not None:
                 return cached
         body = self._fetch("post", url, params=None, data=data, headers=headers, encoding=encoding)
-        if not should_bypass_page_cache(url, data) and not _partial_result(url, body):
+        if self._may_read_cache(url, data) and _result_replayable(url, body):
             self._store(key, url, body)
         return body
 
@@ -132,15 +178,20 @@ class CachingHTTPClient(HTTPClient):
         self._last_request_time = datetime.now().timestamp()
         return body
 
+    @staticmethod
+    def _may_read_cache(url: str, params: dict | None) -> bool:
+        """False for a live track page or a race list for today or later."""
+        return not should_bypass_page_cache(url, params) and not live_race_list(url, params)
+
     def _cached_body(self, key: str, url: str) -> str | None:
-        """A stored body. A flash or short result table is not replayed."""
+        """A stored body. A non-final result page is not replayed."""
         body = self._body(key)
-        if body is None or _partial_result(url, body):
+        if body is None or not _result_replayable(url, body):
             return None
         return body
 
     def _store(self, key: str, url: str, body: str) -> None:
-        if not body or looks_like_login_wall(body) or _partial_result(url, body):
+        if not body or looks_like_login_wall(body) or not _result_replayable(url, body):
             return
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)

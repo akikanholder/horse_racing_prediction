@@ -66,6 +66,9 @@ DATE_RANGE_REQUIRED = "a date or date range is required"
 DATE_RANGE_IGNORED = "date range is ignored in recent meeting mode"
 AS_OF_IGNORED = "as_of applies only to recent meeting mode"
 HISTORICAL_START_WARNING = "historical races start in 2025"
+RESULT_NOT_COMPLETE = "race result is not complete"
+RACE_NOT_SETTLED = "race not yet settled"
+TODAY_CONFLICT = "today is the Asia/Tokyo meeting day and does not take another date"
 
 
 class TrendFilter(BaseModel):
@@ -79,7 +82,13 @@ class TrendFilter(BaseModel):
     date_from: date | None = Field(None, description="開始日。含む")
     date_to: date | None = Field(None, description="終了日。含む")
     recent_meeting: bool = Field(False, description="当日の確定と、同じ競馬場の前開催日だけ")
-    as_of: date | None = Field(None, description="recent meeting の当日。無ければ今日")
+    as_of: date | None = Field(
+        None, description="recent meeting の当日。無ければ今日（Asia/Tokyo）"
+    )
+    today: bool = Field(
+        False,
+        description="true のとき開催日は今日（Asia/Tokyo）の1日。date_from と date_to がその日",
+    )
 
 
 class TrendBucket(BaseModel):
@@ -169,6 +178,14 @@ class ExcludedRace(BaseModel):
     reason: str = Field(..., description="集計に入れなかった理由")
 
 
+class IncludedRace(BaseModel):
+    """One race that was counted. source and fetched_at are that race's own."""
+
+    race_id: str = Field(..., description="レースID")
+    source: str | None = Field(None, description="そのレースの source。無ければ null")
+    fetched_at: datetime = Field(..., description="そのレースの fetched_at")
+
+
 class RunnerOmission(BaseModel):
     """Runners inside included races that were left out of one table."""
 
@@ -198,7 +215,20 @@ class RaceTrendReport(BaseModel):
     )
     sample_size: int = Field(0, description="集計に入れたレース数")
     runner_sample_size: int = Field(0, description="集計に入れた出走馬数。取消・除外は含めない")
-    included_race_ids: list[str] = Field(default_factory=list, description="集計に入れたレースID")
+    included_races: list[IncludedRace] = Field(
+        default_factory=list,
+        description="集計に入れたレース。各行に race_id と source と fetched_at",
+    )
+    included_race_ids: list[str] = Field(
+        default_factory=list, description="included_races の race_id。同じ順"
+    )
+    races_pending: int = Field(
+        0,
+        description=(
+            "最終結果ではないレース数。result_phase が confirmed かつ complete が true "
+            "ではない。集計に入れず、着順は作らない"
+        ),
+    )
     excluded: list[ExcludedRace] = Field(
         default_factory=list, description="取ったが集計に入れなかったレースと理由"
     )
@@ -235,6 +265,15 @@ class RaceTrendReport(BaseModel):
     fetched_at_max: datetime | None = Field(None, description="入れたレースの最も新しい fetched_at")
     computed_at: datetime = Field(..., description="この集計を計算した時刻")
     warning: str | None = Field(None, description="集計全体の欠測。複数は ; でつなぐ")
+
+
+def pending_races_warning(count: int) -> str | None:
+    """Warning when races were left out because they are not final."""
+    if count <= 0:
+        return None
+    if count == 1:
+        return "1 race is not final and was left out"
+    return f"{count} races are not final and were left out"
 
 
 def running_style_definition() -> RunningStyleDefinition:

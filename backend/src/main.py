@@ -18,7 +18,7 @@ from backend.models.odds import RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
 from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
-from backend.scrapers.track_freshness import require_finite_seconds
+from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
@@ -241,10 +241,21 @@ async def export_race_history(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _meeting_day(value: str | None) -> date | None:
+    """``YYYYMMDD`` or ``YYYY-MM-DD``. An unreadable string is 400."""
+    if value is None or value == "":
+        return None
+    day, warning = parse_race_day(value.strip())
+    if day is None or warning:
+        raise HTTPException(status_code=400, detail="date was not YYYYMMDD or YYYY-MM-DD")
+    return day
+
+
 @app.get("/api/races/trends", response_model=RaceTrendReport, tags=["Races"])
 async def get_race_trends(
     on_date: Annotated[
-        date | None, Query(alias="date", description="その日だけ YYYY-MM-DD")
+        str | None,
+        Query(alias="date", description="その日だけ。YYYYMMDD または YYYY-MM-DD"),
     ] = None,
     date_from: Annotated[date | None, Query(description="開始日。含む")] = None,
     date_to: Annotated[date | None, Query(description="終了日。含む")] = None,
@@ -257,17 +268,30 @@ async def get_race_trends(
         bool,
         Query(description="当日の確定レースと、同じ競馬場の前開催日だけ"),
     ] = False,
-    as_of: Annotated[date | None, Query(description="recent meeting の当日。無ければ今日")] = None,
+    as_of: Annotated[
+        date | None, Query(description="recent meeting の当日。無ければ今日（Asia/Tokyo）")
+    ] = None,
+    today: Annotated[
+        bool,
+        Query(description="開催日は今日（Asia/Tokyo）の1日。ほかの日付と一緒には使えない"),
+    ] = False,
     fetch_mode: JraFetchMode = "html",
 ):
     """人気、馬番、枠、脚質、騎手、父の勝率と回収。
 
-    過去レースとローカルキャッシュから計算する。欠測は null と warning。
-    403 とログイン画面は再試行しない。
+    確定かつ complete のレースだけを数える。未確定は races_pending。
+    欠測は null と warning。403 とログイン画面は再試行しない。
+    未確定の result.html はキャッシュから返さない。
     """
     if not race_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    if not recent_meeting and on_date is None and date_from is None:
+    meeting_day = _meeting_day(on_date)
+    if today and (meeting_day or date_from or date_to or recent_meeting or as_of):
+        raise HTTPException(
+            status_code=400,
+            detail="today is the Asia/Tokyo meeting day and does not take another date",
+        )
+    if not today and not recent_meeting and meeting_day is None and date_from is None:
         raise HTTPException(status_code=400, detail="date or date_from is required")
     try:
         return race_service.get_race_trends(
@@ -276,11 +300,12 @@ async def get_race_trends(
             distance=distance,
             race_class=race_class,
             going=going,
-            on_date=on_date,
+            on_date=meeting_day,
             date_from=date_from,
             date_to=date_to,
             recent_meeting=recent_meeting,
             as_of=as_of,
+            today=today,
             **_mode_arg(fetch_mode),
         )
     except Exception as e:

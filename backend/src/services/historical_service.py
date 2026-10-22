@@ -158,8 +158,11 @@ class HistoricalService:
 
         A 403 or a login wall on the race list or the result page stops the
         range. That request is not retried, and later races are not opened.
-        Pages already stored in the cache are not requested again. ``resume_from``
-        loads earlier races from the cache only.
+        A confirmed and complete result page already stored in the cache is
+        not requested again. A result page that is not final is not a cache
+        hit, so a later run can read the settled page. ``resume_from`` loads
+        earlier races from the cache only. ``progress.json`` is written on
+        export and is not a cursor this method reads.
         """
         fetched_at = datetime.now()
         selected = _venue_filter(venues, priority_venues)
@@ -194,6 +197,8 @@ class HistoricalService:
                 warning=None if record.in_scope else record.warning,
             )
 
+        # The span is inclusive. ``date_to`` is the last meeting day, including
+        # today in Asia/Tokyo. There is no past-only cut.
         start, end, range_warning = _resolve_span(on_date, date_from, date_to)
         if start is None or end is None:
             return HistoricalBatch(
@@ -443,7 +448,11 @@ class HistoricalService:
         ), blocked
 
     def _result_cached(self, race_id: str) -> bool:
-        """True when the result page is already on disk. A 403 is not cached."""
+        """True when a final result page is already on disk.
+
+        A 403 is not cached. An unsettled, provisional, or incomplete
+        ``result.html`` is not a hit, so the next run fetches it again.
+        """
         client = self.http
         if client is None:
             candidate = getattr(self.netkeiba, "http_client", None)

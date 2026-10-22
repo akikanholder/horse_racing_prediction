@@ -1,7 +1,10 @@
-"""Load history, then aggregate trends. Pages already cached are not fetched again.
+"""Load history, then aggregate trends.
 
-A 403 or a login wall stops the walk. This service does not change the
-User-Agent, solve a captcha, or send credentials.
+A confirmed and complete result page that is already cached is not fetched
+again. A result page that is not final is not replayed, so a later run can
+pick up a race that settled during the day. A 403 or a login wall stops the
+walk. This service does not change the User-Agent, solve a captcha, or send
+credentials.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from backend.models.race_trends import (
     RECENT_MEETING_LOOKBACK_DAYS,
     RECENT_MEETING_NEEDS_VENUE,
     SIRE_NOT_LOADED,
+    TODAY_CONFLICT,
     ExcludedRace,
     FlatSurface,
     Going,
@@ -37,6 +41,7 @@ from backend.scrapers.page_fallback import AccessBlocked
 from backend.scrapers.runner_status import join_warnings
 from backend.services.historical_service import HistoricalService
 from backend.services.race_trend_aggregate import aggregate_race_trends
+from backend.utils.date_utils import tokyo_now
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +68,7 @@ class RaceTrendService:
         )
         self._list_races = list_races
         self._pedigree_lookup = pedigree_lookup
-        self._today = clock or date.today
+        self._today = clock or _tokyo_today
 
     def _list(self, day: date) -> Sequence[Race]:
         if self._list_races is not None:
@@ -99,12 +104,15 @@ class RaceTrendService:
         date_to: date | None = None,
         recent_meeting: bool = False,
         as_of: date | None = None,
+        today: bool = False,
         sires: Mapping[str, Pedigree] | None = None,
     ) -> RaceTrendReport:
         """Filter settled races and return the trend tables.
 
-        ``sires`` skips the pedigree fetch. Tests pass it. Production leaves
-        it empty so each horse id is read once from the existing pedigree code.
+        ``today`` is one meeting day, today in Asia/Tokyo. It does not take
+        another date. ``sires`` skips the pedigree fetch. Tests pass it.
+        Production leaves it empty so each horse id is read once from the
+        existing pedigree code.
         """
         computed_at = datetime.now()
         selected: list[str] = []
@@ -112,6 +120,14 @@ class RaceTrendService:
             text = _text(venue)
             if text is not None:
                 selected.append(text)
+        if today and (on_date or date_from or date_to or recent_meeting or as_of):
+            return _empty(
+                TrendFilter(venues=selected, today=True),
+                computed_at,
+                TODAY_CONFLICT,
+            )
+        if today:
+            on_date = self._today()
         filt = TrendFilter(
             venues=selected,
             surface=_surface(surface),
@@ -122,6 +138,7 @@ class RaceTrendService:
             date_to=on_date or date_to or date_from,
             recent_meeting=recent_meeting,
             as_of=as_of,
+            today=today,
         )
         invalid = _invalid_filter(surface, going)
         if invalid:
@@ -406,6 +423,11 @@ def _going(value: str | None) -> Going | None:
     if text in {"良", "稍重", "重", "不良"}:
         return text  # type: ignore[return-value]
     return None
+
+
+def _tokyo_today() -> date:
+    """The meeting day. The host clock is not used."""
+    return tokyo_now().date()
 
 
 def _text(value: str | None) -> str | None:

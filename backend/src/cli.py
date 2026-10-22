@@ -17,7 +17,7 @@ from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, 
 from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
-from backend.scrapers.track_freshness import require_finite_seconds
+from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -656,7 +656,11 @@ def cmd_history(args):
 def _cli_date(value: str | None) -> date | None:
     if not value:
         return None
-    return date.fromisoformat(value)
+    day, warning = parse_race_day(value.strip())
+    if day is None or warning:
+        print("日付は YYYYMMDD または YYYY-MM-DD で指定してください")
+        sys.exit(1)
+    return day
 
 
 def _default_history_dir() -> Path:
@@ -714,8 +718,13 @@ def _print_historical_race(race: HistoricalRace) -> None:
 
 def cmd_trends(args):
     """Win rate, top-2, top-3, and ROI over settled history."""
-    if not args.recent_meeting and not args.date and not args.date_from:
-        print("--date か --from か --recent-meeting を指定してください")
+    if args.today and (
+        args.date or args.date_from or args.date_to or args.recent_meeting or args.as_of
+    ):
+        print("--today は Asia/Tokyo のその日だけです。ほかの日付と一緒には使えません")
+        sys.exit(1)
+    if not args.today and not args.recent_meeting and not args.date and not args.date_from:
+        print("--today か --date か --from か --recent-meeting を指定してください")
         sys.exit(1)
     with _open_service(RaceService, args) as service:
         report = service.get_race_trends(
@@ -724,11 +733,12 @@ def cmd_trends(args):
             distance=args.distance,
             race_class=args.race_class,
             going=args.going,
-            on_date=_cli_date(args.date),
+            on_date=None if args.today else _cli_date(args.date),
             date_from=_cli_date(args.date_from),
             date_to=_cli_date(args.date_to),
             recent_meeting=args.recent_meeting,
             as_of=_cli_date(args.as_of),
+            today=args.today,
         )
     if args.json:
         print_json(report)
@@ -740,6 +750,13 @@ def _print_trends(report: RaceTrendReport) -> None:
     print("\n=== レース傾向（確定結果の集計。予想の入力ではない） ===")
     print(f"モード: {report.mode}")
     print(f"レース数: {report.sample_size}  出走: {report.runner_sample_size}")
+    if report.races_pending:
+        print(f"未確定: {report.races_pending}")
+    if report.included_races:
+        print("集計に入れたレース:")
+        for row in report.included_races:
+            fetched = row.fetched_at.isoformat(timespec="seconds")
+            print(f"  {row.race_id}  {row.source or 'ソースなし'}  {fetched}")
     if report.recent_meeting and report.recent_meeting.previous_meeting_date:
         print(
             f"当日: {report.recent_meeting.as_of}  "
@@ -989,9 +1006,13 @@ def main():
         ),
     )
     history_parser.add_argument("race_id", nargs="?", help="レースID")
-    history_parser.add_argument("--date", help="その日だけ。YYYY-MM-DD")
-    history_parser.add_argument("--from", dest="date_from", help="開始日 YYYY-MM-DD")
-    history_parser.add_argument("--to", dest="date_to", help="終了日 YYYY-MM-DD")
+    history_parser.add_argument("--date", help="その日だけ。YYYYMMDD または YYYY-MM-DD")
+    history_parser.add_argument(
+        "--from", dest="date_from", help="開始日。YYYYMMDD または YYYY-MM-DD"
+    )
+    history_parser.add_argument(
+        "--to", dest="date_to", help="終了日。含む。YYYYMMDD または YYYY-MM-DD"
+    )
     history_parser.add_argument(
         "--venue",
         action="append",
@@ -1039,13 +1060,26 @@ def main():
             "人気帯、馬番、枠、脚質、騎手、父。騎手と父は芝とダートを分けて出す。"
             "脚質は通過順の最初の数字と頭数の三等分。4コーナーは使わない。"
             "少ない標本も sample_size 付きで残す。計算できない値は null と warning。"
+            "入れるのは result_phase が confirmed かつ complete が true のレースだけ。"
+            "未確定は races_pending に数え、着順は作らない。"
             "403 とログイン画面は再試行せず、User-Agent の差し替えや captcha はしない。"
+            "--today は今日（Asia/Tokyo）の1日。--date もその開催日だけ。"
+            "未確定の result.html と、今日の開催一覧はキャッシュから返さない。"
             "--recent-meeting は当日の確定と、同じ競馬場の前開催日だけ。"
         ),
     )
-    trends_parser.add_argument("--date", help="その日だけ。YYYY-MM-DD")
-    trends_parser.add_argument("--from", dest="date_from", help="開始日 YYYY-MM-DD")
-    trends_parser.add_argument("--to", dest="date_to", help="終了日 YYYY-MM-DD")
+    trends_parser.add_argument(
+        "--today",
+        action="store_true",
+        help="開催日は今日（Asia/Tokyo）だけ。ほかの日付と一緒には使えない",
+    )
+    trends_parser.add_argument("--date", help="その日だけ。YYYYMMDD または YYYY-MM-DD")
+    trends_parser.add_argument(
+        "--from", dest="date_from", help="開始日。YYYYMMDD または YYYY-MM-DD"
+    )
+    trends_parser.add_argument(
+        "--to", dest="date_to", help="終了日。含む。YYYYMMDD または YYYY-MM-DD"
+    )
     trends_parser.add_argument("--venue", action="append", help="競馬場。繰り返す")
     trends_parser.add_argument("--surface", choices=["芝", "ダート"], help="芝またはダート")
     trends_parser.add_argument("--distance", type=int, help="距離 (m)")
@@ -1058,7 +1092,7 @@ def main():
     )
     trends_parser.add_argument(
         "--as-of",
-        help="recent meeting の当日。YYYY-MM-DD。無ければ今日",
+        help="recent meeting の当日。YYYYMMDD または YYYY-MM-DD。無ければ今日（Asia/Tokyo）",
     )
     trends_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     trends_parser.set_defaults(func=cmd_trends)

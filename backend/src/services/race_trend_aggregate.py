@@ -33,7 +33,9 @@ from backend.models.race_trends import (
     PLACE_ROI_PARTIAL,
     POPULARITY_BANDS,
     POPULARITY_MISSING,
+    RACE_NOT_SETTLED,
     RANK_MISSING,
+    RESULT_NOT_COMPLETE,
     RESULT_PHASE_MISSING,
     RESULT_PHASE_PROVISIONAL,
     SCRATCHED,
@@ -46,6 +48,7 @@ from backend.models.race_trends import (
     FlatSurface,
     FrameRow,
     GateRow,
+    IncludedRace,
     JockeySurfaceRow,
     PopularityBandRow,
     RaceTrendReport,
@@ -54,6 +57,7 @@ from backend.models.race_trends import (
     RunningStyleRow,
     SireSurfaceRow,
     TrendFilter,
+    pending_races_warning,
     running_style_definition,
 )
 from backend.models.running_style import (
@@ -156,6 +160,7 @@ def aggregate_race_trends(
     fetched_min = min(fetched) if fetched else None
     fetched_max = max(fetched) if fetched else None
     same_fetch = fetched_min is not None and fetched_min == fetched_max
+    pending = sum(1 for item in excluded if _is_pending(item.reason))
     notes = [
         batch_warning,
         None if recent_meeting is None else recent_meeting.warning,
@@ -163,6 +168,11 @@ def aggregate_race_trends(
         None
         if not included or _join_source(*(race.source for race in included))
         else ("source was not on the included races"),
+        pending_races_warning(pending),
+    ]
+    included_rows = [
+        IncludedRace(race_id=race.race_id, source=race.source, fetched_at=race.fetched_at)
+        for race in included
     ]
     return RaceTrendReport(
         mode="recent_meeting" if filt.recent_meeting else "range",
@@ -170,7 +180,9 @@ def aggregate_race_trends(
         recent_meeting=recent_meeting,
         sample_size=len(included),
         runner_sample_size=len(flat),
-        included_race_ids=[race.race_id for race in included],
+        included_races=included_rows,
+        included_race_ids=[row.race_id for row in included_rows],
+        races_pending=pending,
         excluded=excluded,
         history_skipped=history_skipped,
         runner_omissions=_omission_rows(omissions),
@@ -202,11 +214,9 @@ def _exclude_reason(race: HistoricalRace, filt: TrendFilter) -> str | None:
     missing = _missing_filter_field(race, filt)
     if missing:
         return missing
-    phase = race.result.result_phase
-    if phase == "provisional":
-        return RESULT_PHASE_PROVISIONAL
-    if phase != "confirmed":
-        return RESULT_PHASE_MISSING
+    finality = _finality_reason(race)
+    if finality is not None:
+        return finality
     starters = [row for row in race.result.results if _role(row) in {"ranked", "loss"}]
     if any(row.horse_number is None for row in starters):
         return GATE_MISSING
@@ -215,6 +225,40 @@ def _exclude_reason(race: HistoricalRace, filt: TrendFilter) -> str | None:
     if not race.odds_final or any(_win_odds(race, row.horse_number) is None for row in starters):
         return _final_odds_reason(race)
     return None
+
+
+def _finality_reason(race: HistoricalRace) -> str | None:
+    """Why this race is not final. None when it is confirmed and complete.
+
+    A missing phase, a provisional label, an unfinished order, and a page
+    that has not settled are not guessed into the rates.
+    """
+    phase = race.result.result_phase
+    if phase == "confirmed" and race.result.complete is True:
+        return None
+    warning = join_warnings(race.warning, race.result.warning) or ""
+    if RACE_NOT_SETTLED in warning:
+        return RACE_NOT_SETTLED
+    if phase == "provisional":
+        return RESULT_PHASE_PROVISIONAL
+    for piece in warning.split("; "):
+        if piece.startswith("race result incomplete"):
+            return piece
+    if phase != "confirmed":
+        return RESULT_PHASE_MISSING
+    return RESULT_NOT_COMPLETE
+
+
+def _is_pending(reason: str) -> bool:
+    """True when the race was left out because it is not a final result."""
+    if reason in {
+        RACE_NOT_SETTLED,
+        RESULT_PHASE_PROVISIONAL,
+        RESULT_PHASE_MISSING,
+        RESULT_NOT_COMPLETE,
+    }:
+        return True
+    return reason.startswith("race result incomplete")
 
 
 def _matches_filter(race: HistoricalRace, filt: TrendFilter) -> bool:
