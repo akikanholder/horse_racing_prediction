@@ -127,11 +127,11 @@ def _settled(
 def test_arima_kinen_finish_and_payouts_come_from_the_result_page():
     settled, client = _settled(_load("netkeiba_race_result.html"))
 
-    assert settled.warning == f"{RACE_RESULT_PHASE_UNKNOWN}; {JRA_PAYOUT_UNREACHABLE}"
+    assert settled.warning == JRA_PAYOUT_UNREACHABLE
     assert settled.payout_note is None
     assert settled.refunds is None
     assert settled.complete is True
-    assert settled.result_phase is None
+    assert settled.result_phase == "confirmed"
     assert settled.source == "netkeiba_html"
     assert settled.race_id == RACE_ID
     assert settled.race_name == "有馬記念"
@@ -395,9 +395,9 @@ def test_result_api_returns_the_settled_payload(monkeypatch):
     assert body["results"][0]["odds"] == 10.9
     assert body["payouts"][0]["bet_type"] == "単勝"
     assert body["payouts"][0]["payout"] == 1090
-    assert body["warning"] == f"{RACE_RESULT_PHASE_UNKNOWN}; {JRA_PAYOUT_UNREACHABLE}"
+    assert body["warning"] == JRA_PAYOUT_UNREACHABLE
     assert body["complete"] is True
-    assert body["result_phase"] is None
+    assert body["result_phase"] == "confirmed"
     assert body["results"][0]["source"] == "netkeiba_html"
     assert body["results"][0]["fetched_at"].startswith("2026-09-27T12:00:00")
     assert body["results"][-1]["status"] == "scratched"
@@ -823,7 +823,7 @@ def test_login_wall_stops_before_the_fallback():
 
 def test_jra_payout_mismatch_is_a_warning_and_does_not_replace_the_price():
     umaren = """<tr class="Umaren"><th>馬連</th>
-<td class="Result"><div><span>1-2</span></div></td>
+<td class="Result"><ul><li><span>1</span></li><li><span>2</span></li></ul></td>
 <td class="Payout"><span>300円</span></td>
 <td class="Ninki"><span>2人気</span></td></tr>"""
     html = _result_html(
@@ -842,10 +842,11 @@ def test_jra_payout_mismatch_is_a_warning_and_does_not_replace_the_price():
     assert settled.payouts[0].payout == 100
     assert settled.payouts[0].source == "netkeiba_html"
     assert settled.payouts[0].fetched_at == FETCHED_AT
-    assert settled.warning is not None
-    assert settled.warning.startswith(JRA_PAYOUT_MISMATCH)
-    assert "100円" in settled.warning
-    assert "200円" in settled.warning
+    assert settled.warning == (
+        f"{JRA_PAYOUT_MISMATCH}: netkeibaのみ: 単勝 1 100円 1人気; JRAのみ: 単勝 1 200円 1人気"
+    )
+    assert "馬連" not in settled.warning
+    assert "300円" not in settled.warning
     assert client.calls[-1]["params"]["cname"] == _JRA_CNAME
 
 
@@ -1360,8 +1361,13 @@ def test_tied_place_payouts_ignore_swapped_popularity_order():
     )
     assert JRA_PAYOUT_MISMATCH not in (settled.warning or "")
     assert settled.complete is True
+    by_combo = {payout.combination: payout.popularity for payout in settled.payouts}
+    assert by_combo == {"1": 2, "2": 1}
+    assert settled.payout_note is not None
+    assert "複勝 1 160円 netkeiba 1人気, JRA 2人気" in settled.payout_note
+    assert "複勝 2 160円 netkeiba 2人気, JRA 1人気" in settled.payout_note
 
-    disagreed = _result_html(
+    differed = _result_html(
         [_row("1", 1, "イチ")],
         heads=1,
         phase="確定",
@@ -1369,10 +1375,16 @@ def test_tied_place_payouts_ignore_swapped_popularity_order():
     )
     alone = _jra_ticket("複勝", "1", "160", "2")
     settled, _client = _settled(
-        disagreed,
+        differed,
         posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("160", tickets=alone)},
     )
-    assert JRA_PAYOUT_MISMATCH in (settled.warning or "")
+    assert JRA_PAYOUT_MISMATCH not in (settled.warning or "")
+    assert settled.payouts[0].payout == 160
+    assert settled.payouts[0].popularity == 2
+    assert settled.payouts[0].source == "netkeiba_html+jra_html"
+    assert settled.payouts[0].fetched_at == FETCHED_AT
+    assert settled.payout_note is not None
+    assert "JRA popularity: 複勝 1 160円 netkeiba 1人気, JRA 2人気" in settled.payout_note
 
 
 def test_unpinned_fetched_at_carries_the_tokyo_offset():
@@ -1466,6 +1478,215 @@ def test_pre_race_models_do_not_carry_result_fields():
     settlement_only = {"demoted", "complete", "result_phase", "refunds"}
     assert settlement_only.isdisjoint(RaceEntry.model_fields)
     assert {"status", "status_label", "source", "fetched_at"} <= set(RaceEntry.model_fields)
+
+
+_KYOTO_CNAME = "pw01hde10082026040720261018/82"
+_TOKYO_CNAME = "pw01hde10052026040720261018/A4"
+_NIIGATA_CNAME = "pw01hde10042026040220261018/1B"
+
+
+def _real_posts(block: str, cname: str) -> dict[str, str]:
+    return {
+        "pw01hli00/03": _load("jra_payout_index_20261018.html"),
+        cname: _load(block),
+    }
+
+
+def _ticket(settled, bet: str, combination: str):
+    return next(
+        payout
+        for payout in settled.payouts
+        if payout.bet_type == bet and payout.combination == combination
+    )
+
+
+def test_real_kyoto_place_popularity_follows_jra_and_is_not_a_mismatch():
+    """202608040709 複勝 2 is 140円 on both pages. 人気 is 3 on netkeiba and 4 on JRA."""
+    settled, _client = _settled(
+        _load("netkeiba_result_202608040709.html"),
+        "202608040709",
+        posts=_real_posts("jra_payout_202608040709.html", _KYOTO_CNAME),
+    )
+    place = _ticket(settled, "複勝", "2")
+    assert place.payout == 140
+    assert place.popularity == 4
+    assert place.source == "netkeiba_html+jra_html"
+    assert place.fetched_at == FETCHED_AT
+    assert _ticket(settled, "複勝", "3").popularity == 1
+    assert _ticket(settled, "複勝", "8").popularity == 2
+    assert _ticket(settled, "単勝", "3").popularity == 2
+    assert _ticket(settled, "単勝", "3").source == "netkeiba_html"
+    assert _ticket(settled, "単勝", "3").payout == 260
+    note = settled.payout_note or ""
+    popularity = note.split("JRA popularity:", 1)[-1]
+    assert "複勝 2 140円 netkeiba 3人気, JRA 4人気" in note
+    assert "複勝 3 110円 netkeiba 2人気, JRA 1人気" in note
+    assert "複勝 8 110円 netkeiba 1人気, JRA 2人気" in note
+    assert "単勝" not in popularity
+    assert "ワイド" not in popularity
+    assert "馬連" not in popularity
+    assert settled.warning is None
+    assert settled.result_phase == "confirmed"
+    assert settled.complete is True
+    assert settled.source == "netkeiba_html"
+    assert settled.fetched_at == FETCHED_AT
+    assert settled.refunds is not None
+    assert settled.refunds[0].horse_numbers == [7]
+    assert settled.refunds[0].source == "jra_html"
+    assert settled.refunds[0].fetched_at == FETCHED_AT
+    excluded = next(row for row in settled.results if row.horse_number == 7)
+    assert excluded.status == "excluded"
+    assert excluded.rank is None
+
+
+def test_real_tokyo_wide_popularity_follows_jra_and_lists_only_that_ticket():
+    """202605040709 ワイド 7-9 is 700円. 人気 is 9 on netkeiba and 12 on JRA."""
+    settled, _client = _settled(
+        _load("netkeiba_result_202605040709.html"),
+        "202605040709",
+        posts=_real_posts("jra_payout_202605040709.html", _TOKYO_CNAME),
+    )
+    wide = _ticket(settled, "ワイド", "7-9")
+    assert wide.payout == 700
+    assert wide.popularity == 12
+    assert wide.source == "netkeiba_html+jra_html"
+    assert wide.fetched_at == FETCHED_AT
+    assert _ticket(settled, "ワイド", "6-9").popularity == 1
+    assert _ticket(settled, "ワイド", "6-9").source == "netkeiba_html"
+    note = settled.payout_note or ""
+    assert note == "JRA popularity: ワイド 7-9 700円 netkeiba 9人気, JRA 12人気"
+    assert settled.warning is None
+    assert settled.result_phase == "confirmed"
+    assert settled.complete is True
+    assert settled.source == "netkeiba_html"
+    assert settled.refunds is None
+    stopped = next(row for row in settled.results if row.horse_number == 8)
+    assert stopped.status == "did_not_finish"
+    assert stopped.status_label == "中止"
+    assert stopped.rank is None
+
+
+def test_real_confirmed_races_without_a_phase_label_are_confirmed():
+    """Payout table and full order, no 確定 label. 202608040711 and 202604040205."""
+    shuka, _client = _settled(
+        _load("netkeiba_result_202608040711.html"),
+        "202608040711",
+        posts=_real_posts("jra_payout_202608040711.html", _KYOTO_CNAME),
+    )
+    assert shuka.result_phase == "confirmed"
+    assert shuka.complete is True
+    assert shuka.source == "netkeiba_html"
+    assert shuka.payout_note is None
+    assert shuka.warning is None
+    assert shuka.refunds is None
+    assert _ticket(shuka, "単勝", "8").payout == 130
+    assert _ticket(shuka, "単勝", "8").popularity == 1
+    assert _ticket(shuka, "単勝", "8").source == "netkeiba_html"
+    stopped = next(row for row in shuka.results if row.horse_number == 9)
+    assert stopped.status == "did_not_finish"
+    assert stopped.rank is None
+
+    niigata, _client = _settled(
+        _load("netkeiba_result_202604040205.html"),
+        "202604040205",
+        posts=_real_posts("jra_payout_202604040205.html", _NIIGATA_CNAME),
+    )
+    assert niigata.result_phase == "confirmed"
+    assert niigata.complete is True
+    assert niigata.source == "netkeiba_html"
+    assert niigata.payout_note is None
+    assert niigata.warning is None
+    assert _ticket(niigata, "複勝", "11").popularity == 2
+    assert _ticket(niigata, "3連単", "11-7-10").payout == 54140
+    assert niigata.refunds is not None
+    assert niigata.refunds[0].horse_numbers == [3]
+    assert niigata.refunds[0].bracket_numbers == [2]
+    assert niigata.refunds[0].source == "jra_html"
+    assert niigata.refunds[0].fetched_at == FETCHED_AT
+    excluded = next(row for row in niigata.results if row.horse_number == 3)
+    assert excluded.status == "excluded"
+    assert excluded.rank is None
+
+
+def test_real_takamatsunomiya_2020_demotion_keeps_the_official_rank():
+    """202007010811 高松宮記念. クリノガウディー finished 4th with 1位降着 on the page."""
+    settled, _client = _settled(_load("netkeiba_result_202007010811.html"), "202007010811")
+    assert settled.race_name == "高松宮記念"
+    assert settled.race_date == date(2020, 3, 29)
+    assert settled.venue == "中京"
+    assert settled.complete is True
+    assert settled.result_phase == "confirmed"
+    assert settled.source == "netkeiba_html"
+    assert settled.warning == JRA_PAYOUT_UNREACHABLE
+    demoted = [row for row in settled.results if row.demoted]
+    assert len(demoted) == 1
+    horse = demoted[0]
+    assert horse.horse_name == "クリノガウディー"
+    assert horse.horse_number == 11
+    assert horse.rank == 4
+    assert horse.status == "finished"
+    assert horse.status_label is None
+    assert horse.source == "netkeiba_html"
+    assert horse.fetched_at == FETCHED_AT
+    assert all(row.status != "disqualified" for row in settled.results)
+
+
+def test_complete_order_without_payouts_warns_when_the_phase_is_unknown():
+    """A full order with no payouts is not confirmed when JRA is not read."""
+    html = _result_html([_row("1", 1, "イチ")], heads=1)
+    settled, client = _settled(html)
+    assert settled.complete is True
+    assert settled.result_phase is None
+    assert settled.payouts == []
+    assert settled.warning == RACE_RESULT_PHASE_UNKNOWN
+    assert [call["url"] for call in client.calls] == [RESULT_URL]
+
+
+def test_payouts_and_full_order_drop_the_phase_warning_when_jra_is_unreachable():
+    html = _result_html([_row("1", 1, "イチ")], heads=1, extra=_WIN_PAYOUT)
+    settled, _client = _settled(html)
+    assert settled.complete is True
+    assert settled.result_phase == "confirmed"
+    assert settled.source == "netkeiba_html"
+    assert settled.warning == JRA_PAYOUT_UNREACHABLE
+    assert RACE_RESULT_PHASE_UNKNOWN not in (settled.warning or "")
+
+
+def test_printed_provisional_wins_over_the_payout_table_and_jra():
+    html = _result_html(
+        [_row("1", 1, "イチ")],
+        heads=1,
+        phase="確定前",
+        extra=_WIN_PAYOUT,
+    )
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("100")},
+    )
+    assert settled.result_phase == "provisional"
+    assert settled.source == "netkeiba_html"
+    assert JRA_PAYOUT_MISMATCH not in (settled.warning or "")
+    assert "result phase sources disagree" not in (settled.warning or "")
+    assert settled.warning is None
+
+
+def test_jra_payout_table_confirms_a_short_result_that_did_not_say():
+    html = _result_html(
+        [_row(str(number), number, f"馬{number}") for number in range(1, 6)],
+        heads=8,
+        extra=_WIN_PAYOUT,
+    )
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("100")},
+    )
+    assert settled.complete is False
+    assert settled.result_phase == "confirmed"
+    assert settled.source == "netkeiba_html+jra_html"
+    assert "5 of 8 runners" in (settled.warning or "")
+    assert "result phase was not on the page" not in (settled.warning or "")
+    assert settled.payouts[0].payout == 100
+    assert settled.payouts[0].fetched_at == FETCHED_AT
 
 
 @pytest.mark.skipif(
