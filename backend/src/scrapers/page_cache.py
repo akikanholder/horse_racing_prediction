@@ -13,10 +13,21 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from backend.scrapers.netkeiba_scraper import result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_login_wall
+from backend.scrapers.track_freshness import should_bypass_page_cache
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_result(url: str, body: str) -> bool:
+    """A flash or short ``result.html`` must not be stored or replayed.
+
+    An unsettled page with no finish table is not partial. Caching that
+    empty page is unchanged.
+    """
+    return "result.html" in url and result_html_is_partial(body)
 
 
 def default_page_cache_dir() -> Path:
@@ -70,11 +81,13 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("GET", url, params, None)
-        cached = self._body(key)
-        if cached is not None:
-            return cached
+        if not should_bypass_page_cache(url, params):
+            cached = self._cached_body(key, url)
+            if cached is not None:
+                return cached
         body = self._fetch("get", url, params=params, data=None, headers=headers, encoding=encoding)
-        self._store(key, url, body)
+        if not should_bypass_page_cache(url, params) and not _partial_result(url, body):
+            self._store(key, url, body)
         return body
 
     def post(
@@ -85,11 +98,13 @@ class CachingHTTPClient(HTTPClient):
         encoding: str | None = None,
     ) -> str:
         key = self._cache_key("POST", url, None, data)
-        cached = self._body(key)
-        if cached is not None:
-            return cached
+        if not should_bypass_page_cache(url, data):
+            cached = self._cached_body(key, url)
+            if cached is not None:
+                return cached
         body = self._fetch("post", url, params=None, data=data, headers=headers, encoding=encoding)
-        self._store(key, url, body)
+        if not should_bypass_page_cache(url, data) and not _partial_result(url, body):
+            self._store(key, url, body)
         return body
 
     def _fetch(
@@ -117,8 +132,15 @@ class CachingHTTPClient(HTTPClient):
         self._last_request_time = datetime.now().timestamp()
         return body
 
+    def _cached_body(self, key: str, url: str) -> str | None:
+        """A stored body. A flash or short result table is not replayed."""
+        body = self._body(key)
+        if body is None or _partial_result(url, body):
+            return None
+        return body
+
     def _store(self, key: str, url: str, body: str) -> None:
-        if not body or looks_like_login_wall(body):
+        if not body or looks_like_login_wall(body) or _partial_result(url, body):
             return
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)

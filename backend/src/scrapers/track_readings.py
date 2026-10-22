@@ -168,10 +168,16 @@ def discover_jra_baba_urls(html: str, page_url: str, fetch: Callable[[str], str]
     return found
 
 
-def fetch_or_block(get: Callable[..., str], url: str, *, encoding: str | None) -> str:
+def fetch_or_block(
+    get: Callable[..., str],
+    url: str,
+    *,
+    encoding: str | None,
+    headers: dict[str, str] | None = None,
+) -> str:
     """GET ``url``. HTTP 401/403 becomes ``AccessBlocked`` and stops the chain."""
     try:
-        body = get(url, params=None, headers=None, encoding=encoding)
+        body = get(url, params=None, headers=headers, encoding=encoding)
     except AccessBlocked:
         raise
     except Exception as exc:

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import date, datetime, timedelta
@@ -73,6 +74,11 @@ from backend.scrapers.runner_status import (
 )
 from backend.scrapers.runner_status import (
     page_records as _page_records,
+)
+from backend.scrapers.track_freshness import (
+    polite_interval,
+    require_finite_seconds,
+    wait_budget_spent,
 )
 from backend.utils.date_utils import (
     get_current_week_dates,
@@ -982,8 +988,9 @@ def _result_source(value: str) -> str:
     return "netkeiba_html"
 
 
-def _result_block_warning(warning: str | None) -> str:
-    if warning is not None and "403" in warning:
+def _result_block_warning(loaded: FallbackFetch) -> str:
+    """Map a refused fetch onto the result warnings. The yen amount is not a status."""
+    if loaded.http_status == 403 and not loaded.login_required:
         return RACE_RESULT_FORBIDDEN
     return RACE_RESULT_LOGIN
 
@@ -1094,11 +1101,109 @@ def _finish_status(rank_text: str) -> tuple[int | None, str | None, str | None, 
     return None, None, None, demoted
 
 
+_NON_RUNNER_STATUS = frozenset({"scratched", "excluded"})
+_FLASH_MARK = re.compile(r"5着まで|上位5頭|全着順を見|全着順を表示")
+_EARLY_ORDER = "runners on the early result, full order not on the page"
+
+
+def _class_tokens(tag: Tag) -> set[str]:
+    raw = tag.get("class") or []
+    if isinstance(raw, str):
+        return set(raw.split())
+    return {str(token) for token in raw}
+
+
+def _result_table(soup: BeautifulSoup) -> Tag | None:
+    table = soup.find("table", summary="全着順")
+    if isinstance(table, Tag):
+        return table
+    return None
+
+
+def _data_rows(table: Tag) -> list[Tag]:
+    return [
+        row for row in table.find_all("tr") if isinstance(row, Tag) and row.find("td") is not None
+    ]
+
+
+def _is_flash_table(soup: BeautifulSoup) -> bool:
+    """True for the early 速報 table: ``FirstDisplay`` rows and no ``Table_Show_All``.
+
+    A table that already has ``Table_Show_All`` is the full order, even when the
+    first rows still carry ``FirstDisplay``.
+    """
+    table = _result_table(soup)
+    if table is None or "Table_Show_All" in _class_tokens(table):
+        return False
+    rows = _data_rows(table)
+    if not rows or not all("FirstDisplay" in _class_tokens(row) for row in rows):
+        return False
+    if _FLASH_MARK.search(soup.get_text(" ", strip=True)):
+        return True
+    # A real 5-runner field that is only FirstDisplay rows, with no
+    # Table_Show_All, looks the same as the early flash. The page does not
+    # say which it is, so this stays incomplete (fail closed). An ordinary
+    # HorseList table of five runners is not this case and stays complete.
+    return len(rows) == 5
+
+
+def result_html_is_partial(html: str) -> bool:
+    """True when a result page would undercount a same-day trend.
+
+    The early flash is partial. So is a table whose rows that ran are short
+    of the printed ``N頭`` after 取消 and 除外. A page with no finish table
+    is unsettled and is not partial, so it may stay cached. A five-horse
+    ``HorseList`` table that matches ``N頭`` is complete.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    if _is_flash_table(soup):
+        return True
+    table = _result_table(soup)
+    if table is None:
+        return False
+    rows = _data_rows(table)
+    if not rows:
+        return False
+    header = soup.select_one(".RaceData02")
+    text = header.get_text(" ", strip=True) if header is not None else ""
+    match = re.search(r"(\d+)\s*頭", text)
+    if match is None:
+        return False
+    starters = int(match.group(1))
+    non_runners = 0
+    for row in rows:
+        label = re.sub(r"\s+", "", row.get_text())
+        if "取消" in label or "除外" in label:
+            non_runners += 1
+    return len(rows) - non_runners < starters - non_runners
+
+
+def _non_runner_count(results: list[SettledFinisher]) -> int:
+    """取消 and 除外 did not start. 中止 and 失格 did."""
+    return sum(1 for row in results if row.status in _NON_RUNNER_STATUS)
+
+
 def _assess_complete(
-    results: list[SettledFinisher], entry_count: int | None
+    results: list[SettledFinisher],
+    entry_count: int | None,
+    *,
+    flash_only: bool = False,
 ) -> tuple[bool, str | None]:
+    """Incomplete when the rows that ran are short of the starters who ran.
+
+    ``entry_count`` is the printed ``N頭``. Scratched and excluded rows are
+    taken off both sides. A flash table whose own ``N頭`` was rewritten to the
+    visible five is still incomplete.
+    """
     if entry_count is None:
         return False, "race result incomplete: card runner count was not on the page"
+    non_runners = _non_runner_count(results)
+    ran = len(results) - non_runners
+    expected = entry_count - non_runners
+    if ran < expected:
+        return False, f"race result incomplete: {ran} of {expected} runners"
+    if flash_only:
+        return False, f"race result incomplete: {ran} {_EARLY_ORDER}"
     if len(results) != entry_count:
         return False, f"race result incomplete: {len(results)} of {entry_count} runners"
     missing = [
@@ -1109,6 +1214,28 @@ def _assess_complete(
     if missing:
         return False, "race result incomplete: runner missing status: " + "、".join(missing)
     return True, None
+
+
+def _result_stopped(settled: SettledRaceResult) -> bool:
+    """HTTP 401/403 or a login wall. ``--wait-complete`` must not open the URL again.
+
+    A payout of 403円 or 1403円 is not a refusal. Only the fetch flags are.
+    """
+    return bool(settled.login_required or settled.http_status in {401, 403})
+
+
+def _merged_flash(pages: list[FetchedBody], runner_count: int) -> bool:
+    """True when every HTML document is still the early table and nothing was added."""
+    html_pages = [page for page in pages if page.body.lstrip().startswith("<")]
+    if not html_pages:
+        return False
+    soups = [BeautifulSoup(page.body, "lxml") for page in html_pages]
+    if not _is_flash_table(soups[0]):
+        return False
+    table = _result_table(soups[0])
+    if table is None or len(_data_rows(table)) != runner_count:
+        return False
+    return all(_is_flash_table(soup) for soup in soups)
 
 
 def _merge_phase(current: str | None, new: str | None) -> tuple[str | None, bool]:
@@ -1906,7 +2033,16 @@ class NetkeibaScraper(BaseScraper):
             return None
 
     def get_settled_race_result(
-        self, race_id: str, *, fetched_at: datetime | None = None
+        self,
+        race_id: str,
+        *,
+        fetched_at: datetime | None = None,
+        wait_complete: bool = False,
+        retry_interval: float = 60,
+        max_wait: float = 600,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> SettledRaceResult:
         """Settled finish and payouts for one race.
 
@@ -1917,18 +2053,51 @@ class NetkeibaScraper(BaseScraper):
         A failed fetch, a missing race, or a race that has no finish table
         returns empty finishers and payouts with ``warning``. Prices are not made up.
 
-        When the HTML table is shorter than the printed field, JSON embedded in
-        the page or a same-site result URL the page calls is read next, then an
-        optional headless render. HTTP 403 and a login wall stop that chain.
+        When the HTML table is shorter than the printed field, or it is only
+        the early five-row flash, JSON embedded in the page or a same-site
+        result URL the page calls is read next, then an optional headless
+        render. HTTP 403 and a login wall stop that chain and are not retried.
+        A payout amount that contains 403 is not that refusal.
+
+        ``wait_complete`` refetches until the order covers the starters who
+        ran, or ``max_wait`` seconds pass. The gap is at least 60 seconds.
+        The caller's ``fetched_at`` is kept on the first attempt. A later
+        attempt stores a new timestamp.
 
         Args:
             race_id: Race ID
-            fetched_at: Timestamp stored on the payload. Defaults to now.
+            fetched_at: Timestamp stored on the first payload. Defaults to now.
+            wait_complete: Refetch while the order is short of the field.
+            retry_interval: Seconds between refetches. Raised to 60 when shorter.
+            max_wait: Stop once another wait would pass this many seconds.
+            sleeper: Pause used between attempts. Defaults to ``time.sleep``.
+            clock: Monotonic clock for the wait budget.
+            now: Timestamp factory for attempts after the first.
 
         Returns:
             Settled race result. ``warning`` is set when it is not usable.
         """
-        fetched = fetched_at or datetime.now()
+        if wait_complete:
+            retry_interval = require_finite_seconds(retry_interval, "retry_interval")
+            max_wait = require_finite_seconds(max_wait, "max_wait")
+        interval = polite_interval(retry_interval)
+        mono = clock or time.monotonic
+        pause = sleeper or time.sleep
+        stamp = now or tokyo_now
+        started = mono()
+        attempt = 0
+        while True:
+            fetched = fetched_at if attempt == 0 and fetched_at is not None else stamp()
+            settled = self._load_settled_result(race_id, fetched)
+            attempt += 1
+            if not wait_complete or settled.complete or _result_stopped(settled):
+                return settled
+            if wait_budget_spent(started, mono(), interval, max_wait):
+                return settled
+            pause(interval)
+
+    def _load_settled_result(self, race_id: str, fetched: datetime) -> SettledRaceResult:
+        """One fetch of the result page, including JSON and headless when short."""
         fallback = PageFallback(
             self.http_client,
             site="netkeiba",
@@ -1947,7 +2116,9 @@ class NetkeibaScraper(BaseScraper):
             return self._empty_settled_result(
                 race_id,
                 fetched,
-                _result_block_warning(loaded.warning),
+                _result_block_warning(loaded),
+                http_status=loaded.http_status,
+                login_required=loaded.login_required,
             )
         if loaded.status == "failed" or not loaded.pages:
             return self._empty_settled_result(race_id, fetched, RACE_RESULT_FETCH_FAILED)
@@ -1956,9 +2127,9 @@ class NetkeibaScraper(BaseScraper):
         if loaded.status == "blocked":
             settled = settled.model_copy(
                 update={
-                    "warning": _join_warnings(
-                        settled.warning, _result_block_warning(loaded.warning)
-                    )
+                    "warning": _join_warnings(settled.warning, _result_block_warning(loaded)),
+                    "http_status": loaded.http_status,
+                    "login_required": loaded.login_required,
                 }
             )
         elif (
@@ -1991,6 +2162,9 @@ class NetkeibaScraper(BaseScraper):
         fetched_at: datetime,
         warning: str,
         header: _SettledHeader | None = None,
+        *,
+        http_status: int | None = None,
+        login_required: bool = False,
     ) -> SettledRaceResult:
         identity = header or _SettledHeader()
         return SettledRaceResult(
@@ -2012,6 +2186,8 @@ class NetkeibaScraper(BaseScraper):
             payouts=[],
             payout_note=None,
             warning=warning,
+            http_status=http_status,
+            login_required=login_required,
         )
 
     def _parse_settled_race_result(
@@ -2325,6 +2501,8 @@ class NetkeibaScraper(BaseScraper):
         )
         if not rows:
             return True
+        if _is_flash_table(soup):
+            return True
         if header.entry_count is None:
             return False
         return len(rows) < header.entry_count
@@ -2389,6 +2567,7 @@ class NetkeibaScraper(BaseScraper):
             payout_note,
             refunds=refunds,
             phase_disagree=phase_disagree,
+            flash_only=_merged_flash(pages, len(runners)),
         )
 
     def _supplement_from_page(
@@ -2459,8 +2638,9 @@ class NetkeibaScraper(BaseScraper):
         *,
         refunds: list[RaceRefund] | None = None,
         phase_disagree: bool = False,
+        flash_only: bool = False,
     ) -> SettledRaceResult:
-        complete, incomplete = _assess_complete(results, header.entry_count)
+        complete, incomplete = _assess_complete(results, header.entry_count, flash_only=flash_only)
         phase_warning: str | None = None
         phase = None if phase_disagree else header.result_phase
         if phase_disagree:
@@ -2497,6 +2677,8 @@ class NetkeibaScraper(BaseScraper):
             return settled
         refunds = settled.refunds
         notes: list[str | None] = []
+        payout_status: int | None = None
+        payout_login = False
         if settled.payouts or settled.refunds:
             key = _official_payout_key(header, self.VENUE_CODES)
             if key is None:
@@ -2504,7 +2686,7 @@ class NetkeibaScraper(BaseScraper):
                 official: list[OfficialRefund] | None = None
                 jra_source = "jra_html"
             else:
-                payout_note, official, jra_source = cross_check_payouts(
+                checked = cross_check_payouts(
                     self.http_client,
                     key,
                     [
@@ -2513,16 +2695,29 @@ class NetkeibaScraper(BaseScraper):
                     ],
                     fetch_mode=self.fetch_mode,
                 )
-                notes.append(payout_note)
+                official = checked.refunds
+                jra_source = checked.source
+                notes.append(checked.warning)
+                if checked.http_status in {401, 403} or checked.login_required:
+                    payout_status = checked.http_status
+                    payout_login = checked.login_required
             refunds, refund_note = _merge_refunds(
                 settled.refunds, official, settled.fetched_at, jra_source=jra_source
             )
             notes.append(refund_note)
         notes.append(_refund_status_warning(settled.results, refunds))
         warning = _join_warnings(settled.warning, *notes)
-        if warning == settled.warning and refunds == settled.refunds:
+        update: dict[str, object] = {}
+        if warning != settled.warning:
+            update["warning"] = warning
+        if refunds != settled.refunds:
+            update["refunds"] = refunds
+        if payout_status in {401, 403} or payout_login:
+            update["http_status"] = payout_status
+            update["login_required"] = payout_login
+        if not update:
             return settled
-        return settled.model_copy(update={"warning": warning, "refunds": refunds})
+        return settled.model_copy(update=update)
 
     def get_horse_info(
         self,

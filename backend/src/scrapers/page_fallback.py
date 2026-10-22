@@ -68,11 +68,18 @@ class FetchedBody:
 
 @dataclass
 class FallbackFetch:
-    """Bodies collected before the chain stopped."""
+    """Bodies collected before the chain stopped.
+
+    ``http_status`` and ``login_required`` are set only when the fetch itself
+    was refused (HTTP 401/403 or a login wall). A later warning that merely
+    contains the digits 403, such as a payout of 403円, does not set them.
+    """
 
     status: Literal["ok", "blocked", "failed"]
     pages: list[FetchedBody] = field(default_factory=list)
     warning: str | None = None
+    http_status: int | None = None
+    login_required: bool = False
 
 
 def looks_like_login_wall(html: str) -> bool:
@@ -107,23 +114,73 @@ def headless_browser_installed() -> bool:
     return Path(executable).is_file()
 
 
+# The post-race flash paints five ``FirstDisplay`` rows before the rest of the
+# table. ``domcontentloaded`` is that flash. Wait until the row count covers
+# the printed field, or the wait times out and the parser marks the result
+# incomplete. A 401/403 is raised before this runs and is not retried.
+RESULT_TABLE_WAIT_MS = 15_000
+RESULT_TABLE_READY_JS = """() => {
+  const table = document.querySelector('#All_Result_Table, table[summary="全着順"]');
+  if (!table) return false;
+  const rows = Array.from(table.querySelectorAll('tr')).filter((tr) => tr.querySelector('td'));
+  if (!rows.length) return false;
+  const className = String(table.className || '');
+  const flash = !className.includes('Table_Show_All')
+    && rows.every((tr) => String(tr.className || '').includes('FirstDisplay'));
+  const header = document.querySelector('.RaceData02');
+  const text = header ? (header.textContent || '') : '';
+  const match = text.match(/(\\d+)\\s*頭/);
+  if (!match) return !flash;
+  const starters = Number(match[1]);
+  // rows.length - nonRunners < starters - nonRunners is rows.length < starters.
+  if (rows.length < starters) return false;
+  if (flash) return false;
+  return true;
+}"""
+
+
+def await_page_ready(page: object, url: str) -> None:
+    """Wait for a full result table. Other URLs return immediately.
+
+    A timeout is the page still showing the early rows. The caller parses
+    that document and reports it incomplete. This does not fetch again.
+    """
+    if "/race/result.html" not in url:
+        return
+    waiter = getattr(page, "wait_for_function", None)
+    if not callable(waiter):
+        return
+    try:
+        waiter(RESULT_TABLE_READY_JS, timeout=RESULT_TABLE_WAIT_MS)
+    except Exception as exc:
+        logger.info("Result table was still short for %s: %s", url, exc)
+
+
 def render_headless(url: str) -> str:
     """Render ``url`` in a headless browser.
 
     Uses the browser's own user agent. A 401/403 response is not retried.
+    A race result page waits for the full finishing table before the HTML
+    is read. A live track page sends ``Cache-Control: no-cache``.
     """
     if not headless_browser_installed():
         raise HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
     from playwright.sync_api import sync_playwright
 
+    from backend.scrapers.track_freshness import fresh_track_headers
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
             page = browser.new_page()
+            fresh = fresh_track_headers(url)
+            if fresh:
+                page.set_extra_http_headers(fresh)
             response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             status = response.status if response is not None else None
             if status in {401, 403}:
                 raise AccessBlocked(status, PAGE_FORBIDDEN if status == 403 else PAGE_LOGIN)
+            await_page_ready(page, url)
             html = str(page.content())
         finally:
             browser.close()
@@ -251,7 +308,7 @@ class PageFallback:
             try:
                 html = self._get(url, params=params, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:
-                return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, blocked))
+                return blocked_fetch(self.site, blocked)
             except Exception as exc:
                 logger.error("Page fetch failed for %s: %s", url, exc)
                 return FallbackFetch(status="failed", warning=None)
@@ -259,8 +316,7 @@ class PageFallback:
             html = html_body
 
         if looks_like_login_wall(html):
-            login = AccessBlocked(401, PAGE_LOGIN)
-            return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, login))
+            return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN))
 
         page_url = _with_query(url, params)
         first_source = document_source or f"{self.site}_html"
@@ -288,30 +344,17 @@ class PageFallback:
         try:
             endpoints = list(self._url_finder(html, page_url))
         except AccessBlocked as blocked:
-            return FallbackFetch(
-                status="blocked",
-                pages=pages,
-                warning=_blocked_warning(self.site, blocked),
-            )
+            return blocked_fetch(self.site, blocked, pages)
         for endpoint in endpoints:
             try:
                 body = self._get(endpoint, params=None, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:
-                return FallbackFetch(
-                    status="blocked",
-                    pages=pages,
-                    warning=_blocked_warning(self.site, blocked),
-                )
+                return blocked_fetch(self.site, blocked, pages)
             except Exception as exc:
                 logger.warning("Result endpoint %s failed: %s", endpoint, exc)
                 continue
             if looks_like_login_wall(body):
-                login = AccessBlocked(401, PAGE_LOGIN)
-                return FallbackFetch(
-                    status="blocked",
-                    pages=pages,
-                    warning=_blocked_warning(self.site, login),
-                )
+                return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN), pages)
             fragment_source = f"{self.site}_js"
             if document_source == "headless" and getattr(self.http_client, "used_headless", False):
                 fragment_source = "headless"
@@ -339,11 +382,7 @@ class PageFallback:
                 )
             )
         elif isinstance(rendered, AccessBlocked):
-            return FallbackFetch(
-                status="blocked",
-                pages=pages,
-                warning=_blocked_warning(self.site, rendered),
-            )
+            return blocked_fetch(self.site, rendered, pages)
         elif isinstance(rendered, HeadlessUnavailableError):
             headless_warning = HEADLESS_UNAVAILABLE
         return FallbackFetch(status="ok", pages=pages, warning=headless_warning)
@@ -388,6 +427,22 @@ class PageFallback:
             if not headless_browser_installed() and choice == "auto":
                 return HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
             return None
+
+
+def blocked_fetch(
+    site: str,
+    blocked: AccessBlocked,
+    pages: list[FetchedBody] | None = None,
+) -> FallbackFetch:
+    """Stop the chain. The refusal is the HTTP status, not a substring of the warning."""
+    status = blocked.status if blocked.status in {401, 403} else None
+    return FallbackFetch(
+        status="blocked",
+        pages=list(pages or []),
+        warning=_blocked_warning(site, blocked),
+        http_status=status,
+        login_required=status == 401,
+    )
 
 
 def _blocked_warning(site: str, blocked: AccessBlocked) -> str:

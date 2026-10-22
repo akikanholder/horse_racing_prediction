@@ -36,7 +36,13 @@ from backend.scrapers.netkeiba_scraper import (
     REFUND_NOT_NON_RUNNER,
     NetkeibaScraper,
 )
-from backend.scrapers.page_fallback import headless_browser_installed, render_headless
+from backend.scrapers.page_fallback import (
+    RESULT_TABLE_READY_JS,
+    RESULT_TABLE_WAIT_MS,
+    await_page_ready,
+    headless_browser_installed,
+    render_headless,
+)
 from backend.services.race_service import RaceService
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1106,6 +1112,345 @@ def test_refund_horse_mismatch_keeps_the_netkeiba_numbers():
     assert settled.refunds[0].horse_numbers == [2]
     assert settled.refunds[0].source == "netkeiba_html"
     assert settled.warning == f"{JRA_REFUND_MISMATCH}: netkeibaのみ: 2番; JRAのみ: 5番"
+
+
+class _SequenceHTTP:
+    """GET bodies in order. An exception body is raised."""
+
+    def __init__(self, pages: list[str | Exception]):
+        self.pages = list(pages)
+        self.calls: list[str] = []
+
+    def get(self, url, params=None, headers=None, encoding=None):
+        self.calls.append(url)
+        if not self.pages:
+            raise AssertionError(url)
+        body = self.pages.pop(0)
+        if isinstance(body, Exception):
+            raise body
+        return body
+
+    def post(self, url, data=None, headers=None, encoding=None):
+        raise AssertionError("result wait should not post a payout")
+
+    def close(self) -> None:
+        return None
+
+
+def _full_order(heads: int = 16) -> str:
+    rows = [_row(str(number), number, f"馬{number}") for number in range(1, heads + 1)]
+    return _result_html(rows, heads=heads, phase="確定")
+
+
+def _flash_rows(count: int = 5) -> list[str]:
+    return [
+        _row(str(number), number, f"馬{number}").replace("HorseList", "FirstDisplay HorseList")
+        for number in range(1, count + 1)
+    ]
+
+
+def test_top5_flash_page_is_incomplete_and_keeps_source():
+    settled, client = _settled(_load("netkeiba_race_result_top5.html"))
+    assert settled.complete is False
+    assert len(settled.results) == 5
+    assert settled.results[0].horse_name == "イチ"
+    assert settled.results[-1].rank == 5
+    assert "race result incomplete: 5 of 16 runners" in (settled.warning or "")
+    assert all(
+        row.source == "netkeiba_html" and row.fetched_at == FETCHED_AT for row in settled.results
+    )
+    assert [call["url"] for call in client.calls] == [RESULT_URL]
+
+
+def test_flash_table_whose_head_count_is_five_stays_incomplete_and_tries_headless():
+    html = _result_html(
+        _flash_rows(),
+        heads=5,
+        phase="確定",
+        extra='<p class="ResultMore">5着まで表示 全着順を見る</p>',
+    )
+    seen: list[str] = []
+    settled, _client = _settled(html, headless=lambda url: seen.append(url) or html)
+    assert settled.complete is False
+    assert len(settled.results) == 5
+    assert "runners on the early result, full order not on the page" in (settled.warning or "")
+    assert seen and "result.html" in seen[0]
+
+
+def test_five_horse_race_without_flash_markup_is_complete():
+    html = _result_html(
+        [_row(str(number), number, f"馬{number}") for number in range(1, 6)],
+        heads=5,
+        phase="確定",
+    )
+    settled, client = _settled(html)
+    assert settled.complete is True
+    assert settled.warning is None
+    assert [call["url"] for call in client.calls] == [RESULT_URL]
+
+
+def test_scratched_row_is_taken_out_of_the_expected_field():
+    rows = [_row(str(number), number, f"馬{number}") for number in range(1, 5)]
+    rows.append(_row("取消", 5, "ゴ"))
+    html = _result_html(rows, heads=8, phase="確定")
+    settled, _client = _settled(html)
+    assert settled.complete is False
+    assert len(settled.results) == 5
+    assert settled.warning == "race result incomplete: 4 of 7 runners"
+
+
+def test_wait_complete_refetches_until_the_full_order_and_restamps():
+    later = datetime(2026, 10, 18, 15, 1)
+    client = _SequenceHTTP([_load("netkeiba_race_result_top5.html"), _full_order()])
+    slept: list[float] = []
+    ticks = iter((0.0, 0.0))
+    scraper = NetkeibaScraper(http_client=client, headless_render="off")  # type: ignore[arg-type]
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        fetched_at=FETCHED_AT,
+        wait_complete=True,
+        retry_interval=1,
+        max_wait=600,
+        sleeper=slept.append,
+        clock=lambda: next(ticks),
+        now=lambda: later,
+    )
+    assert slept == [60]
+    assert client.calls == [RESULT_URL, RESULT_URL]
+    assert settled.complete is True
+    assert len(settled.results) == 16
+    assert settled.fetched_at == later
+    assert settled.results[0].fetched_at == later
+    assert settled.results[0].source == "netkeiba_html"
+
+
+def test_wait_complete_does_not_sleep_on_403_or_login():
+    forbidden = _SequenceHTTP([_http_error(403)])
+    slept: list[float] = []
+    scraper = NetkeibaScraper(http_client=forbidden, headless_render="off")  # type: ignore[arg-type]
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        fetched_at=FETCHED_AT,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: 0.0,
+    )
+    assert slept == []
+    assert settled.results == []
+    assert settled.warning == RACE_RESULT_FORBIDDEN
+    assert settled.http_status == 403
+    assert settled.login_required is False
+    assert forbidden.calls == [RESULT_URL]
+
+    login = """<html><head><title>ログイン</title></head><body>
+    <form><input type="password" name="pswd"></form></body></html>"""
+    wall = _SequenceHTTP([login])
+    scraper = NetkeibaScraper(http_client=wall, headless_render="off")  # type: ignore[arg-type]
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: 0.0,
+    )
+    assert slept == []
+    assert settled.warning == RACE_RESULT_LOGIN
+    assert settled.http_status == 401
+    assert settled.login_required is True
+    assert wall.calls == [RESULT_URL]
+
+
+def test_wait_complete_stops_when_a_later_fetch_is_forbidden():
+    client = _SequenceHTTP([_load("netkeiba_race_result_top5.html"), _http_error(403)])
+    slept: list[float] = []
+    ticks = iter((0.0, 0.0))
+    scraper = NetkeibaScraper(http_client=client, headless_render="off")  # type: ignore[arg-type]
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: next(ticks),
+        max_wait=600,
+    )
+    assert slept == [60]
+    assert settled.results == []
+    assert settled.warning == RACE_RESULT_FORBIDDEN
+    assert client.calls == [RESULT_URL, RESULT_URL]
+
+
+def test_payout_403_does_not_start_a_wait():
+    html = _result_html(
+        [_row(str(number), number, f"馬{number}") for number in range(1, 6)],
+        heads=8,
+        phase="確定",
+        extra=_WIN_PAYOUT,
+    )
+    scraper, client = _scraper(html, posts={"pw01hli00/03": _http_error(403)})
+    slept: list[float] = []
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        fetched_at=FETCHED_AT,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: 0.0,
+    )
+    assert slept == []
+    assert "5 of 8 runners" in (settled.warning or "")
+    assert JRA_PAYOUT_FORBIDDEN in (settled.warning or "")
+    assert settled.http_status == 403
+    assert settled.login_required is False
+    assert [call["url"] for call in client.calls].count(RESULT_URL) == 1
+
+
+def test_payout_yen_containing_403_does_not_stop_the_wait():
+    html = _result_html(
+        [_row(str(number), number, f"馬{number}") for number in range(1, 6)],
+        heads=8,
+        phase="確定",
+        extra=_place_table(
+            [
+                ("単勝", "<div><span>1</span></div>", "403円", "<span>1人気</span>"),
+                ("複勝", "<div><span>1</span></div>", "1403円", "<span>2人気</span>"),
+            ]
+        ),
+    )
+    tickets = _jra_ticket("単勝", "1", "100", "1") + _jra_ticket("複勝", "1", "200", "2")
+    scraper, client = _scraper(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("100", tickets=tickets)},
+    )
+    slept: list[float] = []
+    ticks = iter((0.0, 0.0, 600.0))
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        fetched_at=FETCHED_AT,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: next(ticks),
+        max_wait=600,
+    )
+    warning = settled.warning or ""
+    assert slept == [60]
+    assert "403円" in warning
+    assert "1403円" in warning
+    assert settled.http_status is None
+    assert settled.login_required is False
+    assert [call["url"] for call in client.calls].count(RESULT_URL) == 2
+
+
+def test_tied_place_payouts_ignore_swapped_popularity_order():
+    html = _result_html(
+        [_row("1", 1, "イチ"), _row("2", 2, "ニ")],
+        heads=2,
+        phase="確定",
+        extra=_place_table(
+            [
+                (
+                    "複勝",
+                    "<div><span>1</span></div><div><span>2</span></div>",
+                    "160円<br />160円",
+                    "<span>1人気</span><span>2人気</span>",
+                )
+            ]
+        ),
+    )
+    tickets = _jra_ticket("複勝", "1", "160", "2") + _jra_ticket("複勝", "2", "160", "1")
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("160", tickets=tickets)},
+    )
+    assert JRA_PAYOUT_MISMATCH not in (settled.warning or "")
+    assert settled.complete is True
+
+    disagreed = _result_html(
+        [_row("1", 1, "イチ")],
+        heads=1,
+        phase="確定",
+        extra=_place_table([("複勝", "<div><span>1</span></div>", "160円", "<span>1人気</span>")]),
+    )
+    alone = _jra_ticket("複勝", "1", "160", "2")
+    settled, _client = _settled(
+        disagreed,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("160", tickets=alone)},
+    )
+    assert JRA_PAYOUT_MISMATCH in (settled.warning or "")
+
+
+def test_unpinned_fetched_at_carries_the_tokyo_offset():
+    html = _result_html([_row("1", 1, "イチ")], heads=1, phase="確定")
+    scraper, _client = _scraper(html)
+    settled = scraper.get_settled_race_result(RACE_ID)
+    assert settled.fetched_at.tzinfo is not None
+    assert "+09:00" in settled.fetched_at.isoformat()
+
+
+def test_wait_complete_rejects_non_finite_seconds():
+    scraper, client = _scraper(_result_html([_row("1", 1, "イチ")], heads=1, phase="確定"))
+    slept: list[float] = []
+    with pytest.raises(ValueError, match="max_wait must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            max_wait=float("nan"),
+            sleeper=slept.append,
+        )
+    with pytest.raises(ValueError, match="retry_interval must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            retry_interval=float("inf"),
+            sleeper=slept.append,
+        )
+    with pytest.raises(ValueError, match="max_wait must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            max_wait=-1,
+            sleeper=slept.append,
+        )
+    assert slept == []
+    assert client.calls == []
+
+
+def test_cli_and_api_reject_non_finite_wait(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["backend.cli", "result", RACE_ID, "--max-wait", "nan"])
+    with pytest.raises(SystemExit) as caught:
+        cli_main()
+    assert caught.value.code == 2
+    assert "max_wait must be a finite number >= 0" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        sys, "argv", ["backend.cli", "track", "--retry-interval", "-1", "--wait-fresh"]
+    )
+    with pytest.raises(SystemExit) as caught:
+        cli_main()
+    assert caught.value.code == 2
+    assert "retry_interval must be a finite number >= 0" in capsys.readouterr().err
+
+    with TestClient(app) as client:
+        result = client.get(f"/api/races/{RACE_ID}/result", params={"max_wait": "nan"})
+        track = client.get("/api/tracks", params={"retry_interval": "inf"})
+    assert result.status_code == 422
+    assert "max_wait" in result.text
+    assert track.status_code == 422
+    assert "retry_interval" in track.text
+
+
+def test_result_headless_waits_for_the_full_table_and_swallows_timeout():
+    waited: list[tuple[str, int]] = []
+
+    class _Page:
+        def wait_for_function(self, script: str, timeout: int | None = None) -> None:
+            waited.append((script, timeout or 0))
+
+    await_page_ready(_Page(), "https://race.netkeiba.com/race/result.html?race_id=1")
+    await_page_ready(_Page(), "https://www.jra.go.jp/keiba/baba/index.html")
+    assert waited == [(RESULT_TABLE_READY_JS, RESULT_TABLE_WAIT_MS)]
+
+    class _Slow:
+        def wait_for_function(self, script: str, timeout: int | None = None) -> None:
+            raise TimeoutError("still the early rows")
+
+    await_page_ready(_Slow(), "https://race.netkeiba.com/race/result.html?race_id=1")
 
 
 def test_pre_race_models_do_not_carry_result_fields():

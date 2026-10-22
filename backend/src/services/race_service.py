@@ -1,7 +1,7 @@
 """Race service for aggregating data from multiple sources."""
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -257,13 +257,40 @@ class RaceService:
             return None
 
     def get_settled_race_result(
-        self, race_id: str, *, fetch_mode: str | None = None
+        self,
+        race_id: str,
+        *,
+        fetch_mode: str | None = None,
+        wait_complete: bool = False,
+        retry_interval: float = 60,
+        max_wait: float = 600,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> SettledRaceResult:
         """Settled finish order and payouts for one race."""
         with self._using(fetch_mode):
-            return self._settled_race_result(race_id)
+            return self._settled_race_result(
+                race_id,
+                wait_complete=wait_complete,
+                retry_interval=retry_interval,
+                max_wait=max_wait,
+                sleeper=sleeper,
+                clock=clock,
+                now=now,
+            )
 
-    def _settled_race_result(self, race_id: str) -> SettledRaceResult:
+    def _settled_race_result(
+        self,
+        race_id: str,
+        *,
+        wait_complete: bool = False,
+        retry_interval: float = 60,
+        max_wait: float = 600,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> SettledRaceResult:
         """Settled finish order and payouts for one race.
 
         This is the post-race settlement used for mark × finish logs.
@@ -276,7 +303,20 @@ class RaceService:
         Returns:
             Settled race result from the netkeiba result page
         """
-        return self.netkeiba_scraper.get_settled_race_result(race_id)
+        if not wait_complete:
+            return self.netkeiba_scraper.get_settled_race_result(race_id)
+        kwargs: dict[str, object] = {
+            "wait_complete": True,
+            "retry_interval": retry_interval,
+            "max_wait": max_wait,
+        }
+        if sleeper is not None:
+            kwargs["sleeper"] = sleeper
+        if clock is not None:
+            kwargs["clock"] = clock
+        if now is not None:
+            kwargs["now"] = now
+        return self.netkeiba_scraper.get_settled_race_result(race_id, **kwargs)  # type: ignore[arg-type]
 
     def get_historical_races(
         self,

@@ -6,7 +6,7 @@ Source: https://race.netkeiba.com/race/track.html
 import logging
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from urllib.parse import urlencode, urljoin
 
@@ -24,6 +24,14 @@ from backend.models.track import (
 )
 from backend.scrapers.base_scraper import BaseScraper
 from backend.scrapers.page_fallback import FetchedBody, PageFallback
+from backend.scrapers.track_freshness import (
+    CACHED_COPY,
+    FRESH_REQUEST_HEADERS,
+    apply_measurement_freshness,
+    cached_copy_seen,
+    clear_cached_copy_flag,
+    page_measurement_time,
+)
 from backend.scrapers.track_readings import (
     CUSHION_MISSING,
     PrintedMoisture,
@@ -119,6 +127,9 @@ class NetkeibaTrackScraper(BaseScraper):
         date: str | None = None,
         *,
         fetched_at: datetime | None = None,
+        race_date: date | None = None,
+        today: date | None = None,
+        race_date_warning: str | None = None,
     ) -> TrackInfo:
         """Scrape track information from Netkeiba.
 
@@ -131,14 +142,23 @@ class NetkeibaTrackScraper(BaseScraper):
             date: Date in YYYYMMDD format
             fetched_at: Timestamp stored on each copied value. Defaults to now
                        in Asia/Tokyo.
+            race_date: Day the reading is for. Null means today in Asia/Tokyo.
+            today: Clock date used for ``is_today``. Defaults to today.
+            race_date_warning: Set when the race date could not be read.
 
         Returns:
             TrackInfo object with the scraped data
         """
         fetched = fetched_at or tokyo_now()
+        clear_cached_copy_flag(self.http_client)
         requested = self._requested_venue_name(racecourse_id)
         if racecourse_id and requested is None:
-            return empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE)
+            return self._finish(
+                empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
         self._requested_venue = requested
         url = self.get_track_url(
             self.RACECOURSE_NAME_TO_ID.get(requested, racecourse_id) if requested else racecourse_id,
@@ -152,35 +172,76 @@ class NetkeibaTrackScraper(BaseScraper):
         loaded = fallback.load(
             url=url,
             params=None,
-            headers=None,
+            headers=dict(FRESH_REQUEST_HEADERS),
             encoding=self.ENCODING,
             fetched_at=fetched,
             should_fallback=self._needs_fallback,
             still_incomplete=self._still_missing_cushion,
         )
         if not loaded.pages:
-            return empty_track_info("Netkeiba", self._blocked_warning(loaded.warning))
+            return self._finish(
+                self._with_fetch_block(
+                    empty_track_info("Netkeiba", self._blocked_warning(loaded)), loaded
+                ),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
 
         soup = BeautifulSoup(loaded.pages[0].body, "lxml")
         page_venue = self._active_venue(soup)
         if requested:
             if page_venue != requested:
                 warning = self.TRACK_NOT_MEETING if page_venue else self.TRACK_UNPARSEABLE
-                return empty_track_info("Netkeiba", warning)
+                return self._finish(
+                    empty_track_info("Netkeiba", warning),
+                    race_date=race_date,
+                    today=today,
+                    race_date_warning=race_date_warning,
+                )
             venue = requested
         elif page_venue is None:
-            return empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE)
+            return self._finish(
+                empty_track_info("Netkeiba", self.TRACK_UNPARSEABLE),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
         else:
             venue = page_venue
 
         info = self._from_pages(loaded.pages, venue)
-        if loaded.warning:
-            info = info.model_copy(update={"warning": join_warnings(info.warning, loaded.warning)})
         if loaded.status == "blocked":
+            info = self._with_fetch_block(info, loaded)
             info = info.model_copy(
-                update={"warning": join_warnings(info.warning, self._blocked_warning(loaded.warning))}
+                update={"warning": join_warnings(info.warning, self._blocked_warning(loaded))}
             )
-        return info
+        elif loaded.warning:
+            info = info.model_copy(update={"warning": join_warnings(info.warning, loaded.warning)})
+        return self._finish(
+            info,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
+
+    def _finish(
+        self,
+        info: TrackInfo,
+        *,
+        race_date: date | None,
+        today: date | None,
+        race_date_warning: str | None,
+    ) -> TrackInfo:
+        """Attach a cache-hit note, then the printed measurement clock."""
+        if cached_copy_seen(self.http_client):
+            info = info.model_copy(update={"warning": join_warnings(info.warning, CACHED_COPY)})
+        return apply_measurement_freshness(
+            info,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
 
     def scrape_by_name(
         self, racecourse_name: str, date: str | None = None
@@ -212,13 +273,23 @@ class NetkeibaTrackScraper(BaseScraper):
             return racecourse_id
         return None
 
-    def _blocked_warning(self, warning: str | None) -> str:
+    def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the track warnings. Do not read the body."""
-        if warning and "403" in warning:
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status == 403 and not login:
             return self.TRACK_403
-        if warning and "login" in warning:
+        if login or status == 401:
             return self.TRACK_LOGIN
         return self.TRACK_FETCH_FAILED
+
+    def _with_fetch_block(self, info: TrackInfo, loaded: object) -> TrackInfo:
+        """Copy a fallback refusal onto the track info. A yen amount is not a status."""
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status not in {401, 403} and not login:
+            return info
+        return info.model_copy(update={"http_status": status, "login_required": login})
 
     def _needs_fallback(self, html: str) -> bool:
         """True when this meeting's cushion slot is empty. A foreign tab is not read."""
@@ -371,6 +442,8 @@ class NetkeibaTrackScraper(BaseScraper):
         weather = turf_weather or dirt_weather or Weather.UNKNOWN
         text = scoped.get_text(" ", strip=True) if isinstance(scoped, Tag) else soup.get_text()
         post = post_time_on_page(text)
+        year = printed_year(soup.get_text())
+        stamp = page_measurement_time(soup.get_text("\n", strip=True), year)
         return TrackInfo(
             racecourse=racecourse_name,
             date=race_date,
@@ -380,6 +453,7 @@ class NetkeibaTrackScraper(BaseScraper):
             turf=turf_info,
             dirt=dirt_info,
             source="Netkeiba",
+            measured_at=stamp,
             warning=None,
             post_time=post,
             post_time_source=source if post else None,
@@ -402,12 +476,44 @@ class NetkeibaTrackScraper(BaseScraper):
         return None
 
     def _extract_race_date(self, soup: BeautifulSoup) -> datetime | None:
-        """Date when the page prints a year. A month and day alone stay null."""
-        text = soup.get_text()
+        """Date when the page prints a year. A month and day alone stay null.
+
+        An active tab's ``kaisai_date`` is the meeting. A date inside
+        ``script`` or ``style`` (a bundle can contain ``2026/04/02``) is not.
+        """
+        stamped = self._active_kaisai_date(soup)
+        if stamped is not None:
+            return stamped
+        visible = BeautifulSoup(str(soup), "lxml")
+        for tag in visible.find_all(["script", "style", "noscript"]):
+            tag.decompose()
+        text = visible.get_text(" ", strip=True)
         for pattern in (r"(\d{4})/(\d{1,2})/(\d{1,2})", r"(\d{4})年(\d{1,2})月(\d{1,2})日"):
             match = re.search(pattern, text)
             if match:
+                try:
+                    return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                except ValueError:
+                    continue
+        return None
+
+    def _active_kaisai_date(self, soup: BeautifulSoup) -> datetime | None:
+        """``kaisai_date`` on the selected tab. Other links on the page are ignored."""
+        for tag in soup.find_all(True):
+            classes = [str(name).lower() for name in (tag.get("class") or [])]
+            selected = tag.has_attr("selected") or any(
+                name in {"active", "current", "selected"} for name in classes
+            )
+            if not selected:
+                continue
+            blob = " ".join(str(tag.get(attr) or "") for attr in ("href", "data-href", "value"))
+            match = re.search(r"kaisai_date=(\d{4})(\d{2})(\d{2})", blob)
+            if match is None:
+                continue
+            try:
                 return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                continue
         return None
 
     def _extract_course_info(

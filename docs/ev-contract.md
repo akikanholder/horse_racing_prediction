@@ -249,16 +249,26 @@ python -m backend.cli result 202605030811 --json
 | `distance` / `track_type` / `track_condition` / `weather` | 結果ページに書いてあるときだけ | 無いとき null。`稍` は `稍重` |
 | `race_class` | `RaceData02` のクラスの span（`オープン`、`未勝利`、`1勝クラス` など） | 印字が無ければ null。レース名からは作らない |
 | `entry_count` | ページの `N頭` | 印字が無ければ null |
-| `fetched_at` | 取得時刻 | 必須 |
+| `fetched_at` | 取得時刻。呼び出し側が渡さないときは Asia/Tokyo のオフセット付き（`+09:00`） | 必須 |
+| `http_status` | 結果ページか公式払戻の取得が HTTP 401 / 403 で止まったときのステータス | 拒否以外は null。払戻金の「403円」では付けない |
+| `login_required` | ログイン画面で止まったとき true | 既定 false |
 | `source` | 着順を得た方法。`netkeiba_html` / `netkeiba_js` / `headless`。混ざるときは `netkeiba_html+netkeiba_js` | 失敗時 null |
-| `complete` | 返した頭数がページの `N頭` と一致し、各馬に `status` があるときだけ true | 失敗時 false |
+| `complete` | 走った頭数（取消・除外を除く）が `N頭` から取消・除外を引いた数と一致し、各馬に `status` があり、速報の上位表だけではないとき true | 失敗時 false |
 | `result_phase` | ページに印字された `confirmed`（確定）か `provisional`（確定前・暫定・未確定） | 印字が無ければ null |
 | `results` | `SettledFinisher`。結果表の並び。未入着も含む | 失敗時 `[]` |
 | `payouts` | `RacePayout`。金額がある馬券種だけ | 失敗時 `[]` |
 | `payout_note` | 金額を作らなかった馬券種の注記 | 無ければ null |
 | `warning` | 着順が取れない、または頭数・区分・確定印・公式払戻が揃わない理由。複数は `; ` でつなぐ | 揃っていれば null |
 
-`results` はカードの全頭。着順表がページの `N頭` より短い、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
+`results` はカードの全頭。着順表がページの `N頭` より短い、速報の `FirstDisplay` だけの表（`Table_Show_All` が無く、`5着まで` / `全着順を見る` かちょうど5行）、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
+
+`complete` の頭数は、返した行から取消（`scratched`）と除外（`excluded`）を引いた数と、`N頭` から同じ取消・除外を引いた数を比べる。中止と失格は走った馬として数える。速報が `N頭` を見えている5頭に書き換えていても、`Table_Show_All` の無い `FirstDisplay` だけの表は `complete: false` と `race result incomplete: N runners on the early result, full order not on the page`。`N頭` の方が大きいときは `race result incomplete: 5 of 16 runners` のように走った頭数で書く。
+
+ヘッドレスは結果 URL で、`domcontentloaded` のあと着順表の行数が `N頭` 未満なら待ち、速報の5行ではないところまで待つ（15秒）。行数の比較は `rows.length < starters`。タイムアウトはその短い HTML をパースし、`complete: false` のまま返す。もう一度取りにはいかない。401/403 はこの待ちの前に止め、再試行しない。
+
+速報の `FirstDisplay` だけの `result.html`（`Table_Show_All` が無い、または走った頭数が `N頭` より短い）はページキャッシュに入れない。入れたあとに同じ URL を読んでも、その短い表は返さない。着順表の無い未確定ページは今までどおりキャッシュしてよい。`Table_Show_All` の無い5行だけの表は、本当の5頭立てと速報が同じ印字なので `complete: false` のままにする。普通の `HorseList` の5頭立ては complete。
+
+`--wait-complete`（API は `wait_complete=true`）は `complete` になるまで同じ結果ページを取り直す。`--retry-interval` の既定は 60 秒で、それより短い指定は 60 秒に上げる。`--max-wait` の既定は 600 秒。どちらも 0 以上の有限値だけ受け付ける。`nan` と `inf` と負数は CLI が拒否し、API は 422。次の間隔が上限を超えるときは待たず、その時点の結果を返す。待ちを止めるのは取得側の `http_status`（401 / 403）か `login_required` で、警告文に `403` という数字があるだけでは止めない。払戻が `403円` や `1403円` でも待ちは続く。公式払戻の取得そのものが HTTP 403 のときは `http_status: 403` と `JRA payout returned 403` で、待たずに止める。既定の `result` は1回だけ取る。
 
 `result_phase` は結果ヘッダの印字だけ（`.RaceResultState`、`[data-result-phase]`、`.RaceList_Item02` 内の `.Race_Fixed` / `.Race_Provisional`、またはそのノード自身の短い文字が `確定` / `確定前` / `結果確定` / `結果確定前` / `未確定` / `暫定`）。タイトルの「結果・払戻」、meta の「速報」、ナビの「ゴール後 30秒速報」は局面にしない。印字が無ければ null と `result phase was not on the page`。複数の取得元が食い違うときは null と `result phase sources disagree`。
 
@@ -307,7 +317,8 @@ python -m backend.cli result 202605030811 --json
 揃い方の注記（上と `; ` でつなぐことがある）:
 
 - `race result incomplete: card runner count was not on the page`
-- `race result incomplete: 5 of 8 runners`
+- `race result incomplete: 5 of 8 runners`（取消・除外を引いたあと。速報で `N頭` が残っているとき）
+- `race result incomplete: 5 runners on the early result, full order not on the page`（速報が頭数まで5にしているとき）
 - `race result incomplete: runner missing status: 2、7`
 - `result phase was not on the page`
 - `result phase sources disagree`
@@ -318,7 +329,7 @@ python -m backend.cli result 202605030811 --json
 - `refund horses are not scratched or excluded: …`
 - `JRA refund mismatch: …`
 
-ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は後から馬場・調教でも使える。この契約の馬場・調教の中身は変えていない。
+ヘッドレスは任意。`pip install -e ".[headless]"` と `playwright install chromium`。未インストールでもコマンドは動く。ブラウザの UA はそのまま。403 を避けるための UA 変更、captcha、資格情報の回避はしない。同じ取得順は馬場・調教でも使う。馬場の測定時刻とキャッシュは下の「コース・開催・馬場」にある。
 
 ### JRA の取得モード
 
@@ -836,7 +847,17 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 `WeeklyVenueSchedule`: `venue`, `venue_code`, `dates`, `round_number`, `conditions`, `fetched_at`。
 
-`TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `weather_source`, `weather_fetched_at`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` / `Netkeiba` / `JRA+Netkeiba`。オッズの `source` とは別の語）, `warning`, `post_time`, `post_time_source`, `post_time_fetched_at`, `scraped_at`。
+`TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `weather_source`, `weather_fetched_at`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` / `Netkeiba` / `JRA+Netkeiba`。オッズの `source` とは別の語）, `measured_at`, `is_today`, `stale`, `http_status`, `login_required`, `warning`, `post_time`, `post_time_source`, `post_time_fetched_at`, `scraped_at`。
+
+`http_status` と `login_required` は馬場ページの取得が HTTP 401 / 403 またはログイン画面で止まったときだけ付く。本文に `403` という数字があっても付けない。JRA が 403 のとき、このフラグが付いた JRA の値は null のまま、同じ場の netkeiba 公開ページへ戻る。その netkeiba のページに測定時刻が無ければ `stale` は null。`stale` が null なことは待ちの理由にしない。
+
+`measured_at` はページに印字された測定時刻（Asia/Tokyo の ISO、例 `2026-10-16T12:00:00+09:00`）。クッション値・含水率・ページ見出しのうち最も新しい印字。年が印字に無いときは null。`fetched_at` からは作らない。`発走` の時刻に加え、`発表予定` など発表・予定と印字された時刻も測定時刻にしない。各クッション値・含水率は自分の `measured_at` と `source` と `fetched_at` を持つ。`is_today` は測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null。`stale` は測定日がレース日と違うとき true。レース日は `--date`（`YYYYMMDD` または `YYYY-MM-DD`）。省略したときは今日。日付として読めない文字列は `stale` を null のまま `track race date was not a date`。馬場ページに印字された別の日をレース日には使わない。netkeiba の開催日は、選択中のタブの `kaisai_date` を優先する。`script` や `style` の中の日付（例 `2026/04/02`）は開催日にしない。
+
+測定日がレース日でないときは `warning` に `track measurement is not the race date: YYYY-MM-DD`。応答ヘッダ（`x-cache` / `x-cache-status` / `cf-cache-status` / `x-akamai-cache`）が `HIT` のときは `track response was a cached copy`。`Age` だけでは HIT にしない。数値は HIT の本文のまま返す。
+
+JRA の `/keiba/baba/` は開催のたびに同じ URL なのでページキャッシュに入れない。netkeiba の `track.html` は `kaisai_date` が無い、読めない、今日かそれ以降のときだけキャッシュしない。過去の `kaisai_date` はキャッシュしてよい。リクエストは `Cache-Control: no-cache` と `Pragma: no-cache` を送る。クエリでキャッシュを壊すこと、UA の差し替えはしない。ヘッドレスの馬場 URL も同じヘッダを付ける。
+
+`--wait-fresh`（API は `wait_fresh=true`）は、依頼したレース日が今日（Asia/Tokyo）で、かつ印字された測定日がその日より前のときだけ取り直す。`--date` を省略したとき、過去の日、未来の日は、`stale: true` と今までの警告を付けたまますぐ返す。測定日が今日かそれより後のとき、測定時刻が無いとき（`stale` が null）も待たない。間隔は `--retry-interval`（既定 60 秒、それ未満は 60 秒）、上限は `--max-wait`（既定 600 秒）。どちらも 0 以上の有限値だけ。`nan` / `inf` / 負数は CLI が拒否し、API は 422。JRA が HTTP 403 またはログインのときは `http_status` / `login_required` が付くので待たない。そのとき netkeiba へ戻っても、測定時刻が無ければ `stale` は null のままで、`--wait-fresh` は待たずに返す。警告文に `403` という数字があるだけでは止めない。統合しても JRA の数値を netkeiba の新しい数値で置き換えない。`stale` は残ったクッション値・含水率の印字から付け直す。
 
 芝/ダートの `condition` は 良/稍重/重/不良/不明。印字された馬場状態には `condition_source` と `condition_fetched_at` が付く。`moisture.goal_front` と `fourth_corner` は印字された含水率のまま。凡例や馬場状態からは作らない。`cushion.value` は印字されたクッション値の数値。硬度目盛の 12 / 10 / 8 / 7 や「硬め」は入れない。`cushion.grade` は同じ欄に印字された区分だけ。数値や目盛から区分は計算しない。印字が無ければ null。数値がページに無いときは `warning` に `cushion value was not on the page` を足す。`grass_info.course_name` は使用コース（A/B/C）。バイアスにはしない。`merge=true` のとき、場が取れたソースがある場合だけ統合結果はキー `merged`。
 

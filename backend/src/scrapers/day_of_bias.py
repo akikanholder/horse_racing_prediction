@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from backend.models.race import Race
 from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.jra_track_scraper import baba_meeting_tab_urls
+from backend.scrapers.track_freshness import FRESH_REQUEST_HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,9 @@ class DayOfBiasClient:
                 continue
             seen.add(url)
             try:
-                html = self.jra.http_client.get(url, encoding=BABA_ENCODING)
+                html = self.jra.http_client.get(
+                    url, encoding=BABA_ENCODING, headers=dict(FRESH_REQUEST_HEADERS)
+                )
             except Exception as e:
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if status == 403:

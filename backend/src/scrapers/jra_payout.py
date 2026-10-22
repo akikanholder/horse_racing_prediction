@@ -11,6 +11,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date
+from typing import NamedTuple
 
 from bs4 import BeautifulSoup, Tag
 
@@ -69,6 +70,16 @@ class OfficialRefund:
     bracket_numbers: tuple[int, ...] | None
 
 
+class PayoutCheck(NamedTuple):
+    """Official comparison. ``http_status`` is set only when the payout fetch was refused."""
+
+    warning: str | None
+    refunds: list[OfficialRefund] | None
+    source: str
+    http_status: int | None = None
+    login_required: bool = False
+
+
 def cross_check_payouts(
     http_client: object,
     key: OfficialPayoutKey | None,
@@ -76,41 +87,42 @@ def cross_check_payouts(
     *,
     fetch_mode: str = "html",
     session: object | None = None,
-) -> tuple[str | None, list[OfficialRefund] | None, str]:
+) -> PayoutCheck:
     """Return a payout warning, any 返還 block, and the JRA source token.
 
     ``payouts`` is the netkeiba list. This function does not invent replacements.
     Several rows of one bet type are kept. A missing popularity on one side is
     not a mismatch. ``None`` refunds means the page printed no 返還 block.
     The source is ``headless`` only when the browser returned the documents.
-    A 403 is not fetched again through HTTP.
+    A 403 is not fetched again through HTTP. ``http_status`` is that refusal,
+    not a yen amount that happens to contain 403.
     """
     if key is None:
-        return JRA_PAYOUT_UNREACHABLE, None, "jra_html"
+        return PayoutCheck(JRA_PAYOUT_UNREACHABLE, None, "jra_html")
     post = getattr(http_client, "post", None)
     if not callable(post):
-        return JRA_PAYOUT_UNREACHABLE, None, "jra_html"
+        return PayoutCheck(JRA_PAYOUT_UNREACHABLE, None, "jra_html")
     poster, source_of, extra = _payout_poster(post, fetch_mode, session)
     try:
         index = _post(poster, PAYOUT_INDEX_CNAME)
     except Exception as exc:
         logger.warning("JRA payout index was not reachable: %s", exc)
-        return _join_note(_failure_warning(exc), extra()), None, source_of()
+        return _failure_check(exc, extra(), source_of())
     cname = _meeting_cname(index, key)
     if cname is None:
-        return _join_note(JRA_PAYOUT_UNREACHABLE, extra()), None, source_of()
+        return PayoutCheck(_join_note(JRA_PAYOUT_UNREACHABLE, extra()), None, source_of())
     try:
         day_html = _post(poster, cname)
     except Exception as exc:
         logger.warning("JRA payout day page was not reachable: %s", exc)
-        return _join_note(_failure_warning(exc), extra()), None, source_of()
+        return _failure_check(exc, extra(), source_of())
     refunds = _race_refunds(day_html, key.race_number)
     if not payouts:
-        return extra(), refunds, source_of()
+        return PayoutCheck(extra(), refunds, source_of())
     official = _race_tickets(day_html, key.race_number)
     if official is None:
-        return _join_note(JRA_PAYOUT_UNREACHABLE, extra()), refunds, source_of()
-    return _join_note(_mismatch(payouts, official), extra()), refunds, source_of()
+        return PayoutCheck(_join_note(JRA_PAYOUT_UNREACHABLE, extra()), refunds, source_of())
+    return PayoutCheck(_join_note(_mismatch(payouts, official), extra()), refunds, source_of())
 
 
 def _join_note(warning: str | None, extra: str | None) -> str | None:
@@ -178,9 +190,25 @@ def _payout_poster(
 def _failure_warning(exc: BaseException) -> str:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
     if status in {401, 403}:
         return JRA_PAYOUT_FORBIDDEN
     return JRA_PAYOUT_UNREACHABLE
+
+
+def _failure_check(exc: BaseException, extra: str | None, source: str) -> PayoutCheck:
+    """A refused payout fetch carries the status. Other failures stay unreachable."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    warning = _join_note(_failure_warning(exc), extra)
+    if status == 403:
+        return PayoutCheck(warning, None, source, 403, False)
+    if status == 401:
+        return PayoutCheck(warning, None, source, 401, True)
+    return PayoutCheck(warning, None, source)
 
 
 def _post(post: object, cname: str) -> str:
@@ -351,14 +379,46 @@ def _pop_groups(tickets: list[_Ticket]) -> dict[tuple[str, str, int], list[int |
     return groups
 
 
+def _tie_prices(tickets: list[_Ticket]) -> set[tuple[str, int]]:
+    """Bet types whose rows share one yen amount. Order of 人気 on a tie is not a mismatch."""
+    counts: dict[tuple[str, int], int] = {}
+    for ticket in tickets:
+        key = (ticket.bet_type, ticket.payout)
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
 def _popularities_compatible(left: list[_Ticket], right: list[_Ticket]) -> bool:
-    """Same money rows. A blank popularity does not disagree with a printed one."""
+    """Same money rows. A blank popularity does not disagree with a printed one.
+
+    Two 複勝 at the same yen with swapped 人気 are the same multiset. A single
+    ticket whose 人気 differs still disagrees.
+    """
     left_groups = _pop_groups(left)
     right_groups = _pop_groups(right)
     if set(left_groups) != set(right_groups):
         return False
+    tied = _tie_prices(left)
+    if tied != _tie_prices(right):
+        return False
     for key, pops in left_groups.items():
+        bet_type, _combination, payout = key
+        if (bet_type, payout) in tied:
+            continue
         if not _pop_counts_fit(pops, right_groups[key]):
+            return False
+    for bet_type, payout in tied:
+        left_pops = [
+            ticket.popularity
+            for ticket in left
+            if ticket.bet_type == bet_type and ticket.payout == payout
+        ]
+        right_pops = [
+            ticket.popularity
+            for ticket in right
+            if ticket.bet_type == bet_type and ticket.payout == payout
+        ]
+        if not _pop_counts_fit(left_pops, right_pops):
             return False
     return True
 

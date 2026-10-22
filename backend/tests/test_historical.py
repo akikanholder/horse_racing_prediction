@@ -540,6 +540,32 @@ def test_page_cache_skips_a_second_fetch_and_keeps_fetched_at(tmp_path: Path):
     assert stamped is not None
 
 
+def test_partial_result_html_is_not_cached(tmp_path: Path):
+    top5 = _load("netkeiba_race_result_top5.html")
+    full = _load("netkeiba_race_result.html")
+    calls: list[str] = []
+
+    class _Transport:
+        def __init__(self, body: str):
+            self.body = body
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            calls.append(url)
+            return self.body
+
+    url = "https://race.netkeiba.com/race/result.html"
+    flash = CachingHTTPClient(tmp_path / "flash", transport=_Transport(top5), min_request_interval=0)
+    flash.get(url, params={"race_id": RACE_ID})
+    flash.get(url, params={"race_id": RACE_ID})
+    assert calls == [url, url]
+
+    calls.clear()
+    cached = CachingHTTPClient(tmp_path / "full", transport=_Transport(full), min_request_interval=0)
+    cached.get(url, params={"race_id": RACE_ID})
+    cached.get(url, params={"race_id": RACE_ID})
+    assert calls == [url]
+
+
 def test_login_wall_is_not_cached(tmp_path: Path):
     calls: list[int] = []
 

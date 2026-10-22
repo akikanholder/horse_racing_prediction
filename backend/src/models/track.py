@@ -175,6 +175,29 @@ class TrackInfo(BaseModel):
         default_factory=list, description="週間天候情報"
     )
     source: str = Field(..., description="データソース (JRA/Netkeiba)")
+    measured_at: datetime | None = Field(
+        None,
+        description="ページに印字された測定時刻。Asia/Tokyo。印字が無ければ null。fetched_at からは作らない",
+    )
+    is_today: bool | None = Field(
+        None,
+        description="測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null",
+    )
+    stale: bool | None = Field(
+        None,
+        description="測定日がレース日と違うとき true。測定時刻が無い、またはレース日が読めないときは null",
+    )
+    http_status: int | None = Field(
+        None,
+        description=(
+            "取得が HTTP 401 または 403 で止まったときのステータス。"
+            "本文に 403 という数字があっても、拒否そのもの以外では null"
+        ),
+    )
+    login_required: bool = Field(
+        False,
+        description="ログイン画面で止まったとき true。本文の文字列からは付けない",
+    )
     warning: str | None = Field(
         None, description="取得できない理由。取れたときは null"
     )

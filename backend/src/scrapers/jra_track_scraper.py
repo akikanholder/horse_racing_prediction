@@ -6,7 +6,7 @@ Source: https://www.jra.go.jp/keiba/baba/index.html
 import logging
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -26,7 +26,16 @@ from backend.models.track import (
 )
 from backend.scrapers.base_scraper import BaseScraper
 from backend.scrapers.jra_headless import HeadlessTransport
-from backend.scrapers.page_fallback import FetchedBody, PageFallback
+from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
+from backend.scrapers.track_freshness import (
+    CACHED_COPY,
+    FRESH_REQUEST_HEADERS,
+    apply_measurement_freshness,
+    cached_copy_seen,
+    clear_cached_copy_flag,
+    measurement_times,
+    page_measurement_time,
+)
 from backend.scrapers.track_readings import (
     CUSHION_MISSING,
     PrintedMoisture,
@@ -152,7 +161,13 @@ class JRATrackScraper(BaseScraper):
         return urljoin(self.BASE_URL, self.TRACK_INFO_PATH)
 
     def scrape(
-        self, racecourse: str | None = None, *, fetched_at: datetime | None = None
+        self,
+        racecourse: str | None = None,
+        *,
+        fetched_at: datetime | None = None,
+        race_date: date | None = None,
+        today: date | None = None,
+        race_date_warning: str | None = None,
     ) -> TrackInfo:
         """Scrape track information from the current JRA baba tabs.
 
@@ -170,37 +185,92 @@ class JRATrackScraper(BaseScraper):
                        title names a meeting.
             fetched_at: Timestamp stored on each copied value. Defaults to now
                        in Asia/Tokyo.
+            race_date: Day the reading is for. Null means today in Asia/Tokyo.
+            today: Clock date used for ``is_today``. Defaults to today in Asia/Tokyo.
+            race_date_warning: Set when the caller could not read the race date.
+                ``stale`` stays null. The comparison day is not invented.
 
         Returns:
             TrackInfo object with the scraped data, or an empty one
         """
         fetched = fetched_at or tokyo_now()
         self._transport.fallback_warning = None
+        clear_cached_copy_flag(self.http_client)
         requested = self._requested_name(racecourse)
         if racecourse and requested is None:
             return empty_track_info("JRA", self.BABA_UNPARSEABLE)
-        pages, sources, saw_403, saw_error = self._load_meeting_tabs(requested)
+        pages, sources, saw_403, saw_error, saw_login = self._load_meeting_tabs(requested)
 
         chosen = self._choose_page(pages, requested)
         if chosen is None:
             htmls = [html for _, html in pages]
-            return empty_track_info("JRA", self._miss_warning(htmls, saw_403, saw_error))
+            warning = self._miss_warning(htmls, saw_403, saw_error, saw_login)
+            return self._finish(
+                self._with_access(
+                    empty_track_info("JRA", warning),
+                    warning=warning,
+                    saw_403=saw_403,
+                    saw_login=saw_login,
+                ),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
         url, html = chosen
         venue = self._title_venue(html) or requested
         if venue is None:
-            return empty_track_info("JRA", self.BABA_UNPARSEABLE)
+            return self._finish(
+                empty_track_info("JRA", self.BABA_UNPARSEABLE),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
         loaded = self._enrich(url, html, fetched, document_source=sources.get(url))
         if not loaded.pages:
-            return empty_track_info("JRA", self._blocked_warning(loaded.warning))
+            return self._finish(
+                self._with_fetch_block(
+                    empty_track_info("JRA", self._blocked_warning(loaded)), loaded
+                ),
+                race_date=race_date,
+                today=today,
+                race_date_warning=race_date_warning,
+            )
         info = self._from_pages(loaded.pages, venue)
-        extra = join_warnings(loaded.warning, self._transport.fallback_warning)
+        if loaded.status == "blocked":
+            extra = join_warnings(self._transport.fallback_warning, self._blocked_warning(loaded))
+            info = self._with_fetch_block(info, loaded)
+        else:
+            extra = join_warnings(loaded.warning, self._transport.fallback_warning)
         if extra:
             info = info.model_copy(update={"warning": join_warnings(info.warning, extra)})
-        return info
+        return self._finish(
+            info,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
+
+    def _finish(
+        self,
+        info: TrackInfo,
+        *,
+        race_date: date | None,
+        today: date | None,
+        race_date_warning: str | None = None,
+    ) -> TrackInfo:
+        """Attach a cache-hit note, then the printed measurement clock."""
+        if cached_copy_seen(self.http_client):
+            info = info.model_copy(update={"warning": join_warnings(info.warning, CACHED_COPY)})
+        return apply_measurement_freshness(
+            info,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
 
     def _load_meeting_tabs(
         self, requested: str | None
-    ) -> tuple[list[tuple[str, str]], dict[str, str], bool, bool]:
+    ) -> tuple[list[tuple[str, str]], dict[str, str], bool, bool, bool]:
         """The two known tabs, then further ``indexN.html`` links when needed.
 
         A requested meeting that is already on ``index.html`` or ``index2.html``
@@ -211,22 +281,31 @@ class JRATrackScraper(BaseScraper):
         sources: dict[str, str] = {}
         saw_403 = False
         saw_error = False
+        saw_login = False
         seen: set[str] = set()
 
         def fetch(url: str) -> str | None:
-            nonlocal saw_403, saw_error
-            if url in seen:
+            nonlocal saw_403, saw_error, saw_login
+            if url in seen or saw_login:
                 return None
             seen.add(url)
             try:
-                html = self.http_client.get(url, encoding=self.BABA_ENCODING)
+                html = self.http_client.get(
+                    url, encoding=self.BABA_ENCODING, headers=dict(FRESH_REQUEST_HEADERS)
+                )
             except Exception as e:
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if status == 403:
                     saw_403 = True
+                elif status == 401:
+                    saw_login = True
                 else:
                     saw_error = True
                 logger.info("JRA baba fetch failed for %s (%s)", url, e)
+                return None
+            if looks_like_login_wall(html):
+                saw_login = True
+                logger.info("JRA baba requires login for %s", url)
                 return None
             pages.append((url, html))
             sources[url] = "headless" if self._transport.used_headless else "jra_html"
@@ -244,7 +323,7 @@ class JRATrackScraper(BaseScraper):
                 html = fetch(url)
                 if html and self._title_venue(html) == requested:
                     break
-        return pages, sources, saw_403, saw_error
+        return pages, sources, saw_403, saw_error, saw_login
 
     def _requested_name(self, racecourse: str | None) -> str | None:
         """Japanese meeting name for a code or name. Unknown codes stay unset."""
@@ -268,8 +347,12 @@ class JRATrackScraper(BaseScraper):
             return name
         return None
 
-    def _miss_warning(self, pages: list[str], saw_403: bool, saw_error: bool) -> str:
+    def _miss_warning(
+        self, pages: list[str], saw_403: bool, saw_error: bool, saw_login: bool = False
+    ) -> str:
         """Why no tab was copied. A foreign title is not this meeting."""
+        if saw_login:
+            return self.BABA_LOGIN
         if any(self._title_venue(html) for html in pages):
             return self.BABA_NOT_MEETING
         if saw_403:
@@ -292,13 +375,42 @@ class JRATrackScraper(BaseScraper):
                 return url, html
         return None
 
-    def _blocked_warning(self, warning: str | None) -> str:
+    def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the baba warnings. Do not read the body."""
-        if warning and "403" in warning:
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status == 403 and not login:
             return self.BABA_403
-        if warning and "login" in warning:
+        if login or status == 401:
             return self.BABA_LOGIN
         return self.BABA_FETCH_FAILED
+
+    def _with_access(
+        self,
+        info: TrackInfo,
+        *,
+        warning: str,
+        saw_403: bool,
+        saw_login: bool,
+    ) -> TrackInfo:
+        """Set the refusal flags only when that refusal is why the meeting was missed.
+
+        A 403 on one tab does not mark the result blocked when another tab names
+        a venue. The warning is then "not this meeting", and ``http_status`` stays null.
+        """
+        if warning == self.BABA_LOGIN and saw_login:
+            return info.model_copy(update={"http_status": 401, "login_required": True})
+        if warning == self.BABA_403 and saw_403:
+            return info.model_copy(update={"http_status": 403, "login_required": False})
+        return info
+
+    def _with_fetch_block(self, info: TrackInfo, loaded: object) -> TrackInfo:
+        """Copy a fallback refusal onto the track info. Text in the body is not a status."""
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status not in {401, 403} and not login:
+            return info
+        return info.model_copy(update={"http_status": status, "login_required": login})
 
     def _enrich(
         self,
@@ -318,7 +430,7 @@ class JRATrackScraper(BaseScraper):
         return fallback.load(
             url=url,
             params=None,
-            headers=None,
+            headers=dict(FRESH_REQUEST_HEADERS),
             encoding=self.BABA_ENCODING,
             fetched_at=fetched_at,
             should_fallback=self._cushion_slot_empty,
@@ -331,7 +443,12 @@ class JRATrackScraper(BaseScraper):
         """``_data_cushion.html`` and ``_data_moist.html`` only."""
 
         def fetch(script_url: str) -> str:
-            return fetch_or_block(self.http_client.get, script_url, encoding=self.BABA_ENCODING)
+            return fetch_or_block(
+                self.http_client.get,
+                script_url,
+                encoding=self.BABA_ENCODING,
+                headers=dict(FRESH_REQUEST_HEADERS),
+            )
 
         return discover_jra_baba_urls(html, page_url, fetch)
 
@@ -454,8 +571,11 @@ class JRATrackScraper(BaseScraper):
         turf_condition = self._extract_track_condition(soup, CourseType.TURF)
         dirt_condition = self._extract_track_condition(soup, CourseType.DIRT)
         cushion_value = self._extract_cushion_value(soup, source, fetched_at, year)
-        turf_moisture, dirt_moisture = self._extract_moisture_content(soup, source, fetched_at)
+        turf_moisture, dirt_moisture = self._extract_moisture_content(
+            soup, source, fetched_at, year
+        )
         post = post_time_on_page(soup.get_text(" ", strip=True))
+        measured_at = page_measurement_time(soup.get_text("\n", strip=True), year)
 
         turf_info = CourseInfo(
             course_type=CourseType.TURF,
@@ -483,6 +603,7 @@ class JRATrackScraper(BaseScraper):
             grass_info=self._extract_grass_info(soup),
             weekly_info=self._extract_weekly_info(soup),
             source="JRA",
+            measured_at=measured_at,
             warning=None,
             post_time=post,
             post_time_source=source if post else None,
@@ -569,11 +690,12 @@ class JRATrackScraper(BaseScraper):
         soup: BeautifulSoup,
         source: str,
         fetched_at: datetime,
+        year: int | None,
     ) -> tuple[MoistureContent | None, MoistureContent | None]:
         """Moisture printed in the goal / 4th-corner cells. The legend is ignored."""
         turf_moisture = None
         dirt_moisture = None
-        measured_at = self._extract_measurement_time(soup, "含水率", None)
+        measured_at = self._extract_measurement_time(soup, "含水率", year)
 
         tables = soup.find_all("table")
         for table in tables:
@@ -669,20 +791,15 @@ class JRATrackScraper(BaseScraper):
         self, soup: BeautifulSoup, section_name: str, year: int | None
     ) -> datetime | None:
         """Measurement clock printed with ``section_name``. No year means null."""
-        text = soup.get_text()
-        pattern = (
-            rf"{section_name}[^\n]*?(\d{{1,2}})月(\d{{1,2}})日[^\d]*(\d{{1,2}})[時:](\d{{1,2}})"
-        )
-        match = re.search(pattern, text, re.DOTALL)
-        if match is None or year is None:
-            return None
-        return datetime(
-            year,
-            int(match.group(1)),
-            int(match.group(2)),
-            int(match.group(3)),
-            int(match.group(4)),
-        )
+        lines = soup.get_text("\n", strip=True).splitlines()
+        for index, line in enumerate(lines):
+            if section_name not in line:
+                continue
+            window = " ".join(lines[index : index + 3])
+            times = measurement_times(window, year)
+            if times:
+                return times[0]
+        return None
 
     def _extract_grass_info(self, soup: BeautifulSoup) -> GrassInfo | None:
         """Extract grass length and course information."""
