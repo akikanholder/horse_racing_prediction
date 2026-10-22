@@ -1,3 +1,8 @@
+# Minimum versions. Reproducible setup uses backend/requirements.lock via
+# `make setup` / scripts/setup.sh (Windows: scripts/setup.ps1). The lock
+# includes the headless extra. Do not install this file alone when rebuilding
+# backend/.venv.
+
 # Web scraping
 requests>=2.31.0
 beautifulsoup4>=4.12.0

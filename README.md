@@ -59,11 +59,56 @@ EV（競馬予想）が CLI と HTTP JSON を読む契約は [docs/ev-contract.m
 
 ## インストール
 
+Python 3.11 以上が要る。再現するときは `backend/requirements.lock` の固定版を使う。次のコマンドで `backend/.venv` を作り、本体・headless extra（Playwright）・開発依存を入れ、Chromium を置き、オフラインのセルフチェックまで行う。Node.js は不要。
+
 ```bash
-# 依存パッケージのインストール
-pip install -r backend/requirements.txt
-pip install -e backend
+make setup
 ```
+
+`make` が無いときは `bash scripts/setup.sh`。Windows は次のとおり。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
+```
+
+`backend/.venv` は git に入らない。消えたあとも同じコマンドで戻る。中身を捨てて入れ直すときは `--force`。
+
+```bash
+make setup-force
+# または
+bash scripts/setup.sh --force
+```
+
+別の Python は `PYTHON=/path/to/python3.11 bash scripts/setup.sh`。終わったら有効にする。
+
+```bash
+source backend/.venv/bin/activate
+python -m backend.cli --help
+```
+
+Windows の有効化は `backend\.venv\Scripts\Activate.ps1`。
+
+セルフチェックは JRA や netkeiba を開かない。確認するのは次の4つ。
+
+- `import backend`
+- `python -m backend.cli --help`
+- `pytest -m "not integration"` の一部（`tests/test_csv_export.py`）
+- headless Chromium が `about:blank` を開けること
+
+`backend/requirements.txt` は最低版のメモ。セットアップはロックを使う。ロックを作り直すときは `backend/` で次を実行する。
+
+```bash
+pip-compile --extra=headless --extra=dev --output-file=requirements.lock pyproject.toml
+```
+
+### うまくいかないとき
+
+- 表示が `outside requires-python >=3.11`: Python 3.11 以上を入れて、`python3` か `PYTHON` がその実行ファイルを指すようにしてからやり直す。
+- Debian/Ubuntu で `ensurepip is not available`: その Python の venv パッケージを入れる。例は `sudo apt install python3.12-venv`。そのあと `make setup`。
+- `backend/.venv` が壊れている、または Python の版が違う: `make setup-force`。`--force` が無くても、Python が動かないか `requires-python` を外れている環境は作り直す。
+- Chromium が共有ライブラリ不足で起動しない: Linux では `backend/.venv/bin/python -m playwright install-deps chromium`（管理者権限）。ブラウザの取得先は Playwright の配布で、JRA と netkeiba には繋がない。
+- `backend/requirements.lock` が無い: 未固定のインストールには落とさず失敗する。ファイルを戻すか、上の `pip-compile` で作り直す。
+- `node` が無い: 注記だけで、失敗にはしない。
 
 ## 使用方法
 
@@ -546,9 +591,15 @@ netkeiba の馬ページに脚質の項目は無い。成績の「ペース」�
 ## プロジェクト構成
 
 ```
+Makefile                 # make setup / make setup-force
+scripts/
+├── setup.sh             # macOS / Linux
+├── setup.ps1            # Windows
+└── setup_support.py     # 版チェック、venv、セルフチェック
 backend/
 ├── pyproject.toml       # パッケージ定義
-├── requirements.txt     # 依存パッケージ
+├── requirements.txt     # 最低バージョン
+├── requirements.lock    # 再現用の固定バージョン
 ├── pytest.ini           # pytest 設定
 ├── examples/            # 使用例
 │   └── demo_scraper.py
@@ -586,12 +637,16 @@ backend/
 
 ## テスト
 
+`make setup` のあと、`backend/.venv` の Python で実行する。
+
 ```bash
 cd backend
-pytest
-pytest -m "not integration"
-pytest -m "integration"
+.venv/bin/python -m pytest
+.venv/bin/python -m pytest -m "not integration"
+.venv/bin/python -m pytest -m "integration"
 ```
+
+Windows は `backend\.venv\Scripts\python.exe -m pytest -m "not integration"`。
 
 ## 技術スタック
 
