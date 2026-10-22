@@ -405,6 +405,8 @@ class SettledRaceResult(BaseModel):
         description=(
             "provisional（確定前・暫定）か confirmed（確定）。"
             "印字、または払戻表と全着順、または JRA の払戻表。決められなければ null。"
+            "払戻が無く局面も null のときは warning に result phase was not on the page を残す。"
+            "最終結果は result_phase が confirmed かつ complete が true のときだけ。"
             "結果ページ由来のときは source と fetched_at がその出典。"
             "JRA の払戻表だけが示したときは source に jra_html または headless を足す"
         ),

@@ -239,7 +239,7 @@ with TrackInfoService() as service:
 - 同着は同じ着順の行をページの順で残す。`1同着` も着順は数字。並べ替えない。
 - `refunds` は払戻の隣。返還の印字（馬番、印字されていれば馬券種、JRA の返還同枠）があるときだけ。無いときは null。取消・除外と一致する返還に警告は足さない。金額は作らない。
 - `complete` は、取消・除外を除いた頭数がページの `N頭` から同じ取消・除外を引いた数と一致し、各馬に `status` があり、速報の上位5頭だけではないとき true。足りないときは false と `race result incomplete: …`。`--wait-complete` は揃うまで取り直す（間隔は 60 秒以上、`--max-wait` の既定は 600 秒。どちらも 0 以上の有限値）。取り直さないのは取得の HTTP 401/403 とログイン。払戻金の「403円」では止まらない。呼び出し側が時刻を渡さない `fetched_at` は Asia/Tokyo（`+09:00`）。
-- `result_phase` はページが `確定` か `確定前`（暫定・未確定）と印字しているとき `confirmed` / `provisional`。印字が無くても、払戻表と全着順がある、または JRA の払戻表があるときは `confirmed`。タイトルや「速報」からは決めない。決められないとき null。`complete` なら `result phase was not on the page` は出さない。その警告は着順が揃っていないときだけ。JRA の払戻表だけが示したときは `source` に `jra_html` または `headless` を足す。
+- `result_phase` はページが `確定` か `確定前`（暫定・未確定）と印字しているとき `confirmed` / `provisional`。印字が無くても、払戻表と全着順がある、または JRA の払戻表があるときは `confirmed`。タイトルや「速報」からは決めない。決められないとき null とし、`result phase was not on the page` を出す。着順が揃っていても払戻が無ければこの警告は残す。出さないのは局面が決まったときだけ。最終結果として扱うのは `result_phase` が `confirmed` かつ `complete` が true のときだけ。JRA の払戻表だけが示したときは `source` に `jra_html` または `headless` を足す。
 - 着順表が `N頭` より短い、空、壊れているときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。各値の `source` は `netkeiba_html` / `netkeiba_js` / `headless`。`fetched_at` はその値を得た時刻。ヘッドレスは任意（`pip install -e ".[headless]"`）。未インストールなら警告だけ。403 とログイン画面は止め、回避しない。
 - 開催日はページの `kaisai_date`（無ければタイトルの年月日）。レースIDの桁からは日付を作らない。
 - 競馬場、距離、芝/ダート、馬場、天候は結果ページに書いてあるときだけ入る。馬場の `稍` は馬成績と同じく `稍重`。

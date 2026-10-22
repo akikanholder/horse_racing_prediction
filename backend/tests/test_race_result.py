@@ -1608,12 +1608,48 @@ def test_real_confirmed_races_without_a_phase_label_are_confirmed():
     assert excluded.rank is None
 
 
-def test_complete_result_without_a_phase_signal_does_not_warn():
+def test_real_takamatsunomiya_2020_demotion_keeps_the_official_rank():
+    """202007010811 高松宮記念. クリノガウディー finished 4th with 1位降着 on the page."""
+    settled, _client = _settled(_load("netkeiba_result_202007010811.html"), "202007010811")
+    assert settled.race_name == "高松宮記念"
+    assert settled.race_date == date(2020, 3, 29)
+    assert settled.venue == "中京"
+    assert settled.complete is True
+    assert settled.result_phase == "confirmed"
+    assert settled.source == "netkeiba_html"
+    assert settled.warning == JRA_PAYOUT_UNREACHABLE
+    demoted = [row for row in settled.results if row.demoted]
+    assert len(demoted) == 1
+    horse = demoted[0]
+    assert horse.horse_name == "クリノガウディー"
+    assert horse.horse_number == 11
+    assert horse.rank == 4
+    assert horse.status == "finished"
+    assert horse.status_label is None
+    assert horse.source == "netkeiba_html"
+    assert horse.fetched_at == FETCHED_AT
+    assert all(row.status != "disqualified" for row in settled.results)
+
+
+def test_complete_order_without_payouts_warns_when_the_phase_is_unknown():
+    """A full order with no payouts is not confirmed when JRA is not read."""
     html = _result_html([_row("1", 1, "イチ")], heads=1)
-    settled, _client = _settled(html)
+    settled, client = _settled(html)
     assert settled.complete is True
     assert settled.result_phase is None
-    assert settled.warning is None
+    assert settled.payouts == []
+    assert settled.warning == RACE_RESULT_PHASE_UNKNOWN
+    assert [call["url"] for call in client.calls] == [RESULT_URL]
+
+
+def test_payouts_and_full_order_drop_the_phase_warning_when_jra_is_unreachable():
+    html = _result_html([_row("1", 1, "イチ")], heads=1, extra=_WIN_PAYOUT)
+    settled, _client = _settled(html)
+    assert settled.complete is True
+    assert settled.result_phase == "confirmed"
+    assert settled.source == "netkeiba_html"
+    assert settled.warning == JRA_PAYOUT_UNREACHABLE
+    assert RACE_RESULT_PHASE_UNKNOWN not in (settled.warning or "")
 
 
 def test_printed_provisional_wins_over_the_payout_table_and_jra():

@@ -2743,7 +2743,9 @@ class NetkeibaScraper(BaseScraper):
         phase = None if phase_disagree else header.result_phase
         if phase_disagree:
             phase_warning = RACE_RESULT_PHASE_DISAGREE
-        elif phase is None and not complete:
+        elif phase is None:
+            # A full order is not a confirmed result. Keep the warning until a
+            # label, payouts plus the full order, or the JRA payout table sets a phase.
             phase_warning = RACE_RESULT_PHASE_UNKNOWN
         return SettledRaceResult(
             race_id=race_id,
@@ -2820,7 +2822,9 @@ class NetkeibaScraper(BaseScraper):
             notes.append(refund_note)
         notes.append(_refund_status_warning(settled.results, refunds))
         warning = _join_warnings(settled.warning, *notes)
-        if phase is not None or settled.complete:
+        # Drop the phase warning only after a phase is known. complete alone,
+        # including a full order with no payouts and JRA unread, is not enough.
+        if phase is not None:
             warning = _drop_warning(warning, RACE_RESULT_PHASE_UNKNOWN)
         update: dict[str, object] = {}
         if warning != settled.warning:
