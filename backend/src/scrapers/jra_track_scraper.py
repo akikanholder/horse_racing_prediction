@@ -204,8 +204,14 @@ class JRATrackScraper(BaseScraper):
         chosen = self._choose_page(pages, requested)
         if chosen is None:
             htmls = [html for _, html in pages]
+            warning = self._miss_warning(htmls, saw_403, saw_error, saw_login)
             return self._finish(
-                empty_track_info("JRA", self._miss_warning(htmls, saw_403, saw_error, saw_login)),
+                self._with_access(
+                    empty_track_info("JRA", warning),
+                    warning=warning,
+                    saw_403=saw_403,
+                    saw_login=saw_login,
+                ),
                 race_date=race_date,
                 today=today,
                 race_date_warning=race_date_warning,
@@ -222,13 +228,19 @@ class JRATrackScraper(BaseScraper):
         loaded = self._enrich(url, html, fetched, document_source=sources.get(url))
         if not loaded.pages:
             return self._finish(
-                empty_track_info("JRA", self._blocked_warning(loaded.warning)),
+                self._with_fetch_block(
+                    empty_track_info("JRA", self._blocked_warning(loaded)), loaded
+                ),
                 race_date=race_date,
                 today=today,
                 race_date_warning=race_date_warning,
             )
         info = self._from_pages(loaded.pages, venue)
-        extra = join_warnings(loaded.warning, self._transport.fallback_warning)
+        if loaded.status == "blocked":
+            extra = join_warnings(self._transport.fallback_warning, self._blocked_warning(loaded))
+            info = self._with_fetch_block(info, loaded)
+        else:
+            extra = join_warnings(loaded.warning, self._transport.fallback_warning)
         if extra:
             info = info.model_copy(update={"warning": join_warnings(info.warning, extra)})
         return self._finish(
@@ -285,6 +297,8 @@ class JRATrackScraper(BaseScraper):
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if status == 403:
                     saw_403 = True
+                elif status == 401:
+                    saw_login = True
                 else:
                     saw_error = True
                 logger.info("JRA baba fetch failed for %s (%s)", url, e)
@@ -361,13 +375,42 @@ class JRATrackScraper(BaseScraper):
                 return url, html
         return None
 
-    def _blocked_warning(self, warning: str | None) -> str:
+    def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the baba warnings. Do not read the body."""
-        if warning and "403" in warning:
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status == 403 and not login:
             return self.BABA_403
-        if warning and "login" in warning:
+        if login or status == 401:
             return self.BABA_LOGIN
         return self.BABA_FETCH_FAILED
+
+    def _with_access(
+        self,
+        info: TrackInfo,
+        *,
+        warning: str,
+        saw_403: bool,
+        saw_login: bool,
+    ) -> TrackInfo:
+        """Set the refusal flags only when that refusal is why the meeting was missed.
+
+        A 403 on one tab does not mark the result blocked when another tab names
+        a venue. The warning is then "not this meeting", and ``http_status`` stays null.
+        """
+        if warning == self.BABA_LOGIN and saw_login:
+            return info.model_copy(update={"http_status": 401, "login_required": True})
+        if warning == self.BABA_403 and saw_403:
+            return info.model_copy(update={"http_status": 403, "login_required": False})
+        return info
+
+    def _with_fetch_block(self, info: TrackInfo, loaded: object) -> TrackInfo:
+        """Copy a fallback refusal onto the track info. Text in the body is not a status."""
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status not in {401, 403} and not login:
+            return info
+        return info.model_copy(update={"http_status": status, "login_required": login})
 
     def _enrich(
         self,

@@ -115,6 +115,8 @@ def test_jra_403_is_trackinfo_with_null_venue_and_measurements():
     info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
     _assert_null_measurement(info)
     assert info.warning == JRATrackScraper.BABA_403
+    assert info.http_status == 403
+    assert info.login_required is False
     assert info.source == "JRA"
     assert client.urls == [BABA_TOKYO, BABA_KYOTO]
     assert client.encodings == ["cp932", "cp932"]

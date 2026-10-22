@@ -3,8 +3,10 @@
 from datetime import date, datetime
 from pathlib import Path
 
+import pytest
 import requests
 
+from backend.models.track import TrackInfo
 from backend.scrapers.jra_track_scraper import JRATrackScraper
 from backend.scrapers.page_cache import CachingHTTPClient
 from backend.scrapers.track_freshness import (
@@ -12,6 +14,8 @@ from backend.scrapers.track_freshness import (
     RACE_DATE_UNREADABLE,
     STALE_PREFIX,
     cached_copy_warning,
+    needs_fresh_wait,
+    track_blocked,
 )
 from backend.services.track_info_service import TrackInfoService
 from backend.utils.date_utils import TOKYO
@@ -236,6 +240,8 @@ def test_wait_fresh_refetches_a_stale_reading_and_stops_on_403():
     )
     assert slept == []
     assert results["jra"].warning == JRATrackScraper.BABA_403
+    assert results["jra"].http_status == 403
+    assert results["jra"].login_required is False
     assert blocked.urls == [BABA_TOKYO, BABA_KYOTO]
 
 
@@ -258,5 +264,110 @@ def test_login_wall_does_not_open_the_next_tab_or_wait():
     )
     assert slept == []
     assert results["jra"].warning == JRATrackScraper.BABA_LOGIN
+    assert results["jra"].http_status == 401
+    assert results["jra"].login_required is True
     assert results["jra"].turf is None or results["jra"].turf.cushion is None
     assert client.urls == [BABA_TOKYO]
+
+
+def _reading(**kwargs: object) -> TrackInfo:
+    payload = {
+        "source": "JRA",
+        "measured_at": datetime(2026, 10, 16, 12, 0, tzinfo=TOKYO),
+        "stale": True,
+        "warning": "note 1403円",
+    }
+    payload.update(kwargs)
+    return TrackInfo(**payload)  # type: ignore[arg-type]
+
+
+def test_wait_fresh_only_when_today_and_the_measurement_is_earlier():
+    earlier = _reading()
+    assert track_blocked(earlier) is False
+    assert needs_fresh_wait({"jra": earlier}, race_date=RACE_DAY, today=RACE_DAY) is True
+    assert needs_fresh_wait({"jra": earlier}, race_date=None, today=RACE_DAY) is False
+    assert needs_fresh_wait({"jra": earlier}, race_date=date(2026, 10, 17), today=RACE_DAY) is False
+    assert needs_fresh_wait({"jra": earlier}, race_date=date(2026, 10, 19), today=RACE_DAY) is False
+    later = _reading(measured_at=datetime(2026, 10, 19, 12, 0, tzinfo=TOKYO))
+    assert needs_fresh_wait({"jra": later}, race_date=RACE_DAY, today=RACE_DAY) is False
+    blocked = _reading(http_status=403)
+    assert track_blocked(blocked) is True
+    assert needs_fresh_wait({"jra": blocked}, race_date=RACE_DAY, today=RACE_DAY) is False
+    missing = _reading(measured_at=None, stale=None)
+    assert needs_fresh_wait({"jra": missing}, race_date=RACE_DAY, today=RACE_DAY) is False
+
+
+def _stale_service() -> tuple[TrackInfoService, _Gets]:
+    stale = (FIXTURES / "jra_baba_stale_20261016.html").read_text(encoding="utf-8")
+    client = _Gets(gets={BABA_TOKYO: stale, BABA_KYOTO: _baba("京都")})
+    scraper = JRATrackScraper(http_client=client, headless_render="off")  # type: ignore[arg-type]
+    return TrackInfoService(jra_scraper=scraper), client
+
+
+def test_wait_fresh_returns_at_once_for_an_omitted_past_or_future_date():
+    for race_date in (None, "20261017", "20261019"):
+        service, client = _stale_service()
+        slept: list[float] = []
+        results = service.get_track_info(
+            racecourse="東京",
+            date=race_date,
+            sources=["jra"],
+            wait_fresh=True,
+            sleeper=slept.append,
+            clock=lambda: 0.0,
+            today=RACE_DAY,
+            max_wait=600,
+        )
+        assert slept == [], race_date
+        assert client.urls.count(BABA_TOKYO) == 1
+        assert results["jra"].stale is True
+        assert results["jra"].warning == f"{STALE_PREFIX}: 2026-10-16"
+
+
+def test_wait_fresh_does_not_wait_for_a_later_measurement():
+    client = _Gets(gets={BABA_TOKYO: _fresh_tokyo(), BABA_KYOTO: _baba("京都")})
+    scraper = JRATrackScraper(http_client=client, headless_render="off")  # type: ignore[arg-type]
+    service = TrackInfoService(jra_scraper=scraper)
+    slept: list[float] = []
+    results = service.get_track_info(
+        racecourse="東京",
+        date="20261016",
+        sources=["jra"],
+        wait_fresh=True,
+        sleeper=slept.append,
+        clock=lambda: 0.0,
+        today=date(2026, 10, 16),
+    )
+    assert slept == []
+    assert results["jra"].stale is True
+    assert results["jra"].measured_at == datetime(2026, 10, 18, 15, 0, tzinfo=TOKYO)
+
+
+def test_announcement_time_is_not_a_measurement():
+    html = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <div class="content" id="cushion_num"><p><strong>9.4</strong></p></div>
+        <p>クッション値 10月18日（日曜）9時00分現在</p>
+        <p>馬場発表予定 10月18日（日曜）16時30分</p>
+        """,
+    )
+    info = _scrape(_Gets(gets={BABA_TOKYO: html, BABA_KYOTO: _baba("京都")}))
+    assert info.measured_at == datetime(2026, 10, 18, 9, 0, tzinfo=TOKYO)
+
+    only_announcement = _baba(
+        "東京",
+        "<p>2026年10月18日</p><p>クッション値 9.4</p><p>発表予定 10月18日 16時30分</p>",
+    )
+    info = _scrape(_Gets(gets={BABA_TOKYO: only_announcement, BABA_KYOTO: _baba("京都")}))
+    assert info.measured_at is None
+    assert info.warning is None
+
+
+def test_wait_fresh_rejects_non_finite_seconds():
+    service = TrackInfoService()
+    with pytest.raises(ValueError, match="max_wait must be a finite number >= 0"):
+        service.get_track_info(wait_fresh=True, max_wait=float("nan"))
+    with pytest.raises(ValueError, match="retry_interval must be a finite number >= 0"):
+        service.get_track_info(wait_fresh=True, retry_interval=float("-inf"))

@@ -14,6 +14,7 @@ refusal.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime
 from urllib.parse import parse_qs, urlsplit
@@ -43,6 +44,16 @@ _HIT = re.compile(r"(?<![A-Za-z])HIT(?![A-Za-z])", re.IGNORECASE)
 _CACHE_HEADER = ("x-cache", "x-cache-status", "cf-cache-status", "x-akamai-cache")
 
 
+def require_finite_seconds(value: float, name: str) -> float:
+    """Seconds for a wait. ``nan`` and ``inf`` are rejected so a loop can end."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be a finite number >= 0")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{name} must be a finite number >= 0")
+    return number
+
+
 def polite_interval(requested: float) -> float:
     """At least a minute between refetches. A shorter request is raised."""
     return max(RETRY_FLOOR_SECONDS, float(requested))
@@ -53,16 +64,25 @@ def wait_budget_spent(started: float, now: float, interval: float, budget: float
     return now - started + interval > budget
 
 
+_FUTURE_CLOCK = ("発走", "発表", "予定")
+
+
 def measurement_times(text: str, year: int | None) -> list[datetime]:
-    """Clocks printed as ``M月D日 H時M分``. A 発走 clock is not a measurement.
+    """Clocks printed as ``M月D日 H時M分``. A 発走 or 発表予定 clock is not a measurement.
 
     The year is the one printed in the same stamp, otherwise ``year``. A stamp
     with no year stays out of the list. Nothing is filled from the fetch time.
+    A future clock is one whose stamp, or the few characters beside it, says
+    発走, 発表, or 予定.
     """
     found: list[datetime] = []
     for match in _STAMP.finditer(text):
+        # The next line's 発表予定 must not erase the clock above it.
+        # Six characters after the minutes is the same window used for 発走.
+        head = text[max(0, match.start() - 8) : match.start()]
         tail = text[match.end() : match.end() + 6]
-        if "発走" in match.group(0) or "発走" in tail:
+        around = head + match.group(0) + tail
+        if any(mark in around for mark in _FUTURE_CLOCK):
             continue
         printed_year = int(match.group(1)) if match.group(1) else year
         if printed_year is None:
@@ -227,14 +247,35 @@ def apply_measurement_freshness(
 
 
 def track_blocked(info: TrackInfo) -> bool:
-    """403 or a login wall. A later retry must not open the same URL again."""
-    warning = info.warning or ""
-    return "403" in warning or "requires login" in warning
+    """HTTP 401/403 or a login wall. A later retry must not open the same URL again.
+
+    The flag is set by the fetch. A warning that only mentions 403, such as a
+    reading note, is not a block.
+    """
+    return bool(info.login_required or info.http_status in {401, 403})
 
 
-def needs_fresh_wait(results: dict[str, TrackInfo]) -> bool:
-    """True when a reading's printed day is not the race date."""
-    return any(info.stale is True and not track_blocked(info) for info in results.values())
+def needs_fresh_wait(
+    results: dict[str, TrackInfo],
+    *,
+    race_date: date | None,
+    today: date | None = None,
+) -> bool:
+    """Wait only for today's meeting when the printed day is earlier than that.
+
+    An omitted race date, a past or future date, a missing clock, or a
+    measurement dated today or later returns immediately. ``stale`` can still
+    be true in those cases. A 403 or a login wall is not a reason to wait.
+    """
+    current = today or tokyo_now().date()
+    if race_date is None or race_date != current:
+        return False
+    for info in results.values():
+        if track_blocked(info) or info.measured_at is None:
+            continue
+        if _as_tokyo(info.measured_at).date() < race_date:
+            return True
+    return False
 
 
 def _stamp(info: TrackInfo) -> datetime | None:

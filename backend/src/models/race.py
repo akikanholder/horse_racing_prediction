@@ -365,7 +365,21 @@ class SettledRaceResult(BaseModel):
         None, description="クラス。結果ページに印字されたときだけ。レース名からは作らない"
     )
     entry_count: int | None = Field(None, description="ページの N頭。印字が無ければ null")
-    fetched_at: datetime = Field(..., description="取得日時")
+    fetched_at: datetime = Field(
+        ...,
+        description="取得日時。呼び出し側が時刻を渡さないときは Asia/Tokyo（+09:00）",
+    )
+    http_status: int | None = Field(
+        None,
+        description=(
+            "取得が HTTP 401 または 403 で止まったときのステータス。"
+            "払戻金の「403円」など、警告の文字列からは付けない"
+        ),
+    )
+    login_required: bool = Field(
+        False,
+        description="ログイン画面で止まったとき true。払戻の文面からは付けない",
+    )
     source: str | None = Field(
         None,
         description=(

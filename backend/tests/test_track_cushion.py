@@ -350,10 +350,43 @@ def test_successful_jra_cushion_does_not_call_netkeiba():
     assert netkeiba.urls == []
 
 
+def test_script_date_does_not_become_the_meeting_day():
+    script_only = """
+    <html><body>
+      <script>var built = "2026/04/02";</script>
+      <ul><li class="Active">東京</li></ul>
+      <span class="TrackTabArea00 Jyo_05">
+        <div class="TrackTurf01"><div class="CourseData">天候：晴 馬場：良</div></div>
+      </span>
+    </body></html>
+    """
+    chosen = """
+    <html><body>
+      <script>var built = "2026/04/02";</script>
+      <a class="Active" href="track.html?kaisai_date=20261018">10月18日</a>
+      <ul><li class="Active">東京</li></ul>
+      <span class="TrackTabArea00 Jyo_05">
+        <div class="TrackTurf01"><div class="CourseData">天候：晴 馬場：良</div></div>
+      </span>
+    </body></html>
+    """
+    client = _Gets(gets={NK_TRACK_OPEN: script_only})
+    info = NetkeibaTrackScraper(http_client=client, headless_render=_boom).scrape("05")  # type: ignore[arg-type]
+    assert info.date is None
+    assert info.racecourse == "東京"
+
+    client = _Gets(gets={NK_TRACK_OPEN: chosen})
+    info = NetkeibaTrackScraper(http_client=client, headless_render=_boom).scrape("05")  # type: ignore[arg-type]
+    assert info.date == datetime(2026, 10, 18)
+    assert info.racecourse == "東京"
+
+
 def test_netkeiba_403_does_not_render_or_invent_a_number():
     client = _Gets(errors={NK_TRACK_OPEN: _http_error(403)})
     info = NetkeibaTrackScraper(http_client=client, headless_render=_boom).scrape("05")  # type: ignore[arg-type]
     assert info.warning == NetkeibaTrackScraper.TRACK_403
+    assert info.http_status == 403
+    assert info.login_required is False
     assert info.racecourse is None
     assert info.turf is not None
     assert info.turf.cushion is None

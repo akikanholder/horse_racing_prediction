@@ -177,7 +177,7 @@ python -m backend.cli courses --venue 東京
 python -m backend.cli venues
 
 # 馬場情報を取得（--json は TrackInfo だけ。JRA が 403 のとき jra の cushion / moisture は null。同じ場・日は netkeiba の公開ページへ戻る）
-# measured_at はページの測定時刻。レース日と違う日は stale: true。--wait-fresh は揃うまで取り直す（60秒以上、403 とログインは取り直さない）
+# measured_at はページの測定時刻。レース日と違う日は stale: true。--wait-fresh は今日の開催で測定日がそれより前のときだけ取り直す（60秒以上、0以上の有限値）。日付の省略・過去・未来は待たない。403 とログインは取り直さない。JRA が 403 のとき netkeiba の stale は null で、それだけでは待たない
 python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
 python -m backend.cli track --venue 東京 --json
@@ -238,7 +238,7 @@ with TrackInfoService() as service:
 - 各馬の `status` は `finished` / `scratched` / `excluded` / `did_not_finish` / `disqualified` / `unknown`。`status_label` はページの文字のまま（`取消`、`除外`、`中止`、`競走中止`、`失格`）。行に `降着` があるときだけ `demoted: true`。着順はその公式順位。
 - 同着は同じ着順の行をページの順で残す。`1同着` も着順は数字。並べ替えない。
 - `refunds` は払戻の隣。返還の印字（馬番、印字されていれば馬券種、JRA の返還同枠）があるときだけ。無いときは null。取消・除外と一致する返還に警告は足さない。金額は作らない。
-- `complete` は、取消・除外を除いた頭数がページの `N頭` から同じ取消・除外を引いた数と一致し、各馬に `status` があり、速報の上位5頭だけではないとき true。足りないときは false と `race result incomplete: …`。`--wait-complete` は揃うまで取り直す（間隔は 60 秒以上、`--max-wait` の既定は 600 秒）。403 とログインは取り直さない。
+- `complete` は、取消・除外を除いた頭数がページの `N頭` から同じ取消・除外を引いた数と一致し、各馬に `status` があり、速報の上位5頭だけではないとき true。足りないときは false と `race result incomplete: …`。`--wait-complete` は揃うまで取り直す（間隔は 60 秒以上、`--max-wait` の既定は 600 秒。どちらも 0 以上の有限値）。取り直さないのは取得の HTTP 401/403 とログイン。払戻金の「403円」では止まらない。呼び出し側が時刻を渡さない `fetched_at` は Asia/Tokyo（`+09:00`）。
 - `result_phase` はページが `確定` か `確定前`（暫定・未確定）と印字しているときだけ `confirmed` / `provisional`。タイトルや「速報」からは決めない。印字が無ければ null と `result phase was not on the page`。
 - 着順表が `N頭` より短い、空、壊れているときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。各値の `source` は `netkeiba_html` / `netkeiba_js` / `headless`。`fetched_at` はその値を得た時刻。ヘッドレスは任意（`pip install -e ".[headless]"`）。未インストールなら警告だけ。403 とログイン画面は止め、回避しない。
 - 開催日はページの `kaisai_date`（無ければタイトルの年月日）。レースIDの桁からは日付を作らない。

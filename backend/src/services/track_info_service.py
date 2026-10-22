@@ -15,6 +15,7 @@ from backend.scrapers.track_freshness import (
     needs_fresh_wait,
     parse_race_day,
     polite_interval,
+    require_finite_seconds,
     track_blocked,
     wait_budget_spent,
 )
@@ -194,6 +195,9 @@ class TrackInfoService:
         today: date | None = None,
     ) -> dict[str, TrackInfo]:
         race_day, race_warning = parse_race_day(date)
+        if wait_fresh:
+            retry_interval = require_finite_seconds(retry_interval, "retry_interval")
+            max_wait = require_finite_seconds(max_wait, "max_wait")
         interval = polite_interval(retry_interval)
         mono = clock or time.monotonic
         pause = sleeper or time.sleep
@@ -210,7 +214,7 @@ class TrackInfoService:
             )
             if not wait_fresh or any(track_blocked(info) for info in results.values()):
                 return results
-            if not needs_fresh_wait(results):
+            if not needs_fresh_wait(results, race_date=race_day, today=today):
                 return results
             if wait_budget_spent(started, mono(), interval, max_wait):
                 return results

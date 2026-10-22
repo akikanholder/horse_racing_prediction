@@ -153,7 +153,7 @@ def test_payout_403_from_the_browser_does_not_fall_back() -> None:
         race_date=date(2026, 10, 12),
         race_number=1,
     )
-    note, refunds, source = cross_check_payouts(
+    checked = cross_check_payouts(
         _HTTP(),
         key,
         [],
@@ -161,9 +161,11 @@ def test_payout_403_from_the_browser_does_not_fall_back() -> None:
         session=_Blocked(),
     )
 
-    assert note == JRA_PAYOUT_FORBIDDEN
-    assert refunds is None
-    assert source == "jra_html"
+    assert checked.warning == JRA_PAYOUT_FORBIDDEN
+    assert checked.refunds is None
+    assert checked.source == "jra_html"
+    assert checked.http_status == 403
+    assert checked.login_required is False
     assert calls == []
 
 

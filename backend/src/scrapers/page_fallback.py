@@ -68,11 +68,18 @@ class FetchedBody:
 
 @dataclass
 class FallbackFetch:
-    """Bodies collected before the chain stopped."""
+    """Bodies collected before the chain stopped.
+
+    ``http_status`` and ``login_required`` are set only when the fetch itself
+    was refused (HTTP 401/403 or a login wall). A later warning that merely
+    contains the digits 403, such as a payout of 403円, does not set them.
+    """
 
     status: Literal["ok", "blocked", "failed"]
     pages: list[FetchedBody] = field(default_factory=list)
     warning: str | None = None
+    http_status: int | None = None
+    login_required: bool = False
 
 
 def looks_like_login_wall(html: str) -> bool:
@@ -125,12 +132,8 @@ RESULT_TABLE_READY_JS = """() => {
   const match = text.match(/(\\d+)\\s*頭/);
   if (!match) return !flash;
   const starters = Number(match[1]);
-  let nonRunners = 0;
-  for (const tr of rows) {
-    const label = (tr.innerText || '').replace(/\\s/g, '');
-    if (label.includes('取消') || label.includes('除外')) nonRunners += 1;
-  }
-  if (rows.length - nonRunners < starters - nonRunners) return false;
+  // rows.length - nonRunners < starters - nonRunners is rows.length < starters.
+  if (rows.length < starters) return false;
   if (flash) return false;
   return true;
 }"""
@@ -305,7 +308,7 @@ class PageFallback:
             try:
                 html = self._get(url, params=params, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:
-                return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, blocked))
+                return blocked_fetch(self.site, blocked)
             except Exception as exc:
                 logger.error("Page fetch failed for %s: %s", url, exc)
                 return FallbackFetch(status="failed", warning=None)
@@ -313,8 +316,7 @@ class PageFallback:
             html = html_body
 
         if looks_like_login_wall(html):
-            login = AccessBlocked(401, PAGE_LOGIN)
-            return FallbackFetch(status="blocked", warning=_blocked_warning(self.site, login))
+            return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN))
 
         page_url = _with_query(url, params)
         first_source = document_source or f"{self.site}_html"
@@ -342,30 +344,17 @@ class PageFallback:
         try:
             endpoints = list(self._url_finder(html, page_url))
         except AccessBlocked as blocked:
-            return FallbackFetch(
-                status="blocked",
-                pages=pages,
-                warning=_blocked_warning(self.site, blocked),
-            )
+            return blocked_fetch(self.site, blocked, pages)
         for endpoint in endpoints:
             try:
                 body = self._get(endpoint, params=None, headers=headers, encoding=encoding)
             except AccessBlocked as blocked:
-                return FallbackFetch(
-                    status="blocked",
-                    pages=pages,
-                    warning=_blocked_warning(self.site, blocked),
-                )
+                return blocked_fetch(self.site, blocked, pages)
             except Exception as exc:
                 logger.warning("Result endpoint %s failed: %s", endpoint, exc)
                 continue
             if looks_like_login_wall(body):
-                login = AccessBlocked(401, PAGE_LOGIN)
-                return FallbackFetch(
-                    status="blocked",
-                    pages=pages,
-                    warning=_blocked_warning(self.site, login),
-                )
+                return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN), pages)
             fragment_source = f"{self.site}_js"
             if document_source == "headless" and getattr(self.http_client, "used_headless", False):
                 fragment_source = "headless"
@@ -393,11 +382,7 @@ class PageFallback:
                 )
             )
         elif isinstance(rendered, AccessBlocked):
-            return FallbackFetch(
-                status="blocked",
-                pages=pages,
-                warning=_blocked_warning(self.site, rendered),
-            )
+            return blocked_fetch(self.site, rendered, pages)
         elif isinstance(rendered, HeadlessUnavailableError):
             headless_warning = HEADLESS_UNAVAILABLE
         return FallbackFetch(status="ok", pages=pages, warning=headless_warning)
@@ -442,6 +427,22 @@ class PageFallback:
             if not headless_browser_installed() and choice == "auto":
                 return HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
             return None
+
+
+def blocked_fetch(
+    site: str,
+    blocked: AccessBlocked,
+    pages: list[FetchedBody] | None = None,
+) -> FallbackFetch:
+    """Stop the chain. The refusal is the HTTP status, not a substring of the warning."""
+    status = blocked.status if blocked.status in {401, 403} else None
+    return FallbackFetch(
+        status="blocked",
+        pages=list(pages or []),
+        warning=_blocked_warning(site, blocked),
+        http_status=status,
+        login_required=status == 401,
+    )
 
 
 def _blocked_warning(site: str, blocked: AccessBlocked) -> str:

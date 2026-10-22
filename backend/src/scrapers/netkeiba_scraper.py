@@ -75,7 +75,11 @@ from backend.scrapers.runner_status import (
 from backend.scrapers.runner_status import (
     page_records as _page_records,
 )
-from backend.scrapers.track_freshness import polite_interval, wait_budget_spent
+from backend.scrapers.track_freshness import (
+    polite_interval,
+    require_finite_seconds,
+    wait_budget_spent,
+)
 from backend.utils.date_utils import (
     get_current_week_dates,
     parse_japanese_date,
@@ -984,8 +988,9 @@ def _result_source(value: str) -> str:
     return "netkeiba_html"
 
 
-def _result_block_warning(warning: str | None) -> str:
-    if warning is not None and "403" in warning:
+def _result_block_warning(loaded: FallbackFetch) -> str:
+    """Map a refused fetch onto the result warnings. The yen amount is not a status."""
+    if loaded.http_status == 403 and not loaded.login_required:
         return RACE_RESULT_FORBIDDEN
     return RACE_RESULT_LOGIN
 
@@ -1122,11 +1127,10 @@ def _data_rows(table: Tag) -> list[Tag]:
 
 
 def _is_flash_table(soup: BeautifulSoup) -> bool:
-    """True for the early 速報 table: five ``FirstDisplay`` rows, not the full order.
+    """True for the early 速報 table: ``FirstDisplay`` rows and no ``Table_Show_All``.
 
     A table that already has ``Table_Show_All`` is the full order, even when the
-    first rows still carry ``FirstDisplay``. A five-horse race that uses that
-    flash markup and has no full-table class stays incomplete.
+    first rows still carry ``FirstDisplay``.
     """
     table = _result_table(soup)
     if table is None or "Table_Show_All" in _class_tokens(table):
@@ -1136,7 +1140,42 @@ def _is_flash_table(soup: BeautifulSoup) -> bool:
         return False
     if _FLASH_MARK.search(soup.get_text(" ", strip=True)):
         return True
+    # A real 5-runner field that is only FirstDisplay rows, with no
+    # Table_Show_All, looks the same as the early flash. The page does not
+    # say which it is, so this stays incomplete (fail closed). An ordinary
+    # HorseList table of five runners is not this case and stays complete.
     return len(rows) == 5
+
+
+def result_html_is_partial(html: str) -> bool:
+    """True when a result page would undercount a same-day trend.
+
+    The early flash is partial. So is a table whose rows that ran are short
+    of the printed ``N頭`` after 取消 and 除外. A page with no finish table
+    is unsettled and is not partial, so it may stay cached. A five-horse
+    ``HorseList`` table that matches ``N頭`` is complete.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    if _is_flash_table(soup):
+        return True
+    table = _result_table(soup)
+    if table is None:
+        return False
+    rows = _data_rows(table)
+    if not rows:
+        return False
+    header = soup.select_one(".RaceData02")
+    text = header.get_text(" ", strip=True) if header is not None else ""
+    match = re.search(r"(\d+)\s*頭", text)
+    if match is None:
+        return False
+    starters = int(match.group(1))
+    non_runners = 0
+    for row in rows:
+        label = re.sub(r"\s+", "", row.get_text())
+        if "取消" in label or "除外" in label:
+            non_runners += 1
+    return len(rows) - non_runners < starters - non_runners
 
 
 def _non_runner_count(results: list[SettledFinisher]) -> int:
@@ -1177,10 +1216,12 @@ def _assess_complete(
     return True, None
 
 
-def _result_stopped(warning: str | None) -> bool:
-    """403 or a login wall. ``--wait-complete`` must not open the URL again."""
-    text = warning or ""
-    return "403" in text or "requires login" in text
+def _result_stopped(settled: SettledRaceResult) -> bool:
+    """HTTP 401/403 or a login wall. ``--wait-complete`` must not open the URL again.
+
+    A payout of 403円 or 1403円 is not a refusal. Only the fetch flags are.
+    """
+    return bool(settled.login_required or settled.http_status in {401, 403})
 
 
 def _merged_flash(pages: list[FetchedBody], runner_count: int) -> bool:
@@ -2016,6 +2057,7 @@ class NetkeibaScraper(BaseScraper):
         the early five-row flash, JSON embedded in the page or a same-site
         result URL the page calls is read next, then an optional headless
         render. HTTP 403 and a login wall stop that chain and are not retried.
+        A payout amount that contains 403 is not that refusal.
 
         ``wait_complete`` refetches until the order covers the starters who
         ran, or ``max_wait`` seconds pass. The gap is at least 60 seconds.
@@ -2035,17 +2077,20 @@ class NetkeibaScraper(BaseScraper):
         Returns:
             Settled race result. ``warning`` is set when it is not usable.
         """
+        if wait_complete:
+            retry_interval = require_finite_seconds(retry_interval, "retry_interval")
+            max_wait = require_finite_seconds(max_wait, "max_wait")
         interval = polite_interval(retry_interval)
         mono = clock or time.monotonic
         pause = sleeper or time.sleep
-        stamp = now or datetime.now
+        stamp = now or tokyo_now
         started = mono()
         attempt = 0
         while True:
             fetched = fetched_at if attempt == 0 and fetched_at is not None else stamp()
             settled = self._load_settled_result(race_id, fetched)
             attempt += 1
-            if not wait_complete or settled.complete or _result_stopped(settled.warning):
+            if not wait_complete or settled.complete or _result_stopped(settled):
                 return settled
             if wait_budget_spent(started, mono(), interval, max_wait):
                 return settled
@@ -2071,7 +2116,9 @@ class NetkeibaScraper(BaseScraper):
             return self._empty_settled_result(
                 race_id,
                 fetched,
-                _result_block_warning(loaded.warning),
+                _result_block_warning(loaded),
+                http_status=loaded.http_status,
+                login_required=loaded.login_required,
             )
         if loaded.status == "failed" or not loaded.pages:
             return self._empty_settled_result(race_id, fetched, RACE_RESULT_FETCH_FAILED)
@@ -2080,9 +2127,9 @@ class NetkeibaScraper(BaseScraper):
         if loaded.status == "blocked":
             settled = settled.model_copy(
                 update={
-                    "warning": _join_warnings(
-                        settled.warning, _result_block_warning(loaded.warning)
-                    )
+                    "warning": _join_warnings(settled.warning, _result_block_warning(loaded)),
+                    "http_status": loaded.http_status,
+                    "login_required": loaded.login_required,
                 }
             )
         elif (
@@ -2115,6 +2162,9 @@ class NetkeibaScraper(BaseScraper):
         fetched_at: datetime,
         warning: str,
         header: _SettledHeader | None = None,
+        *,
+        http_status: int | None = None,
+        login_required: bool = False,
     ) -> SettledRaceResult:
         identity = header or _SettledHeader()
         return SettledRaceResult(
@@ -2136,6 +2186,8 @@ class NetkeibaScraper(BaseScraper):
             payouts=[],
             payout_note=None,
             warning=warning,
+            http_status=http_status,
+            login_required=login_required,
         )
 
     def _parse_settled_race_result(
@@ -2625,6 +2677,8 @@ class NetkeibaScraper(BaseScraper):
             return settled
         refunds = settled.refunds
         notes: list[str | None] = []
+        payout_status: int | None = None
+        payout_login = False
         if settled.payouts or settled.refunds:
             key = _official_payout_key(header, self.VENUE_CODES)
             if key is None:
@@ -2632,7 +2686,7 @@ class NetkeibaScraper(BaseScraper):
                 official: list[OfficialRefund] | None = None
                 jra_source = "jra_html"
             else:
-                payout_note, official, jra_source = cross_check_payouts(
+                checked = cross_check_payouts(
                     self.http_client,
                     key,
                     [
@@ -2641,16 +2695,29 @@ class NetkeibaScraper(BaseScraper):
                     ],
                     fetch_mode=self.fetch_mode,
                 )
-                notes.append(payout_note)
+                official = checked.refunds
+                jra_source = checked.source
+                notes.append(checked.warning)
+                if checked.http_status in {401, 403} or checked.login_required:
+                    payout_status = checked.http_status
+                    payout_login = checked.login_required
             refunds, refund_note = _merge_refunds(
                 settled.refunds, official, settled.fetched_at, jra_source=jra_source
             )
             notes.append(refund_note)
         notes.append(_refund_status_warning(settled.results, refunds))
         warning = _join_warnings(settled.warning, *notes)
-        if warning == settled.warning and refunds == settled.refunds:
+        update: dict[str, object] = {}
+        if warning != settled.warning:
+            update["warning"] = warning
+        if refunds != settled.refunds:
+            update["refunds"] = refunds
+        if payout_status in {401, 403} or payout_login:
+            update["http_status"] = payout_status
+            update["login_required"] = payout_login
+        if not update:
             return settled
-        return settled.model_copy(update={"warning": warning, "refunds": refunds})
+        return settled.model_copy(update=update)
 
     def get_horse_info(
         self,

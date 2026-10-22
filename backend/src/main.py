@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import AfterValidator
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.export import DailyRaceCsvExport
@@ -17,6 +18,7 @@ from backend.models.odds import RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
 from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
+from backend.scrapers.track_freshness import require_finite_seconds
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
@@ -29,6 +31,18 @@ logger = logging.getLogger(__name__)
 
 race_service: RaceService | None = None
 track_info_service: TrackInfoService | None = None
+
+
+def _retry_seconds(value: float) -> float:
+    return require_finite_seconds(value, "retry_interval")
+
+
+def _max_wait_seconds(value: float) -> float:
+    return require_finite_seconds(value, "max_wait")
+
+
+RetrySeconds = Annotated[float, AfterValidator(_retry_seconds)]
+MaxWaitSeconds = Annotated[float, AfterValidator(_max_wait_seconds)]
 
 
 def _mode_arg(fetch_mode: str) -> dict[str, str]:
@@ -333,8 +347,8 @@ async def get_race_result(
     race_id: str,
     fetch_mode: JraFetchMode = "html",
     wait_complete: bool = False,
-    retry_interval: float = 60,
-    max_wait: float = 600,
+    retry_interval: RetrySeconds = 60,
+    max_wait: MaxWaitSeconds = 600,
 ):
     """確定した1レースの着順と払戻を取得する。
 
@@ -644,8 +658,8 @@ async def get_track_info(
     merge: bool = False,
     fetch_mode: JraFetchMode = "html",
     wait_fresh: bool = False,
-    retry_interval: float = 60,
-    max_wait: float = 600,
+    retry_interval: RetrySeconds = 60,
+    max_wait: MaxWaitSeconds = 600,
 ):
     """馬場情報（馬場状態、含水率、クッション値）を取得する。
 

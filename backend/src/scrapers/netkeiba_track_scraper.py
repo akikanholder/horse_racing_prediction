@@ -180,7 +180,9 @@ class NetkeibaTrackScraper(BaseScraper):
         )
         if not loaded.pages:
             return self._finish(
-                empty_track_info("Netkeiba", self._blocked_warning(loaded.warning)),
+                self._with_fetch_block(
+                    empty_track_info("Netkeiba", self._blocked_warning(loaded)), loaded
+                ),
                 race_date=race_date,
                 today=today,
                 race_date_warning=race_date_warning,
@@ -209,12 +211,13 @@ class NetkeibaTrackScraper(BaseScraper):
             venue = page_venue
 
         info = self._from_pages(loaded.pages, venue)
-        if loaded.warning:
-            info = info.model_copy(update={"warning": join_warnings(info.warning, loaded.warning)})
         if loaded.status == "blocked":
+            info = self._with_fetch_block(info, loaded)
             info = info.model_copy(
-                update={"warning": join_warnings(info.warning, self._blocked_warning(loaded.warning))}
+                update={"warning": join_warnings(info.warning, self._blocked_warning(loaded))}
             )
+        elif loaded.warning:
+            info = info.model_copy(update={"warning": join_warnings(info.warning, loaded.warning)})
         return self._finish(
             info,
             race_date=race_date,
@@ -270,13 +273,23 @@ class NetkeibaTrackScraper(BaseScraper):
             return racecourse_id
         return None
 
-    def _blocked_warning(self, warning: str | None) -> str:
+    def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the track warnings. Do not read the body."""
-        if warning and "403" in warning:
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status == 403 and not login:
             return self.TRACK_403
-        if warning and "login" in warning:
+        if login or status == 401:
             return self.TRACK_LOGIN
         return self.TRACK_FETCH_FAILED
+
+    def _with_fetch_block(self, info: TrackInfo, loaded: object) -> TrackInfo:
+        """Copy a fallback refusal onto the track info. A yen amount is not a status."""
+        status = getattr(loaded, "http_status", None)
+        login = bool(getattr(loaded, "login_required", False))
+        if status not in {401, 403} and not login:
+            return info
+        return info.model_copy(update={"http_status": status, "login_required": login})
 
     def _needs_fallback(self, html: str) -> bool:
         """True when this meeting's cushion slot is empty. A foreign tab is not read."""
@@ -463,12 +476,44 @@ class NetkeibaTrackScraper(BaseScraper):
         return None
 
     def _extract_race_date(self, soup: BeautifulSoup) -> datetime | None:
-        """Date when the page prints a year. A month and day alone stay null."""
-        text = soup.get_text()
+        """Date when the page prints a year. A month and day alone stay null.
+
+        An active tab's ``kaisai_date`` is the meeting. A date inside
+        ``script`` or ``style`` (a bundle can contain ``2026/04/02``) is not.
+        """
+        stamped = self._active_kaisai_date(soup)
+        if stamped is not None:
+            return stamped
+        visible = BeautifulSoup(str(soup), "lxml")
+        for tag in visible.find_all(["script", "style", "noscript"]):
+            tag.decompose()
+        text = visible.get_text(" ", strip=True)
         for pattern in (r"(\d{4})/(\d{1,2})/(\d{1,2})", r"(\d{4})年(\d{1,2})月(\d{1,2})日"):
             match = re.search(pattern, text)
             if match:
+                try:
+                    return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                except ValueError:
+                    continue
+        return None
+
+    def _active_kaisai_date(self, soup: BeautifulSoup) -> datetime | None:
+        """``kaisai_date`` on the selected tab. Other links on the page are ignored."""
+        for tag in soup.find_all(True):
+            classes = [str(name).lower() for name in (tag.get("class") or [])]
+            selected = tag.has_attr("selected") or any(
+                name in {"active", "current", "selected"} for name in classes
+            )
+            if not selected:
+                continue
+            blob = " ".join(str(tag.get(attr) or "") for attr in ("href", "data-href", "value"))
+            match = re.search(r"kaisai_date=(\d{4})(\d{2})(\d{2})", blob)
+            if match is None:
+                continue
+            try:
                 return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                continue
         return None
 
     def _extract_course_info(

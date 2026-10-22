@@ -17,10 +17,27 @@ from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, 
 from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
+from backend.scrapers.track_freshness import require_finite_seconds
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_arg(name: str) -> Callable[[str], float]:
+    """Argparse type: a finite number of seconds, zero or more."""
+
+    def parse(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be a finite number >= 0") from exc
+        try:
+            return require_finite_seconds(parsed, name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return parse
 
 
 def setup_logging(verbose: bool = False):
@@ -871,19 +888,19 @@ def main():
     track_parser.add_argument(
         "--wait-fresh",
         action="store_true",
-        help="測定日がレース日になるまで取り直す。403 とログインは取り直さない",
+        help="今日の開催で測定日がそれより前のときだけ取り直す。403 とログインは取り直さない",
     )
     track_parser.add_argument(
         "--retry-interval",
-        type=float,
+        type=_finite_arg("retry_interval"),
         default=60,
-        help="再取得の間隔（秒）。60秒未満は60秒にする",
+        help="再取得の間隔（秒）。0以上の有限値。60秒未満は60秒にする",
     )
     track_parser.add_argument(
         "--max-wait",
-        type=float,
+        type=_finite_arg("max_wait"),
         default=600,
-        help="待ちの上限（秒）",
+        help="待ちの上限（秒）。0以上の有限値",
     )
     track_parser.set_defaults(func=cmd_track)
 
@@ -906,15 +923,15 @@ def main():
     )
     result_parser.add_argument(
         "--retry-interval",
-        type=float,
+        type=_finite_arg("retry_interval"),
         default=60,
-        help="再取得の間隔（秒）。60秒未満は60秒にする",
+        help="再取得の間隔（秒）。0以上の有限値。60秒未満は60秒にする",
     )
     result_parser.add_argument(
         "--max-wait",
-        type=float,
+        type=_finite_arg("max_wait"),
         default=600,
-        help="待ちの上限（秒）",
+        help="待ちの上限（秒）。0以上の有限値",
     )
     result_parser.set_defaults(func=cmd_result)
 

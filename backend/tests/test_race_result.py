@@ -1238,6 +1238,8 @@ def test_wait_complete_does_not_sleep_on_403_or_login():
     assert slept == []
     assert settled.results == []
     assert settled.warning == RACE_RESULT_FORBIDDEN
+    assert settled.http_status == 403
+    assert settled.login_required is False
     assert forbidden.calls == [RESULT_URL]
 
     login = """<html><head><title>ログイン</title></head><body>
@@ -1252,6 +1254,8 @@ def test_wait_complete_does_not_sleep_on_403_or_login():
     )
     assert slept == []
     assert settled.warning == RACE_RESULT_LOGIN
+    assert settled.http_status == 401
+    assert settled.login_required is True
     assert wall.calls == [RESULT_URL]
 
 
@@ -1292,7 +1296,143 @@ def test_payout_403_does_not_start_a_wait():
     assert slept == []
     assert "5 of 8 runners" in (settled.warning or "")
     assert JRA_PAYOUT_FORBIDDEN in (settled.warning or "")
+    assert settled.http_status == 403
+    assert settled.login_required is False
     assert [call["url"] for call in client.calls].count(RESULT_URL) == 1
+
+
+def test_payout_yen_containing_403_does_not_stop_the_wait():
+    html = _result_html(
+        [_row(str(number), number, f"馬{number}") for number in range(1, 6)],
+        heads=8,
+        phase="確定",
+        extra=_place_table(
+            [
+                ("単勝", "<div><span>1</span></div>", "403円", "<span>1人気</span>"),
+                ("複勝", "<div><span>1</span></div>", "1403円", "<span>2人気</span>"),
+            ]
+        ),
+    )
+    tickets = _jra_ticket("単勝", "1", "100", "1") + _jra_ticket("複勝", "1", "200", "2")
+    scraper, client = _scraper(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("100", tickets=tickets)},
+    )
+    slept: list[float] = []
+    ticks = iter((0.0, 0.0, 600.0))
+    settled = scraper.get_settled_race_result(
+        RACE_ID,
+        fetched_at=FETCHED_AT,
+        wait_complete=True,
+        sleeper=slept.append,
+        clock=lambda: next(ticks),
+        max_wait=600,
+    )
+    warning = settled.warning or ""
+    assert slept == [60]
+    assert "403円" in warning
+    assert "1403円" in warning
+    assert settled.http_status is None
+    assert settled.login_required is False
+    assert [call["url"] for call in client.calls].count(RESULT_URL) == 2
+
+
+def test_tied_place_payouts_ignore_swapped_popularity_order():
+    html = _result_html(
+        [_row("1", 1, "イチ"), _row("2", 2, "ニ")],
+        heads=2,
+        phase="確定",
+        extra=_place_table(
+            [
+                (
+                    "複勝",
+                    "<div><span>1</span></div><div><span>2</span></div>",
+                    "160円<br />160円",
+                    "<span>1人気</span><span>2人気</span>",
+                )
+            ]
+        ),
+    )
+    tickets = _jra_ticket("複勝", "1", "160", "2") + _jra_ticket("複勝", "2", "160", "1")
+    settled, _client = _settled(
+        html,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("160", tickets=tickets)},
+    )
+    assert JRA_PAYOUT_MISMATCH not in (settled.warning or "")
+    assert settled.complete is True
+
+    disagreed = _result_html(
+        [_row("1", 1, "イチ")],
+        heads=1,
+        phase="確定",
+        extra=_place_table([("複勝", "<div><span>1</span></div>", "160円", "<span>1人気</span>")]),
+    )
+    alone = _jra_ticket("複勝", "1", "160", "2")
+    settled, _client = _settled(
+        disagreed,
+        posts={"pw01hli00/03": _JRA_INDEX, _JRA_CNAME: _jra_day("160", tickets=alone)},
+    )
+    assert JRA_PAYOUT_MISMATCH in (settled.warning or "")
+
+
+def test_unpinned_fetched_at_carries_the_tokyo_offset():
+    html = _result_html([_row("1", 1, "イチ")], heads=1, phase="確定")
+    scraper, _client = _scraper(html)
+    settled = scraper.get_settled_race_result(RACE_ID)
+    assert settled.fetched_at.tzinfo is not None
+    assert "+09:00" in settled.fetched_at.isoformat()
+
+
+def test_wait_complete_rejects_non_finite_seconds():
+    scraper, client = _scraper(_result_html([_row("1", 1, "イチ")], heads=1, phase="確定"))
+    slept: list[float] = []
+    with pytest.raises(ValueError, match="max_wait must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            max_wait=float("nan"),
+            sleeper=slept.append,
+        )
+    with pytest.raises(ValueError, match="retry_interval must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            retry_interval=float("inf"),
+            sleeper=slept.append,
+        )
+    with pytest.raises(ValueError, match="max_wait must be a finite number >= 0"):
+        scraper.get_settled_race_result(
+            RACE_ID,
+            wait_complete=True,
+            max_wait=-1,
+            sleeper=slept.append,
+        )
+    assert slept == []
+    assert client.calls == []
+
+
+def test_cli_and_api_reject_non_finite_wait(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["backend.cli", "result", RACE_ID, "--max-wait", "nan"])
+    with pytest.raises(SystemExit) as caught:
+        cli_main()
+    assert caught.value.code == 2
+    assert "max_wait must be a finite number >= 0" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        sys, "argv", ["backend.cli", "track", "--retry-interval", "-1", "--wait-fresh"]
+    )
+    with pytest.raises(SystemExit) as caught:
+        cli_main()
+    assert caught.value.code == 2
+    assert "retry_interval must be a finite number >= 0" in capsys.readouterr().err
+
+    with TestClient(app) as client:
+        result = client.get(f"/api/races/{RACE_ID}/result", params={"max_wait": "nan"})
+        track = client.get("/api/tracks", params={"retry_interval": "inf"})
+    assert result.status_code == 422
+    assert "max_wait" in result.text
+    assert track.status_code == 422
+    assert "retry_interval" in track.text
 
 
 def test_result_headless_waits_for_the_full_table_and_swallows_timeout():
