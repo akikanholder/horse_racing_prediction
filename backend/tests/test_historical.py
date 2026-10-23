@@ -585,7 +585,7 @@ def test_cache_read_does_not_reparse_result_html(tmp_path: Path, monkeypatch: py
     key = client._cache_key("GET", url, params, None)
     path = client._path(key)
     legacy = json.loads(path.read_text(encoding="utf-8"))
-    assert legacy["replayable"] is True
+    assert legacy["replayable"] == page_cache._REPLAYABLE_VERSION
     legacy.pop("replayable")
     path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
     parses.clear()
@@ -842,22 +842,14 @@ def test_cached_login_wall_and_forbidden_page_are_not_replayed(tmp_path: Path):
 
     marked = (
         "<html><head><title>403 Forbidden</title></head>"
-        "<body><h1>Access Denied</h1><p>kept because write time already checked</p></body></html>"
+        "<body><h1>Access Denied</h1><p>old boolean mark is checked again</p></body></html>"
     )
     seed(marked, replayable=True)
-
-    def _must_not_parse(body: str) -> bool:
-        raise AssertionError(body)
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(page_cache, "looks_like_login_wall", _must_not_parse)
-    monkeypatch.setattr(page_cache, "looks_like_forbidden_page", _must_not_parse)
-    try:
-        assert client.get(url) == marked
-        assert transport.calls == [url, url]
-        assert client.cached_fetched_at("GET", url) == datetime.fromisoformat("2026-10-18T07:00:00")
-    finally:
-        monkeypatch.undo()
+    assert client.get(url) == ok
+    assert transport.calls == [url, url, url]
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["replayable"] == page_cache._REPLAYABLE_VERSION
+    assert "Access Denied" not in stored["body"]
 
 
 def test_jra_odds_chain_reads_same_site_json_and_stops_on_403():

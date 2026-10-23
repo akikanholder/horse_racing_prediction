@@ -5,17 +5,21 @@ fetched again. A ``result.html`` that is not confirmed and complete is not
 stored and is not replayed, including a copy left from an earlier run.
 A race list for today or a later day in Asia/Tokyo is not stored either.
 JRA payout (accessH), odds (accessO), and race-card (accessD) pages for
-today or later, and undated menus on those endpoints, are not stored.
-The netkeiba odds API is stored only when its status is ``result`` and the
-odds map is non-empty. An ``official_datetime`` of today or later in
-Asia/Tokyo is not stored. ``odds/index.html`` is stored only when a price
-was extracted. A shell of ``---.-`` is not stored and is not replayed, even
-when an older file was marked replayable. A caller that already knows the
+today or later are not stored. A cname whose date cannot be read is stored
+when the request carries a past ``race_date`` or a project ``race_id``
+(``YYYYMMDD`` plus venue and race). A netkeiba race id is not a calendar
+date. An undated menu with no such day is not stored.
+The netkeiba odds API is stored only when its status is ``result``, ``data``
+is not empty, and the odds map has at least one combination. An
+``official_datetime`` of today or later in Asia/Tokyo is not stored.
+``odds/index.html`` is stored only when a price was extracted. A shell of
+``---.-`` is not stored and is not replayed. A caller that already knows the
 race day is today can set ``replay_disabled`` so the odds pages are not
-stored either. HTTP 403, a login wall, and a challenge page are not stored.
-A legacy file with no replayable mark is checked again on read, so an old
-denial is not replayed. A file this client marked replayable was checked at
-write time and is not parsed again for that denial. ``result.html``, the
+stored either.
+HTTP 403, a login wall, and a challenge page are not stored. The replayable
+mark is a version. The current version was checked at write time and is not
+parsed again for a denial. A boolean ``True`` from the earlier marker, and a
+file with no mark, is checked once per path and mtime. ``result.html``, the
 odds API, and ``odds/index.html`` are still judged from the body. This
 client does not change the User-Agent or send credentials.
 """
@@ -34,7 +38,7 @@ from backend.scrapers.final_odds import _has_price_text, odds_api_is_replayable
 from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
-from backend.utils.date_utils import tokyo_now
+from backend.utils.date_utils import TOKYO, tokyo_now
 from backend.utils.http_client import HTTPClient
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,12 @@ _RACE_LIST_URLS = (
 )
 _JRA_LIVE_URLS = ("accessH.html", "accessO.html", "accessD.html")
 _ODDS_API = "api_get_jra_odds.html"
+# Same codes as JRAScraper.VENUE_CODES. A netkeiba race id uses one of these
+# in digits 4-6; a project race id puts the calendar date in the first eight.
+_JRA_VENUE_CODES = frozenset({"01", "02", "03", "04", "05", "06", "07", "08", "09", "10"})
+# Boolean ``True`` was the mark written before the stricter denial rules.
+# Those files are checked again. A new write stores this version.
+_REPLAYABLE_VERSION = 2
 # The ymd field, not the year+kai+day digits that sit in front of it.
 _DATED_CNAME = re.compile(
     r"(?:"
@@ -65,15 +75,32 @@ def _refused_cache_body(body: object) -> bool:
     return looks_like_login_wall(body) or looks_like_forbidden_page(body)
 
 
-def _legacy_refused(payload: dict[str, object]) -> bool:
-    """Check a denial only when this file predates the replayable mark.
+def _mark_is_current(payload: dict[str, object]) -> bool:
+    """True when this file was stored under the current denial rules."""
+    return payload.get("replayable") == _REPLAYABLE_VERSION
 
-    A marked file was accepted at write time. Parsing it again on every read
-    walks the whole document.
+
+def _legacy_refused(payload: dict[str, object]) -> bool:
+    """Denial check for a file this version did not mark.
+
+    A current mark was accepted at write time. A boolean ``True`` from the
+    earlier marker was not checked against the stricter denial rules, so it
+    is judged again, as is a file with no mark.
     """
-    if isinstance(payload.get("replayable"), bool):
+    if _mark_is_current(payload):
         return False
     return _refused_cache_body(payload.get("body"))
+
+
+def _tokyo_stamp(raw: str) -> datetime | None:
+    """Parse a cache timestamp. A naive clock is Asia/Tokyo, emitted as +09:00."""
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=TOKYO)
+    return parsed
 
 
 def _result_replayable(url: str, body: str) -> bool:
@@ -81,10 +108,11 @@ def _result_replayable(url: str, body: str) -> bool:
 
     A flash or short table fails first. An unsettled page and a provisional
     label fail the finality check. The odds API is replayable only when
-    ``status`` is ``result``, the odds map is non-empty, and
-    ``official_datetime`` is not today or later. ``odds/index.html`` is
-    replayable only when a price was extracted. Other URLs are replayable
-    here; the live-list, live-JRA, and track checks are separate.
+    ``status`` is ``result``, ``data`` is not empty, the odds map has a
+    combination, and ``official_datetime`` is not today or later.
+    ``odds/index.html`` is replayable only when a price was extracted.
+    Other URLs are replayable here; the live-list, live-JRA, and track
+    checks are separate.
     """
     if _ODDS_API in url:
         return odds_api_is_replayable(body)
@@ -117,18 +145,82 @@ def _cname_meeting_day(url: str, params: dict | None) -> date | None:
 
 
 def jra_live_request(url: str, params: dict | None = None, *, today: date | None = None) -> bool:
-    """True when this JRA page is for today or later, or has no meeting date.
+    """True when this JRA page must not be stored.
 
-    A past ``ymd`` may stay cached. An undated menu is the live card, so it
-    is not stored. The odds API is not decided here.
+    A past meeting may stay cached. The day is the cname ``ymd`` when that
+    reads as a date. When it does not, a ``race_date`` on the request, or a
+    project ``race_id`` (``YYYYMMDD`` plus venue and race), is that day. A
+    netkeiba race id does not contain a calendar date and is not used. An
+    undated menu with no such day is the live card. Today or later is live.
+    The odds API is not decided here.
     """
     if not any(marker in url for marker in _JRA_LIVE_URLS):
         return False
-    day = _cname_meeting_day(url, params)
+    day = _jra_meeting_day(url, params)
     if day is None:
         return True
     current = today or tokyo_now().date()
     return day >= current
+
+
+def _jra_meeting_day(url: str, params: dict | None) -> date | None:
+    """Meeting day for an accessH, accessO, or accessD request.
+
+    The cname ``ymd`` wins when it is a date. Otherwise the request's own
+    ``race_date``, then a project ``race_id``. Nothing is invented from a
+    netkeiba id.
+    """
+    day = _cname_meeting_day(url, params)
+    if day is not None:
+        return day
+    stated = _request_value(url, params, "race_date")
+    if stated is not None:
+        parsed, warning = parse_race_day(stated)
+        if parsed is not None and not warning:
+            return parsed
+    return _project_race_id_day(_request_value(url, params, "race_id"))
+
+
+def _request_value(url: str, params: dict | None, key: str) -> str | None:
+    """One request field, from the form body or the query string."""
+    if params:
+        raw = params.get(key)
+        if raw not in (None, ""):
+            return str(raw)
+    values = parse_qs(urlparse(url).query).get(key) or []
+    if values and values[0] not in (None, ""):
+        return str(values[0])
+    return None
+
+
+def _project_race_id_day(raw: str | None) -> date | None:
+    """Calendar day in a project race id, or None when the id is not that form.
+
+    Project ids are ``YYYYMMDD`` + venue + race. A netkeiba id is year + venue
+    + kai + day + race and does not carry a calendar date. When the twelve
+    digits can be read either way, the day is not known.
+    """
+    if raw is None:
+        return None
+    body = raw.strip()
+    if len(body) < 12 or not body[:12].isdigit():
+        return None
+    body = body[:12]
+    race_number = int(body[10:12])
+    if not 1 <= race_number <= 12:
+        return None
+    venue = body[4:6]
+    kai = int(body[6:8])
+    meeting_day = int(body[8:10])
+    if venue in _JRA_VENUE_CODES and 1 <= kai <= 6 and 1 <= meeting_day <= 12:
+        return None
+    try:
+        race_date = date(int(body[:4]), int(body[4:6]), int(body[6:8]))
+    except ValueError:
+        return None
+    if body[8:10] not in _JRA_VENUE_CODES:
+        return None
+    return race_date
 
 
 def _kaisai_date_text(url: str, params: dict | None) -> str | None:
@@ -181,8 +273,11 @@ class CachingHTTPClient(HTTPClient):
         super().__init__(min_request_interval=min_request_interval)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_page_cache_dir()
         self._transport = transport
-        # Legacy files have no replayable mark. Remember the judgement per path and mtime.
+        # Completeness of result.html, the odds API, and odds/index.html,
+        # once per path and mtime.
         self._replay_cache: dict[str, tuple[int, bool]] = {}
+        # Denial check for an old or unmarked file, once per path and mtime.
+        self._legacy_denial: dict[str, tuple[int, bool]] = {}
         # Set for a race whose meeting day is today or later. Odds pages are not stored.
         self.replay_disabled = False
 
@@ -202,7 +297,7 @@ class CachingHTTPClient(HTTPClient):
             return None
         path = self._path(self._cache_key(method, url, params, data))
         payload = self._load(path)
-        if payload is None or _legacy_refused(payload):
+        if payload is None or self._legacy_denied(path, payload):
             return None
         body = payload.get("body")
         if not isinstance(body, str) or not body:
@@ -212,10 +307,7 @@ class CachingHTTPClient(HTTPClient):
         raw = payload.get("fetched_at")
         if not isinstance(raw, str):
             return None
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
+        return _tokyo_stamp(raw)
 
     def get(
         self,
@@ -289,12 +381,14 @@ class CachingHTTPClient(HTTPClient):
     def _cached_body(self, key: str, url: str) -> str | None:
         """A stored body. A non-final result page is not replayed.
 
-        A non-result page this client stored is marked replayable, so a later
-        read does not parse it for a denial or for completeness. ``result.html``,
-        the odds API, and ``odds/index.html`` are judged from the body, once per
-        path and mtime, even when that mark is set. A result page must be
-        confirmed and complete. The odds API must have ``status`` ``result``.
-        An odds index must contain a price.
+        A non-result page stored with the current replayable version is not
+        parsed again for a denial or for completeness. An earlier boolean mark,
+        and a file with no mark, is checked for a denial once per path and
+        mtime. ``result.html``, the odds API, and ``odds/index.html`` are
+        judged from the body even when that mark is set. A result page must be
+        confirmed and complete. The odds API must have ``status`` ``result``,
+        non-empty ``data``, and a combination, and its ``official_datetime``
+        must not be today or later. An odds index must contain a price.
         """
         path = self._path(key)
         payload = self._load(path)
@@ -303,21 +397,47 @@ class CachingHTTPClient(HTTPClient):
         body = payload.get("body")
         if not isinstance(body, str) or not body:
             return None
-        if _legacy_refused(payload):
+        if self._legacy_denied(path, payload):
             return None
         if not self._replayable(path, url, payload, body):
             return None
         return body
 
+    def _legacy_denied(self, path: Path, payload: dict[str, object]) -> bool:
+        """True when an old or unmarked file is a login wall, 403, or challenge.
+
+        A current replayable version was checked at write time. An earlier
+        boolean mark, and a file with no mark, is parsed once for this path
+        and mtime. A later read of the same file does not walk the document
+        again.
+        """
+        if _mark_is_current(payload):
+            return False
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return _legacy_refused(payload)
+        key = str(path)
+        cached = self._legacy_denial.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        denied = _legacy_refused(payload)
+        self._legacy_denial[key] = (mtime, denied)
+        return denied
+
     def _replayable(self, path: Path, url: str, payload: dict[str, object], body: str) -> bool:
         """False when a result page is not confirmed and complete.
 
-        A non-result page with a replayable mark is kept without parsing.
-        ``result.html``, the odds API, and ``odds/index.html`` are always
-        judged from the body, mark or not.
+        A non-result page with the current replayable version is kept without
+        parsing. An earlier boolean mark still skips the completeness parse.
+        The denial check for that old mark is separate. ``result.html``, the
+        odds API, and ``odds/index.html`` are always judged from the body,
+        mark or not.
         """
         if "result.html" in url or _ODDS_API in url or "odds/index.html" in url:
             return self._body_is_complete(path, url, body)
+        if _mark_is_current(payload):
+            return True
         marked = payload.get("replayable")
         if isinstance(marked, bool):
             return marked
@@ -328,9 +448,10 @@ class CachingHTTPClient(HTTPClient):
 
         A result page must be confirmed and complete. That rejects a flash,
         a short order, an unsettled page, and a provisional label. The odds
-        API must report ``result``. The judgement is remembered for the path
-        and mtime. A new write changes the mtime, so the next read checks the
-        new body.
+        API must report ``result`` with prices, and not a meeting day of today
+        or later. An odds index must contain a price. The judgement is
+        remembered for the path and mtime. A new write changes the mtime, so
+        the next read checks the new body.
         """
         try:
             mtime = path.stat().st_mtime_ns
@@ -356,11 +477,12 @@ class CachingHTTPClient(HTTPClient):
         payload = {
             "url": url,
             "fetched_at": tokyo_now().isoformat(timespec="seconds"),
-            "replayable": True,
+            "replayable": _REPLAYABLE_VERSION,
             "body": body,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         self._replay_cache.pop(str(path), None)
+        self._legacy_denial.pop(str(path), None)
 
     def _load(self, path: Path) -> dict[str, object] | None:
         if not path.is_file():

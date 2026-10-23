@@ -97,22 +97,38 @@ def looks_like_login_wall(html: str) -> bool:
 
 
 # Status phrasing, not a digit sequence. 「第403回」 and 「403万円」 are not denials.
-# Cloudflare's interstitial title is 「Just a moment...」. That is a challenge.
+# Cloudflare's interstitial title is exactly 「Just a moment...」. A title that
+# only contains those words is not a challenge. Japanese captcha titles such
+# as 「CAPTCHA認証」 have no word boundary after the Latin token, so captcha
+# is not limited to ``\b``.
 _DENIAL_LABEL = re.compile(
-    r"just\s+a\s+moment"
-    r"|\baccess\s+denied\b"
+    r"\baccess\s+denied\b"
     r"|\b403\s*forbidden\b"
-    r"|\bcaptcha\b",
+    r"|captcha"
+    r"|キャプチャ"
+    r"|画像認証",
     re.IGNORECASE,
 )
 _SHORT_DENIAL = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
+_CLOUDFLARE_TITLE = re.compile(r"just a moment(?:\.\.\.|…)", re.IGNORECASE)
+_CHALLENGE_MARKER = re.compile(
+    r"cf-browser-verification"
+    r"|challenge-platform"
+    r"|cf-challenge"
+    r"|cdn-cgi/challenge"
+    r"|__cf_chl"
+    r"|cf_chl_opt",
+    re.IGNORECASE,
+)
 
 
 def _denial_label(label: str) -> bool:
-    """True when this title, heading, or short body is a refusal or a challenge."""
+    """True when this title, heading, or short body is a refusal or a captcha."""
     compact = " ".join(label.split())
     if not compact:
         return False
+    if _CLOUDFLARE_TITLE.fullmatch(compact):
+        return True
     if _DENIAL_LABEL.search(compact):
         return True
     return _SHORT_DENIAL.fullmatch(compact) is not None
@@ -122,10 +138,17 @@ def looks_like_forbidden_page(html: str) -> bool:
     """True when the document is a 403, access-denied, captcha, or challenge page.
 
     A payout of 403円, a title 「第403回」, or 「403万円」 is not a refusal.
-    The title and the first heading name the page. Cloudflare 「Just a moment...」
-    is a challenge: callers stop and do not try another identity.
+    The title and the first heading name the page. Cloudflare is a challenge
+    only when the title is exactly 「Just a moment...」 or the document carries
+    a challenge marker (``cf-challenge``, ``challenge-platform``, and the
+    same). A title that merely contains "just a moment" is not a challenge.
+    「CAPTCHA認証」 and 「キャプチャ」 are captcha titles: callers stop and do
+    not try another identity.
     """
-    soup = BeautifulSoup(html or "", "lxml")
+    raw = html or ""
+    if _CHALLENGE_MARKER.search(raw):
+        return True
+    soup = BeautifulSoup(raw, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
     heading = ""
     h1 = soup.find("h1")
