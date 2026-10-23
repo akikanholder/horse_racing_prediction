@@ -1,8 +1,9 @@
 """Final odds from a public page.
 
-A price is final only when the page says 確定オッズ, or the page is a post-race
-result (not 確定前). Live and yoso numbers are not copied. Missing prices stay
-null. Wide ranges need both ends. Place may be a single price or a printed range.
+A price is final only when the page says 確定オッズ or 最終オッズ, or the page
+is a post-race result (not 確定前). Live and yoso numbers are not copied.
+Missing prices stay null. Wide ranges need both ends. Place may be a single
+price or a printed range.
 """
 
 from __future__ import annotations
@@ -10,28 +11,37 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
 from backend.models.odds import BetType, NonRunner, OddsQuote, OddsSource, PageFetchSource
-from backend.models.race import SettledFinisher, SettledRaceResult
+from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult
 from backend.scrapers.page_fallback import FetchedBody
 from backend.scrapers.runner_status import (
     PriceCell,
     as_page_source,
     non_runners_from_cells,
+    read_popularity,
     read_price_cell,
     read_range_cell,
 )
+from backend.utils.date_utils import tokyo_now
 
 FINAL_ODDS_NOT_CONFIRMED = "final odds were not confirmed"
 FINAL_ODDS_NOT_ON_PAGE = "final odds were not on the page"
 PLACE_ODDS_MISSING = "place odds were not on the page"
 COMBO_ODDS_MISSING = "combination odds were not on the page"
+FINAL_ODDS_NOT_SETTLED = "final odds require a confirmed complete race"
+PAYOUT_DISAGREE = "final odds and payout disagree"
+# JRA pays in 10 yen. odds × 100 within that unit is the same price.
+_PAYOUT_ROUNDING_YEN = 10
 
-_FINAL_MARK = "確定オッズ"
+_FINAL_MARKS = ("確定オッズ", "最終オッズ")
+_PAYOUT_BET = {"ワイド": "wide", "馬連": "umaren", "3連複": "sanrenpuku", "三連複": "sanrenpuku"}
+_DATED = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})")
+_DATED_COMPACT = re.compile(r"(\d{4})(\d{2})(\d{2})")
 _JSON_URL = re.compile(r"""(?:url|URL)\s*:\s*['"]([^'"]+)['"]""")
 _RANGE_SPLIT = re.compile(r"[-–−－〜～]")
 _HORSE = re.compile(r"^(?:[1-9]|1[0-8])$")
@@ -79,8 +89,12 @@ class FinalOddsParse:
 
 
 def page_says_final_odds(text: str) -> bool:
-    """True only for the printed words 確定オッズ. 結果確定 is not this."""
-    return _FINAL_MARK in re.sub(r"\s+", "", text)
+    """True for the printed words 確定オッズ or 最終オッズ.
+
+    結果確定 is not this. A finished JRA odds page is labelled 最終オッズ.
+    """
+    compact = re.sub(r"\s+", "", text)
+    return any(mark in compact for mark in _FINAL_MARKS)
 
 
 def result_is_post_race(settled: SettledRaceResult) -> bool:
@@ -237,6 +251,135 @@ def non_runners_from_finishers(finishers: list[SettledFinisher]) -> list[NonRunn
             )
         )
     return runners
+
+
+def canonical_combination(text: str, bet_type: str) -> str | None:
+    """``3-7`` or ``1-2-5`` in ascending horse-number order. Anything else is null."""
+    return _normalize_combo(text, bet_type)
+
+
+def payout_matches_quote(payout: int, quote: OddsQuote) -> bool | None:
+    """True when payout yen is odds × 100, within the 10 yen unit.
+
+    Wide compares the payout with the printed range. None when this quote has
+    no price to compare. The payout is not turned into an odds value.
+    """
+    if quote.withheld:
+        return None
+    if quote.bet_type == "wide":
+        if quote.odds_min is None or quote.odds_max is None:
+            return None
+        low = quote.odds_min * 100 - _PAYOUT_ROUNDING_YEN
+        high = quote.odds_max * 100 + _PAYOUT_ROUNDING_YEN
+        return low <= payout <= high
+    if quote.odds is None:
+        return None
+    return abs(payout - quote.odds * 100) <= _PAYOUT_ROUNDING_YEN
+
+
+def payout_disagreements(
+    quotes: list[OddsQuote],
+    payouts: list[RacePayout],
+) -> list[str]:
+    """Winning tickets whose yen is not the printed final odds.
+
+    A missing quote is not a disagreement. The caller already warns that the
+    market was not on the page. This does not replace either number.
+    """
+    by_key = {(quote.bet_type, quote.combination): quote for quote in quotes}
+    notes: list[str] = []
+    for row in payouts:
+        bet_type = _PAYOUT_BET.get(row.bet_type.strip())
+        if bet_type is None:
+            continue
+        combination = canonical_combination(row.combination, bet_type)
+        if combination is None:
+            continue
+        quote = by_key.get((bet_type, combination))
+        if quote is None:
+            continue
+        matched = payout_matches_quote(row.payout, quote)
+        if matched is None or matched:
+            continue
+        note = f"{PAYOUT_DISAGREE}: {bet_type} {combination}"
+        if note not in notes:
+            notes.append(note)
+    return notes
+
+
+def odds_api_is_final_payload(body: str) -> bool:
+    """True when this odds API body is ``result`` and the odds map is non-empty.
+
+    An empty ``data`` string and an empty odds map are not final prices.
+    ``middle`` and ``yoso`` are not final. This does not decide caching.
+    """
+    payload = _json_object(body)
+    if payload is None or str(payload.get("status") or "").strip().lower() != "result":
+        return False
+    return _api_odds_nonempty(payload)
+
+
+def odds_api_is_replayable(body: str, *, today: date | None = None) -> bool:
+    """True when a final odds API body may be stored.
+
+    Today or a later ``official_datetime`` in Asia/Tokyo is not stored.
+    A result payload with prices and no datetime may be stored. The caller
+    that already knows the race day is today skips the cache itself.
+    """
+    if not odds_api_is_final_payload(body):
+        return False
+    payload = _json_object(body)
+    if payload is None:
+        return False
+    current = today or tokyo_now().date()
+    official = _official_day(payload)
+    if official is not None and official >= current:
+        return False
+    return True
+
+
+def quotes_from_result_api(
+    page: FetchedBody,
+    race_id: str,
+    bet_type: BetType,
+) -> list[OddsQuote]:
+    """Quotes from a netkeiba odds API body the page itself loaded.
+
+    Only ``status`` ``result`` with a non-empty odds map. A pre-race payload
+    contributes nothing. The quote ``source`` stays the fetch that loaded the
+    body. Popularity is the third field when that field is a rank.
+    """
+    if not odds_api_is_final_payload(page.body):
+        return []
+    payload = _json_object(page.body)
+    if payload is None:
+        return []
+    from backend.scrapers.netkeiba_odds_scraper import (
+        parse_netkeiba_sanrenpuku_odds,
+        parse_netkeiba_umaren_odds,
+        parse_netkeiba_wide_odds,
+    )
+
+    parsers = {
+        "wide": parse_netkeiba_wide_odds,
+        "umaren": parse_netkeiba_umaren_odds,
+        "sanrenpuku": parse_netkeiba_sanrenpuku_odds,
+    }
+    parser = parsers.get(bet_type)
+    if parser is None:
+        return []
+    snapshot = parser(payload, race_id, fetched_at=page.fetched_at)
+    if snapshot.race_phase != "post":
+        return []
+    tagged = _as_odds_source(page.source)
+    quotes: list[OddsQuote] = []
+    for quote in snapshot.quotes:
+        if quote.bet_type != bet_type:
+            continue
+        if quote.source != tagged:
+            quote = quote.model_copy(update={"source": tagged})
+        quotes.append(quote)
+    return quotes
 
 
 def missing_market_warning(quotes: list[OddsQuote] | None) -> str | None:
@@ -463,8 +606,9 @@ def _combination_row(
             price_text = text
     if combination is None or not price_text:
         return None
+    popularity = _row_popularity(row, cells)
     if section == "wide":
-        return _wide_quote(price_text, race_id, combination, source, fetched_at)
+        return _wide_quote(price_text, race_id, combination, source, fetched_at, popularity)
     price = read_price_cell(price_text)
     if price is None:
         return None
@@ -475,6 +619,7 @@ def _combination_row(
         odds=None if price.withheld else price.odds,
         odds_min=None,
         odds_max=None,
+        popularity=popularity,
         source=source,
         fetched_at=fetched_at,
         non_runner=price.non_runner,
@@ -488,6 +633,7 @@ def _wide_quote(
     combination: str,
     source: OddsSource,
     fetched_at: datetime,
+    popularity: int | None = None,
 ) -> OddsQuote | None:
     parts = [part for part in _RANGE_SPLIT.split(text) if part]
     if len(parts) != 2:
@@ -500,6 +646,7 @@ def _wide_quote(
                 odds=None,
                 odds_min=None,
                 odds_max=None,
+                popularity=popularity,
                 source=source,
                 fetched_at=fetched_at,
                 non_runner=cell.non_runner,
@@ -516,6 +663,7 @@ def _wide_quote(
         odds=None,
         odds_min=span.odds_min,
         odds_max=span.odds_max,
+        popularity=popularity,
         source=source,
         fetched_at=fetched_at,
         non_runner=span.non_runner,
@@ -569,6 +717,7 @@ def _json_quote(
         combination = _normalize_combo(combo_key.replace("−", "-"), kind)
     if combination is None:
         return None, None
+    popularity = read_popularity(value)
     if kind == "wide" or (kind == "place" and isinstance(value, list)):
         span = read_range_cell(value)
         if span is None and isinstance(value, str):
@@ -582,6 +731,7 @@ def _json_quote(
             odds=None,
             odds_min=span.odds_min,
             odds_max=span.odds_max,
+            popularity=None if kind == "place" else popularity,
             source=source,
             fetched_at=fetched_at,
             non_runner=span.non_runner,
@@ -603,6 +753,7 @@ def _json_quote(
         odds=None if cell.withheld else cell.odds,
         odds_min=None,
         odds_max=None,
+        popularity=popularity,
         source=source,
         fetched_at=fetched_at,
         non_runner=cell.non_runner,
@@ -641,6 +792,7 @@ def _quote(
     fetched_at: datetime,
     non_runner: bool,
     withheld: bool,
+    popularity: int | None = None,
 ) -> OddsQuote:
     return OddsQuote(
         race_id=race_id,
@@ -649,6 +801,7 @@ def _quote(
         odds=odds,
         odds_min=odds_min,
         odds_max=odds_max,
+        popularity=popularity,
         source=source,
         kind="live",
         fetched_at=fetched_at,
@@ -783,3 +936,68 @@ def _join_source(sources: list[str]) -> str | None:
 
 def _compact(text: object) -> str:
     return re.sub(r"\s+", "", str(text))
+
+
+def _row_popularity(row: Tag, cells: list[Tag]) -> int | None:
+    """Rank printed on the row. A blank cell stays null."""
+    raw = row.get("data-popularity")
+    if isinstance(raw, str):
+        rank = read_popularity(raw)
+        if rank is not None:
+            return rank
+    for cell in cells:
+        classes = " ".join(cell.get("class") or []).lower()
+        if "ninki" in classes or "popular" in classes:
+            rank = read_popularity(_compact(cell.get_text()))
+            if rank is not None:
+                return rank
+    return None
+
+
+def _json_object(body: str) -> dict[str, object] | None:
+    text = body.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _api_odds_nonempty(payload: dict[str, object]) -> bool:
+    """True when ``data.odds`` has at least one combination."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    odds = data.get("odds")
+    if not isinstance(odds, dict) or not odds:
+        return False
+    for block in odds.values():
+        if isinstance(block, dict) and block:
+            return True
+    return False
+
+
+def _official_day(payload: dict[str, object]) -> date | None:
+    """The date printed on ``official_datetime`` or ``kaisai_date``. None when absent."""
+    data = payload.get("data")
+    raw: object = None
+    if isinstance(data, dict):
+        raw = data.get("official_datetime") or data.get("kaisai_date")
+    if raw is None:
+        raw = payload.get("official_datetime")
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    match = _DATED.search(text)
+    if match is None and _DATED_COMPACT.fullmatch(text):
+        match = _DATED_COMPACT.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None

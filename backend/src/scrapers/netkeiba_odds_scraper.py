@@ -70,6 +70,7 @@ from backend.scrapers.runner_status import (
     PriceCell,
     RangeCell,
     non_runners_from_cells,
+    read_popularity,
     read_price_cell,
     read_range_cell,
     records_from_json,
@@ -716,18 +717,18 @@ def _quotes_from_wide_map(
     The published ceiling ``9,999.9`` with a non-positive second field is
     both ends.
     """
-    candidates: list[tuple[tuple[int, int, int, str], str, RangeCell]] = []
+    candidates: list[tuple[tuple[int, int, int, str], str, RangeCell, int | None]] = []
     for key, raw in wide_map.items():
         pair = _wide_pair(key)
         odds_range = read_range_cell(raw)
         if pair is None or odds_range is None or not isinstance(key, str):
             continue
         combination = f"{pair[0]}-{pair[1]}"
-        candidates.append((_pair_sort(key, pair), combination, odds_range))
+        candidates.append((_pair_sort(key, pair), combination, odds_range, read_popularity(raw)))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, odds_range in sorted(candidates):
+    for _sort, combination, odds_range, popularity in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -738,6 +739,7 @@ def _quotes_from_wide_map(
                 combination=combination,
                 odds_min=odds_range.odds_min,
                 odds_max=odds_range.odds_max,
+                popularity=popularity,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
@@ -762,18 +764,18 @@ def _quotes_from_umaren_map(
 
     ``----`` or ``取消`` keeps the pair with a null price. An empty cell is dropped.
     """
-    candidates: list[tuple[tuple[int, int, int, str], str, PriceCell]] = []
+    candidates: list[tuple[tuple[int, int, int, str], str, PriceCell, int | None]] = []
     for key, raw in umaren_map.items():
         pair = _wide_pair(key)
         cell = read_price_cell(raw)
         if pair is None or cell is None or not isinstance(key, str):
             continue
         combination = f"{pair[0]}-{pair[1]}"
-        candidates.append((_pair_sort(key, pair), combination, cell))
+        candidates.append((_pair_sort(key, pair), combination, cell, read_popularity(raw)))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, cell in sorted(candidates):
+    for _sort, combination, cell, popularity in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -783,6 +785,7 @@ def _quotes_from_umaren_map(
                 bet_type="umaren",
                 combination=combination,
                 odds=cell.odds,
+                popularity=popularity,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
@@ -807,18 +810,18 @@ def _quotes_from_sanrenpuku_map(
 
     ``----`` or ``取消`` keeps the trio with a null price. An empty cell is dropped.
     """
-    candidates: list[tuple[tuple[int, int, int, int, str], str, PriceCell]] = []
+    candidates: list[tuple[tuple[int, int, int, int, str], str, PriceCell, int | None]] = []
     for key, raw in trio_map.items():
         trio = _trio(key)
         cell = read_price_cell(raw)
         if trio is None or cell is None or not isinstance(key, str):
             continue
         combination = f"{trio[0]}-{trio[1]}-{trio[2]}"
-        candidates.append((_trio_sort(key, trio), combination, cell))
+        candidates.append((_trio_sort(key, trio), combination, cell, read_popularity(raw)))
 
     quotes: list[OddsQuote] = []
     seen: set[str] = set()
-    for _sort, combination, cell in sorted(candidates):
+    for _sort, combination, cell, popularity in sorted(candidates):
         if combination in seen:
             continue
         seen.add(combination)
@@ -828,6 +831,7 @@ def _quotes_from_sanrenpuku_map(
                 bet_type="sanrenpuku",
                 combination=combination,
                 odds=cell.odds,
+                popularity=popularity,
                 source=source,
                 kind=kind,
                 fetched_at=fetched_at,
@@ -1029,4 +1033,3 @@ def _pair_sort(key: str, pair: tuple[int, int]) -> tuple[int, int, int, str]:
     elif text == f"{pair[0]}-{pair[1]}":
         ordered = 0
     return (pair[0], pair[1], ordered, text)
-

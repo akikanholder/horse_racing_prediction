@@ -81,6 +81,7 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli trends --date 20261018 --venue 東京 --surface 芝 --json` | `GET /api/races/trends?date=20261018&venue=東京&surface=芝` | その開催日だけ。`YYYY-MM-DD` も同じ。確定レースの人気・枠・脚質・騎手・父の集計。予想の入力にしない |
 | `python -m backend.cli trends --recent-meeting --venue 東京 --json` | `GET /api/races/trends?recent_meeting=true&venue=東京` | 当日（Asia/Tokyo）の確定と、同じ競馬場の前開催日 |
 | `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds` |
+| `python -m backend.cli final-odds <race_id> --bet-types wide,umaren,sanrenpuku --json` | `GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku` | `FinalRaceOdds`。過去の確定ワイド・馬連・三連複 |
 | `python -m backend.cli courses --json` | `GET /api/courses` | `Course` の配列 |
 | `python -m backend.cli courses --venue 東京 --json` | `GET /api/courses/{venue}` | `Course` |
 | （CLI なし） | `GET /api/courses/{venue}/conditions` | `CourseCondition` |
@@ -346,7 +347,7 @@ CLI の `--fetch-mode` と API の `fetch_mode` は `html`（既定）、`headle
 
 `headless` でブラウザが無い、または描画に失敗したときは HTTP に戻り、`headless browser is not installed` または `headless render failed` を付ける。401/403、captcha、ログイン画面は HTTP に戻さず、null と今までの警告で止める。UA はブラウザ自身。差し替え、プロキシ、回避のための再試行はしない。間隔は 1.5 秒以上。
 
-確定オッズのパーサは `確定オッズ` の印字だけを確定とする。JRA の確定後ページが `最終オッズ` と出すときは、html も headless も確定引用は空のまま。単勝欄の数値は別で、このゲートは変えない。
+確定オッズのパーサは `確定オッズ` と `最終オッズ` の印字を確定とする。JRA の確定後ページが `最終オッズ` と出すとき、そのページの価格は確定引用になる。発売中の数字をこのラベル無しで確定にはしない。
 
 オッズの cname はページに印刷されたものを使う。メニューの `doAction` が先にあり、レースの `151ou` があるときはレース側を使う。`Z/` は最終オッズのボタン。チェックサムは計算しない。
 
@@ -405,6 +406,7 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 | `market_updated_at` | API の `official_datetime` があるときだけ | 同左 | 同左 | 同左 |
 | `non_runner` | その馬が取消・除外のとき true | 組のどれかが取消・除外のとき true | 同左 | 同左 |
 | `withheld` | ページが `----` または `取消` のとき true | 同左 | 同左 | 同左 |
+| `popularity` | ページか API の人気。無いときは null | 同左。配列の3列目 | 同左 | 同左 |
 
 価格が無い行、ワイドで範囲の片側しか無い行は捨てる。ページが `----` または `取消` / `除外` / `出走取消` / `競走除外` と出している行は残す。価格は null、`withheld` は true。数値は作らない。組のページが行自体を出していないときは、その組は作らない。取消馬を含む組でページが価格を出しているときは、その価格を残し `non_runner` を true。変動値は範囲ではないので馬連・三連複の `odds_min` / `odds_max` には入れない。HTTP 400 の本文に数値が載っていても価格にしない。ワイドの掲載上限 `9,999.9` で 2 列目が `0` または負の変動のときは、両端がその上限の点範囲。`2.9` / `0.0` のような片側だけの行は捨てる。
 
@@ -477,7 +479,36 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 }
 ```
 
-ワイドの引用は `combination: "3-7"`、`odds: null`、`odds_min` と `odds_max` に価格。馬連は `combination: "3-7"` と単一の `odds`。三連複は `combination: "1-2-5"` と単一の `odds`。
+ワイドの引用は `combination: "3-7"`、`odds: null`、`odds_min` と `odds_max` に価格。馬連は `combination: "3-7"` と単一の `odds`。三連複は `combination: "1-2-5"` と単一の `odds`。`popularity` はページか API にあるときだけ。無いときは null。
+
+### 過去の確定組み合わせオッズ `FinalRaceOdds`
+
+```bash
+python -m backend.cli final-odds 202505030811 --bet-types wide --json
+python -m backend.cli final-odds 202505030811 --bet-types umaren --json
+python -m backend.cli final-odds 202505030811 --bet-types sanrenpuku --fetch-mode auto --json
+```
+
+`GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku`。既定の馬券種はワイド、馬連、三連複。`win` はこのコマンドでは捨てる。
+
+`FinalRaceOdds` は `RaceOdds` に `result_phase`、`complete`、`odds_final` を足したもの。`encoding` は `utf-8`。`fetched_at` は Asia/Tokyo の `+09:00`。
+
+価格を載せるのは、着順の `result_phase` が `confirmed` かつ `complete` が true のときだけ。そのとき `odds_final` は true、`race_phase` は `post`。それ以外は `quotes` が空、`odds_final` は false、`race_phase` は null、`warning` に理由。払戻からも、発売中の数字からも価格は作らない。
+
+| 局面 | `warning` |
+|---|---|
+| `result_phase` が `provisional` | `result phase is provisional` |
+| `complete` が false | `race result is not complete`（着順の未完了の文があるときはその文） |
+| 局面が null | `result phase was not on the page` |
+| 結果ページが 403 / ログイン | 着順の警告のまま。オッズのページは開かない |
+
+取り方は、静的 HTML、ページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの URL（netkeiba の `api_get_jra_odds.html` を含む）、任意のヘッドレス。`--fetch-mode html` はヘッドレスを開かない。`headless` はブラウザを使い、無いときは HTTP に戻して `headless browser is not installed`。`auto` はブラウザがあれば使い、無ければ警告しない。403、captcha、Cloudflare の `Just a moment`、ログイン画面はそこで止め、User-Agent の差し替えはしない。JRA が 403 のあとは netkeiba に一度だけ進む。JRA の次のページは開かない。netkeiba が 403 のあとはヘッドレスも残りの馬券種も開かない。
+
+ページの `確定オッズ` と `最終オッズ` はどちらも確定。オッズ API は `status` が `result` で組み合わせが空でないときだけ確定価格にする。`middle` と `yoso` は捨てる。
+
+ワイドは範囲。払戻が `odds_min × 100` から `odds_max × 100` のあいだ（10円単位の端数）なら一致。馬連と三連複は `払戻 ≈ odds × 100`（10円以内）。違うときは価格を置き換えず、`warning` に `final odds and payout disagree: umaren 1-3`。ページに無い組は作らない。`combination odds were not on the page: wide` のように欠測の馬券種を書く。
+
+過去の確定オッズは `backend/.cache/pages` に残す。オッズ API は `status` が `result` かつオッズが空でないときだけ。`official_datetime` が今日（Asia/Tokyo）以降のときは保存しない。開催日が今日以降のレースは、結果ページの日付を見てオッズ本文を保存しない。今日以降の開催一覧と JRA の当日ページは従来どおり保存しない。
 
 オッズ API のこのコマンドに無い馬券種（複勝、枠連、馬単、三連単）は、発売中の `odds` では取らない。複勝の確定オッズだけは過去レースが、ページに印字があるとき `bet_type=place` で持つ。確定結果の払戻表にそれらの名前が出ても、発売中のオッズ面の `bet_type` にはならない。
 
@@ -518,7 +549,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 確定オッズにするのは次だけ。
 
-- ページに `確定オッズ` と印字がある。
+- ページに `確定オッズ` または `最終オッズ` と印字がある。
 - またはレース後のページ（着順表がある。`result_phase` が `provisional` のときは含めない）。netkeiba オッズ API は `race_phase=post`（API の `status=result`）のときだけ。
 
 発売中（`middle` / `yoso` / `race_phase=pre`）の数字は確定オッズにしない。`final_odds` は null、`warning` は `final odds were not confirmed`。結果ページに単勝が印字されていれば、それはレース後のページなので単勝の確定オッズにしてよい。複勝と組み合わせは、そのページに価格が無いときは作らない。払戻からオッズは作らない。
@@ -550,7 +581,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 単勝の確定オッズと、単勝・ワイド・馬連・三連複の払戻が揃えばバックテストに足りる。組み合わせの確定オッズはページにあるときだけ。
 
-日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残す。保存時に `replayable` を付ける。その印がある結果以外のページは、読み出し時にログイン画面や 403 の本文を解析しない。印の無い古いファイルは読むときにその判定をする。`result.html` と netkeiba のオッズ API は印があっても本文を見る。判断はパスと mtime ごとに一度。確定かつ complete の `result.html` は開き直さない。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。今日以降の JRA `accessH`（払戻）、`accessO`（オッズ）、`accessD`（出馬表）と、日付の無いそれらのメニューも保存しない。cname の `ymd` が今日より前のページは保存してよい。オッズ API（`api_get_jra_odds.html`）は `status` が `result` のときだけ保存する。`middle` や `yoso` は保存せず、次の実行が取り直す。書き込み時にログイン画面、`403 Forbidden`、`Access Denied`、captcha、Cloudflare の `Just a moment` は保存しない。`第403回` や `403万円`、払戻の `403円` は拒否ではない。`Just a moment` はチャレンジとして止め、別の身元では取りにいかない。
+日付範囲は、先に範囲内のレースIDを並べ、その順に1レースずつ取る。レースとレースのあいだは既定 1.5 秒（`--delay`）。キャッシュにあるページのあいだは待たない。HTTP もその間隔を空ける。取ったページは `backend/.cache/pages` に残す。保存時に `replayable` を付ける。その印がある結果以外のページは、読み出し時にログイン画面や 403 の本文を解析しない。印の無い古いファイルは読むときにその判定をする。`result.html` と netkeiba のオッズ API は印があっても本文を見る。判断はパスと mtime ごとに一度。確定かつ complete の `result.html` は開き直さない。速報、着順が短いページ、着順表の無い未確定ページ、`result_phase` が `provisional` のページは保存しない。すでに保存されていても再生しない。次の実行が取り直す。開催日が今日（Asia/Tokyo）以降の `race_list.html` / `race_list_get_date_list.html` / `race_list_sub.html` も保存しない。日付の無い開催一覧も保存しない。過去の `kaisai_date` はキャッシュしてよい。今日以降の JRA `accessH`（払戻）、`accessO`（オッズ）、`accessD`（出馬表）と、日付の無いそれらのメニューも保存しない。cname の `ymd` が今日より前のページは保存してよい。オッズ API（`api_get_jra_odds.html`）は `status` が `result` でオッズが空でないときだけ保存する。`data` が空、`middle`、`yoso` は保存せず、次の実行が取り直す。`official_datetime` が今日（Asia/Tokyo）以降の結果も保存しない。開催日が今日以降と分かっている確定オッズの取得は、その本文を保存しない。書き込み時にログイン画面、`403 Forbidden`、`Access Denied`、captcha、Cloudflare の `Just a moment` は保存しない。`第403回` や `403万円`、払戻の `403円` は拒否ではない。`Just a moment` はチャレンジとして止め、別の身元では取りにいかない。
 
 結果ページが `race result returned 403` または `race result requires login` のとき、そのレースのオッズも、それより後のレースも開かない。同じ実行ではその URL を再試行しない。User-Agent の差し替え、captcha、ログインはしない。開催一覧が 403 またはログイン画面のときは、その日以降の一覧を開かない。すでに並んだレースだけ取り、`warning` は `race list returned 403` または `race list requires login`。JRA のオッズだけが 403 のときは、そのレースの netkeiba に一度だけ進み、日付範囲は止めない。JRA の次のページは開かない。
 

@@ -10,7 +10,7 @@ did not carry the card, odds, result, or payouts. Delays are at least 1.5s
 between headless navigations. A cache hit does not wait. 403, login, and
 captcha stop the run.
 
-The production odds parser accepts a price only when the page says 確定オッズ.
+The production odds parser accepts a price when the page says 確定オッズ or 最終オッズ.
 Finished JRA odds pages say 最終オッズ. `parser_confirmed` is that gate.
 `printed_win` is the 単勝 column on that page, parsed with `read_price_cell`
 (float, or null when the cell is 取消 or ----). Both sides use the same
@@ -83,7 +83,7 @@ Phase 2 proceeds. After the navigation fix, all 12 races and the track row match
 
 - 202608040501: HTML cache hits 3/3. The HTML time is a cache read. The other 11 HTML times are live.
 - 202608040508: the first headless pass resolved on the form document (0.25s, 12 mismatches, warning that the odds cname was missing). The wait now requires the access URL. A re-fetch with HTML served from cache matched: 11 entries, 11 results, 6 payouts, 11 printed win prices, 0 mismatches, headless 5.17s. The headless RSS on this row is from the failed pass and was not sampled again.
-- Both methods leave `parser_confirmed` false. The page says 最終オッズ. The production parser still requires 確定オッズ. Printed 単勝 prices matched. That gate was not changed.
+- This run recorded `parser_confirmed` false because the page says 最終オッズ and the parser then required 確定オッズ. The parser now treats 最終オッズ as final, the same gate as 確定オッズ. Printed 単勝 prices matched.
 - Embedded JSON payload count is 0. Headless values are the rendered DOM run through the same parsers.
 - The cushion number is not in the baba tab. Both methods follow `_data_cushion.html` named by the page script. Kyoto cushion matched at 10.7.
 - Track is one row. It is not added to each race's seconds.
