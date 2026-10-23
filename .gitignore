@@ -225,6 +225,10 @@ backend/csv_output/
 
 # Prediction JSONL at any depth (`predictions add`, including backend/predictions)
 predictions/
+# Fixtures under this name stay tracked. A parent directory ignore cannot be
+# re-included unless the directory itself is un-ignored first.
+!backend/tests/fixtures/predictions/
+!backend/tests/fixtures/predictions/**
 
 # Cached public pages for historical date ranges
 backend/.cache/

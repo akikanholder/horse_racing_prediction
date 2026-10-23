@@ -127,14 +127,22 @@ _CAPTCHA_LABEL = re.compile(r"captcha|キャプチャ|画像認証", re.IGNORECA
 _FORBIDDEN_LABEL = re.compile(r"\baccess\s+denied\b|\b403\s*forbidden\b", re.IGNORECASE)
 _SHORT_FORBIDDEN = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
 _CLOUDFLARE_TITLE = re.compile(r"just a moment(?:\.\.\.|…)", re.IGNORECASE)
-# A challenge form or id. Cloudflare also injects
-# ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` into ordinary pages.
-# That script tag is not a challenge page.
+# A challenge form, id, or class. ``cf-challenge`` is a prefix, so
+# ``cf-challenge-running`` counts. ``class="cf-browser-verification"`` counts.
+# Cloudflare also injects ``/cdn-cgi/challenge-platform/scripts/jsd/main.js``
+# into ordinary pages. That script tag is not a challenge page.
 _CHALLENGE_FORM = re.compile(
-    r"""\b(?:id|name)\s*=\s*['"](?:cf-challenge|challenge-form|cf-browser-verification)['"]""",
+    r"""\b(?:id|name|class)\s*=\s*['"][^'"]*\b"""
+    r"""(?:cf-challenge[\w-]*|challenge-form|cf-browser-verification)(?![\w-])""",
     re.IGNORECASE,
 )
-_CF_CHL_OPT = re.compile(r"\bcf_chl_opt\b", re.IGNORECASE)
+# ``_`` is a word character, so ``\bcf_chl_opt\b`` misses ``window._cf_chl_opt``
+# and ``__cf_chl_opt``. A letter or digit glued on the left still does not match.
+_CF_CHL_OPT = re.compile(r"(?<![A-Za-z0-9])_*cf_chl_opt\b", re.IGNORECASE)
+_CLOUDFLARE_ATTENTION = re.compile(
+    r"attention required!\s*\|\s*cloudflare",
+    re.IGNORECASE,
+)
 
 
 def _compact_label(label: str) -> str:
@@ -157,7 +165,11 @@ def _forbidden_label(label: str) -> bool:
 
 def _challenge_title(label: str) -> bool:
     compact = _compact_label(label)
-    return bool(compact) and _CLOUDFLARE_TITLE.fullmatch(compact) is not None
+    if not compact:
+        return False
+    if _CLOUDFLARE_TITLE.fullmatch(compact) is not None:
+        return True
+    return _CLOUDFLARE_ATTENTION.fullmatch(compact) is not None
 
 
 def _lacks_real_content(soup: BeautifulSoup) -> bool:
@@ -188,12 +200,15 @@ def _page_labels(html: str) -> tuple[BeautifulSoup, str, str, str]:
 def page_block_reason(html: str) -> BlockedReason | None:
     """Why this document is a refusal, or None when it is a normal page.
 
-    A captcha title is ``captcha``. A challenge form (``cf-challenge``,
-    ``challenge-form``) or the exact title 「Just a moment...」 is
-    ``challenge``. ``cf_chl_opt`` is a challenge only when the page has no
-    real content. The script ``/cdn-cgi/challenge-platform/scripts/jsd/main.js``
-    is not a challenge. An access-denied title is ``http_403`` without claiming
-    that an HTTP status was observed.
+    A captcha title is ``captcha``. A challenge form, id, or class
+    (``cf-challenge`` as a prefix, including ``cf-challenge-running``,
+    ``challenge-form``, ``cf-browser-verification``), the exact title
+    「Just a moment...」, or the exact title 「Attention Required! | Cloudflare」
+    is ``challenge``. ``window._cf_chl_opt`` and ``__cf_chl_opt`` are a
+    challenge only when the page has no real content. The script
+    ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` is not a challenge.
+    An access-denied title is ``http_403`` without claiming that an HTTP
+    status was observed.
     """
     raw = html or ""
     soup, title, heading, text = _page_labels(raw)
@@ -222,9 +237,11 @@ def looks_like_forbidden_page(html: str) -> bool:
 
     A payout of 403円, a title 「第403回」, or 「403万円」 is not a refusal.
     The title and the first heading name the page. Cloudflare is a challenge
-    only when the title is exactly 「Just a moment...」, the document has a
-    challenge form (``cf-challenge``, ``challenge-form``), or ``cf_chl_opt``
-    appears on a page with no real content. A normal page that only includes
+    when the title is exactly 「Just a moment...」 or exactly
+    「Attention Required! | Cloudflare」, the document has a challenge id,
+    name, or class (``cf-challenge`` as a prefix, ``challenge-form``,
+    ``cf-browser-verification``), or ``window._cf_chl_opt`` appears on a page
+    with no real content. A normal page that only includes
     ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` is not a challenge.
     A title that merely contains "just a moment" is not a challenge.
     「CAPTCHA認証」 and 「キャプチャ」 are captcha titles: callers stop and do
@@ -305,24 +322,18 @@ RESULT_TABLE_READY_JS = """() => {
 
 
 # Odds pages paint ``---.-`` and fill the cells from the page's own script.
-# A timeout is that shell. The caller parses it and does not invent a price.
+# One filled cell, or a final heading while other cells are still ``---.-``,
+# is not ready. ``----`` is a printed withheld mark. A timeout is the shell.
+# The caller parses it and does not invent a price.
 ODDS_CELL_WAIT_MS = 12_000
 ODDS_CELL_READY_JS = """() => {
   const compact = (el) => (el.textContent || '').replace(/\\s+/g, '');
-  const placeholders = new Set(['---.-', '----', '']);
+  const loading = new Set(['---.-', '']);
   const nodes = Array.from(document.querySelectorAll(
     'span[id^="odds-"], span[id^="oddsmin-"], span[id^="oddsmax-"], td.Odds, span.Odds'
   ));
-  const priced = nodes.some((el) => {
-    const text = compact(el);
-    return text && !placeholders.has(text) && /\\d/.test(text);
-  });
-  if (priced) return true;
-  const headings = Array.from(document.querySelectorAll('title, h1, h2, h3, h4, caption, th'));
-  return headings.some((el) => {
-    const text = compact(el);
-    return text.includes('確定オッズ') || text.includes('最終オッズ');
-  });
+  if (!nodes.length) return false;
+  return nodes.every((el) => !loading.has(compact(el)));
 }"""
 
 
@@ -342,11 +353,13 @@ BABA_READING_READY_JS = """() => {
 def await_page_ready(page: object, url: str) -> None:
     """Wait until the document has the reading the page itself fills in.
 
-    A result URL waits for the full finishing table. An odds URL waits until a
-    cell leaves ``---.-`` or a final heading is printed. A baba URL waits for
-    the measurement dropdown. Anything else returns immediately. A timeout is
-    the page still short. The caller parses that document and does not fetch
-    again.
+    A result URL waits for the full finishing table. An odds URL waits until
+    every visible odds cell is filled. One number, or a final heading while
+    other cells are still ``---.-`` or empty, does not end the wait. ``----``
+    is a withheld mark and counts as filled. No odds cells means keep waiting.
+    A baba URL waits for the measurement dropdown. Anything else returns
+    immediately. A timeout is the page still short. The caller parses that
+    document and does not fetch again.
     """
     if "/race/result.html" in url:
         script, timeout, note = (

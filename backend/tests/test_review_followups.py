@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.jra_track_scraper import JRATrackScraper, measurement_sections_from_soup
 from backend.scrapers.page_cache import _REPLAYABLE_VERSION, CachingHTTPClient
 from backend.scrapers.page_fallback import (
+    ODDS_CELL_READY_JS,
     PageFallback,
     looks_like_forbidden_page,
     page_block_reason,
@@ -469,6 +472,152 @@ def test_jsd_script_on_a_normal_page_is_not_a_challenge():
         + "</td></tr></table></body></html>"
     )
     assert page_block_reason(with_table) is None
+
+
+def _stopped_challenge(html: str, seen: list[str]):
+    def render(url: str) -> str:
+        seen.append(url)
+        return "<html><body>bypassed</body></html>"
+
+    return PageFallback(object(), site="jra", headless_render=render).load(
+        url="https://www.jra.go.jp/JRADB/accessD.html",
+        params=None,
+        headers=None,
+        encoding="cp932",
+        fetched_at=FETCHED,
+        should_fallback=lambda _html: True,
+        still_incomplete=lambda _pages: True,
+        html_body=html,
+    )
+
+
+def test_window_cf_chl_opt_and_challenge_markers_stop_without_headless_or_cache(tmp_path: Path):
+    story = "story " * 40
+    short = (
+        "<html><head><title>レース</title></head>"
+        "<body><script>window._cf_chl_opt = {};</script></body></html>"
+    )
+    doubled = (
+        "<html><head><title>レース</title></head>"
+        "<body><script>var __cf_chl_opt = {};</script></body></html>"
+    )
+    running = (
+        "<html><head><title>出馬表</title></head><body>"
+        f'<div id="cf-challenge-running"></div>{story}</body></html>'
+    )
+    klass = (
+        "<html><head><title>出馬表</title></head><body>"
+        f'<div class="cf-browser-verification"></div>{story}</body></html>'
+    )
+    attention = (
+        "<html><head><title>Attention Required! | Cloudflare</title></head>"
+        f"<body><p>Sorry, you have been blocked.</p>{story}</body></html>"
+    )
+    seen: list[str] = []
+    for html in (short, doubled, running, klass, attention):
+        assert page_block_reason(html) == "challenge"
+        fetched = _stopped_challenge(html, seen)
+        assert fetched.status == "blocked"
+        assert fetched.blocked_reason == "challenge"
+        assert fetched.http_status is None
+        assert fetched.login_required is False
+        assert fetched.warning == "jra returned a challenge"
+        assert fetched.pages == []
+    assert seen == []
+
+    with_table = (
+        "<html><head><title>出馬表</title></head><body>"
+        "<script>window._cf_chl_opt = {};</script><table><tr><td>"
+        + ("馬番 " * 20)
+        + "</td></tr></table></body></html>"
+    )
+    assert page_block_reason(with_table) is None
+    glued = (
+        "<html><head><title>レース</title></head>"
+        "<body><p>mycf_chl_opt is a horse note.</p></body></html>"
+    )
+    assert page_block_reason(glued) is None
+
+    class _Transport:
+        def __init__(self, body: str):
+            self.body = body
+            self.calls = 0
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls += 1
+            return self.body
+
+    for index, body in enumerate((short, attention)):
+        transport = _Transport(body)
+        client = CachingHTTPClient(
+            tmp_path / str(index),
+            transport=transport,
+            min_request_interval=0,
+        )
+        url = "https://www.jra.go.jp/JRADB/accessD.html"
+        assert client.get(url) == body
+        assert client.get(url) == body
+        assert transport.calls == 2
+    assert list(tmp_path.rglob("*.json")) == []
+
+
+def test_odds_wait_stays_until_visible_cells_are_filled():
+    node = shutil.which("node")
+    assert node
+    probe = """
+const ready = eval(process.argv[1]);
+const cases = JSON.parse(process.argv[2]);
+for (const item of cases) {
+  global.document = {
+    querySelectorAll(sel) {
+      const texts = sel.startsWith("span[id") ? item.cells : item.headings;
+      return texts.map((text) => ({ textContent: text }));
+    },
+  };
+  if (Boolean(ready()) !== item.expect) {
+    console.error(JSON.stringify({ item, got: ready() }));
+    process.exit(1);
+  }
+}
+"""
+    cases = [
+        {"cells": ["1.2", "---.-"], "headings": ["確定オッズ"], "expect": False},
+        {"cells": ["---.-", "---.-"], "headings": ["最終オッズ"], "expect": False},
+        {"cells": [], "headings": ["確定オッズ"], "expect": False},
+        {"cells": ["1.2", ""], "headings": [], "expect": False},
+        {"cells": ["1.2", "4.5"], "headings": [], "expect": True},
+        {"cells": ["1.2", "----"], "headings": ["確定オッズ"], "expect": True},
+        {"cells": ["----", "----"], "headings": [], "expect": True},
+    ]
+    completed = subprocess.run(
+        [node, "-e", probe, ODDS_CELL_READY_JS, json.dumps(cases)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_prediction_fixtures_stay_tracked():
+    root = Path(__file__).resolve().parents[2]
+    fixture = Path("backend/tests/fixtures/predictions/example_record.json")
+    assert (root / fixture).is_file()
+
+    def ignored(path: str) -> bool:
+        completed = subprocess.run(
+            ["git", "check-ignore", "-q", "--no-index", "--", path],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode in {0, 1}, completed.stderr
+        return completed.returncode == 0
+
+    assert ignored(fixture.as_posix()) is False
+    assert ignored("backend/tests/fixtures/predictions/another_record.json") is False
+    assert ignored("backend/predictions/out.json") is True
+    assert ignored("predictions/out.json") is True
 
 
 def test_race_date_metadata_does_not_change_the_jra_form_body(tmp_path: Path, monkeypatch):

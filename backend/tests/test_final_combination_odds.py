@@ -32,6 +32,7 @@ from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
 from backend.scrapers.page_fallback import (
     HEADLESS_UNAVAILABLE,
+    AccessBlocked,
     FetchedBody,
     HeadlessUnavailableError,
     headless_browser_installed,
@@ -564,6 +565,41 @@ def test_netkeiba_403_stops_the_chain():
     assert snapshot.odds_final is False
     assert snapshot.race_phase is None
     assert snapshot.warning == "netkeiba odds returned 403"
+
+
+def test_headless_block_reason_names_captcha_challenge_and_denial():
+    shell = "<html><body>読み込み中</body></html>"
+    cases = (
+        ("captcha", None, "returned a captcha", "netkeiba returned a captcha"),
+        ("challenge", None, "returned a challenge", "netkeiba returned a challenge"),
+        ("http_403", None, "returned 403", "netkeiba odds returned 403"),
+        ("login", 401, "requires login", "netkeiba odds requires login"),
+    )
+    for reason, status, message, warning in cases:
+        calls: list[str] = []
+
+        def render(
+            url: str,
+            *,
+            _reason: str = reason,
+            _status: int | None = status,
+            _message: str = message,
+        ) -> str:
+            calls.append(url)
+            raise AccessBlocked(_status, _message, reason=_reason)
+
+        service, client, _jra = _service(
+            _result_html(),
+            PublicOddsPages([], None, False),
+            odds_html=shell,
+            headless_render=render,
+        )
+        snapshot = service.get(RACE_ID, bet_types="wide,umaren")
+        assert snapshot.quotes == []
+        assert snapshot.odds_final is False
+        assert snapshot.warning == warning
+        assert len(calls) == 1
+        assert sum("odds/index.html" in url for url in client.gets) == 1
 
 
 def test_jra_403_tries_netkeiba_once_per_missing_market():

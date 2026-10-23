@@ -438,7 +438,13 @@ def _render_odds_page(
 
 
 def _block_text(blocked: AccessBlocked) -> str:
-    if blocked.status == 403:
+    """Name the refusal. A captcha or challenge is not a login wall."""
+    reason = blocked.reason
+    if reason == "captcha":
+        return "netkeiba returned a captcha"
+    if reason == "challenge":
+        return "netkeiba returned a challenge"
+    if reason == "http_403" or blocked.status == 403:
         return "netkeiba returned 403"
     return "netkeiba requires login"
 
