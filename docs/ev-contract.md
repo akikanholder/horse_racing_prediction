@@ -945,22 +945,24 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 時刻は ISO 8601 でオフセット `+09:00`。ナイーブ時刻と他のオフセットは拒否する。`race.post_time` は `15:40+09:00` のように時刻だけでも、日付付きでもよい。
 
-確率と EV は小数。`0.36` は +36%。オッズは倍率。金額は整数の円。距離はメートル。`weights` は 8 個で合計 100。`item_scores` も 8 個で、同じ順。欠測は null。金額も着順も払戻も作らない。
+確率と EV は小数。`0.36` は +36%。オッズは倍率。金額は整数の円。距離はメートル。金額も着順も払戻も作らない。
 
-`run.weights` の並びは次のとおり。添字 0 から 7。このツールは重みで点数を計算しない。
+`weights` と `item_scores` は、同じ8つのキーを持つオブジェクト。キーの追加も欠落もできない。値は数値。このツールは重みの既定値を持たない。合計が 100 になる数字は呼び出した側が書く。`weights` の各値は 0 以上。`item_scores` を null にはしない。このツールは重みで点数を計算しない。
 
-| 添字 | 項目 |
+| キー | 意味 |
 |---|---|
-| 0 | 近走 |
-| 1 | 血統 |
-| 2 | 脚質 |
-| 3 | 調教 |
-| 4 | 馬場 |
-| 5 | 枠 |
-| 6 | 騎手 |
-| 7 | 展開 |
+| `ability` | 基礎能力・近走のレース内容 |
+| `pace` | 展開・脚質適性 |
+| `course` | コース・距離適性 |
+| `going` | 馬場適性・当日バイアス |
+| `workout` | 調教・仅上がり・馬体 |
+| `gate_jockey` | 枠順・斤量・騎手 |
+| `pedigree` | 血統適性 |
+| `rotation` | ローテーション・状態リスク |
 
-`softmax_t` のようなモデルのパラメータは `weights` に入れない。`rules` に書く。
+`weights` の8つの値の合計は 100。`softmax_t` のようなモデルのパラメータは `weights` に入れない。`rules` に書く。
+
+見本（`_example` が true）の重みは `ability` 25、`pace` 15、`course` 15、`going` 12、`workout` 10、`gate_jockey` 10、`pedigree` 5、`rotation` 8。本番の行はこの数字を使わなくてよい。
 
 `schema` は `hrp.prediction`。`schema_version` は `1.0.0`。
 
@@ -970,11 +972,11 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 `race`: `race_id`（netkeiba の12桁）、`date`、`venue`、`race_number`、`race_name`、`surface`（芝/ダート/障害）、`distance_m`、`post_time`、`field_size`、`going`（良/稍重/重/不良）、`weather`。レース名、発走、馬場、天候は無いとき null。
 
-`run`: `edition`（`day_before` または `pre_post_45m`）、`run_at`、`engine`（`name` と `version`）、`cli_commit`、`weights`、`rules`。`weights` の順は上の8項目。`rules` はオブジェクトなら何でも残す。中のキーはこのツールでは定めない。`softmax_t` もここ。
+`run`: `edition`（`day_before` または `pre_post_45m`）、`run_at`、`engine`（`name` と `version`）、`cli_commit`、`weights`、`rules`。`weights` のキーは上の表。`rules` はオブジェクトなら何でも残す。中のキーはこのツールでは定めない。`softmax_t` もここ。
 
 `sources[]`: `kind`（`odds_win` / `odds_combo` / `track` / `training` / `past9` / `trends` / `card`）、`provider`、`fetched_at`、`measured_at`、`market_updated_at`、`status`、`is_today`、`stale`、`note`。測定時刻と市場の更新時刻、状態、当日、鮮度、注記は無いとき null。
 
-`horses[]`: `horse_number`、`horse_name`、`scratch_status`（`entered` / `scratched` / `excluded` / `unknown`）、`total_score`、`item_scores`、`data_coverage`（0 から 1）、`plus`、`risk`、`confidence`（高/中/低）、`win_prob`、`win_prob_range`（`[lo, hi]`）、`fair_odds`、`odds_win`、`odds_fetched_at`、`ev`、`ev_conservative`、`ability_mark`、`buy_mark`（◎ ○ ▲ △ ☆、または null）、`market_view`（過小評価/妥当/過剰人気）。`horses` は EV が点を付けた馬で、出走頭数そのものではない。
+`horses[]`: `horse_number`、`horse_name`、`scratch_status`（`entered` / `scratched` / `excluded` / `unknown`）、`total_score`、`item_scores`（`weights` と同じ8キー。値は数値）、`data_coverage`（0 から 1）、`plus`、`risk`、`confidence`（高/中/低）、`win_prob`、`win_prob_range`（`[lo, hi]`）、`fair_odds`、`odds_win`、`odds_fetched_at`、`ev`、`ev_conservative`、`ability_mark`、`buy_mark`（◎ ○ ▲ △ ☆、または null）、`market_view`（過小評価/妥当/過剰人気）。`horses` は EV が点を付けた馬で、出走頭数そのものではない。
 
 `decision`: `pass_race`、`ability_top`（馬番または null）、`reason`。
 

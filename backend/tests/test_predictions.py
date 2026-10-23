@@ -196,6 +196,16 @@ def test_example_record_is_marked_and_valid():
     stored = validate_prediction(raw, pending_only=True)
     assert stored["_example"] is True
     assert stored["schema"] == "hrp.prediction"
+    assert stored["run"]["weights"] == {
+        "ability": 25,
+        "pace": 15,
+        "course": 15,
+        "going": 12,
+        "workout": 10,
+        "gate_jockey": 10,
+        "pedigree": 5,
+        "rotation": 8,
+    }
     assert stored["schema_version"] == "1.0.0"
     assert stored["run"]["rules"] == raw["run"]["rules"]
 
@@ -224,9 +234,21 @@ def test_rules_round_trip_keeps_caller_keys(tmp_path: Path):
 
 def test_add_rejects_bad_weights_timezone_and_wide_price():
     bad_weights = _example()
-    bad_weights["run"]["weights"] = [20, 15, 15, 10, 10, 10, 10, 9]
+    bad_weights["run"]["weights"] = {**bad_weights["run"]["weights"], "rotation": 7}
     with pytest.raises(PredictionValidationError, match="weights must sum to 100"):
         validate_prediction(bad_weights, pending_only=True)
+    missing = _example()
+    del missing["run"]["weights"]["rotation"]
+    with pytest.raises(PredictionValidationError, match="rotation is required"):
+        validate_prediction(missing, pending_only=True)
+    extra = _example()
+    extra["run"]["weights"]["softmax_t"] = 1
+    with pytest.raises(PredictionValidationError, match="softmax_t is not allowed"):
+        validate_prediction(extra, pending_only=True)
+    scored = _example()
+    scored["horses"][0]["item_scores"]["ability"] = None
+    with pytest.raises(PredictionValidationError, match="item_scores.ability must be number"):
+        validate_prediction(scored, pending_only=True)
 
     naive = _example()
     naive["run"]["run_at"] = "2026-10-17T18:00:00"
@@ -722,7 +744,23 @@ def test_schema_path_uses_package_data_and_repo_fallback(monkeypatch: pytest.Mon
     path = schema_path()
     assert path.is_file()
     assert path.name == "hrp.prediction.schema.json"
-    assert prediction_schema()["properties"]["run"]["properties"]["weights"]["maxItems"] == 8
+    weights = prediction_schema()["properties"]["run"]["properties"]["weights"]
+    scores = prediction_schema()["properties"]["horses"]["items"]["properties"]["item_scores"]
+    keys = [
+        "ability",
+        "pace",
+        "course",
+        "going",
+        "workout",
+        "gate_jockey",
+        "pedigree",
+        "rotation",
+    ]
+    assert weights["type"] == "object"
+    assert weights["additionalProperties"] is False
+    assert weights["required"] == keys
+    assert scores["required"] == keys
+    assert "default" not in weights
     docs = Path(__file__).resolve().parents[2] / "docs" / "schemas" / "hrp.prediction.schema.json"
     packaged = Path(__file__).resolve().parents[1] / "src" / "services" / "hrp.prediction.schema.json"
     assert packaged.read_bytes() == docs.read_bytes()
@@ -730,10 +768,31 @@ def test_schema_path_uses_package_data_and_repo_fallback(monkeypatch: pytest.Mon
     assert validate.schema_path() == docs
 
 
-def test_contract_states_weight_order_and_softmax_in_rules():
+def test_contract_names_the_weight_keys():
     text = (Path(__file__).resolve().parents[2] / "docs" / "ev-contract.md").read_text(encoding="utf-8")
-    section = text.split("`run.weights` の並びは次のとおり。", 1)[1].split("###", 1)[0]
-    order = ["近走", "血統", "脚質", "調教", "馬場", "枠", "騎手", "展開"]
-    positions = [section.index(name) for name in order]
-    assert positions == sorted(positions)
+    section = text.split("`weights` と `item_scores` は、同じ8つのキー", 1)[1].split("###", 1)[0]
+    keys = [
+        "ability",
+        "pace",
+        "course",
+        "going",
+        "workout",
+        "gate_jockey",
+        "pedigree",
+        "rotation",
+    ]
+    meanings = [
+        "基礎能力・近走のレース内容",
+        "展開・脚質適性",
+        "コース・距離適性",
+        "馬場適性・当日バイアス",
+        "調教・仅上がり・馬体",
+        "枠順・斤量・騎手",
+        "血統適性",
+        "ローテーション・状態リスク",
+    ]
+    assert [section.index(key) for key in keys] == sorted(section.index(key) for key in keys)
+    for meaning in meanings:
+        assert meaning in section
     assert "softmax_t" in section
+    assert "近走, 血統, 脚質" not in text

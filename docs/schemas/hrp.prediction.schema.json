@@ -84,11 +84,29 @@
         },
         "cli_commit": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
         "weights": {
-          "type": "array",
-          "description": "Eight weights in this order: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. They sum to 100. Model parameters such as softmax_t belong in rules.",
-          "minItems": 8,
-          "maxItems": 8,
-          "items": {"type": "number", "minimum": 0}
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Eight named weights. The caller chooses the numbers; they sum to 100. Model parameters such as softmax_t belong in rules.",
+          "required": [
+            "ability",
+            "pace",
+            "course",
+            "going",
+            "workout",
+            "gate_jockey",
+            "pedigree",
+            "rotation"
+          ],
+          "properties": {
+            "ability": {"type": "number", "minimum": 0, "description": "基礎能力・近走のレース内容"},
+            "pace": {"type": "number", "minimum": 0, "description": "展開・脚質適性"},
+            "course": {"type": "number", "minimum": 0, "description": "コース・距離適性"},
+            "going": {"type": "number", "minimum": 0, "description": "馬場適性・当日バイアス"},
+            "workout": {"type": "number", "minimum": 0, "description": "調教・仅上がり・馬体"},
+            "gate_jockey": {"type": "number", "minimum": 0, "description": "枠順・斤量・騎手"},
+            "pedigree": {"type": "number", "minimum": 0, "description": "血統適性"},
+            "rotation": {"type": "number", "minimum": 0, "description": "ローテーション・状態リスク"}
+          }
         },
         "rules": {
           "type": "object",
@@ -184,11 +202,29 @@
           },
           "total_score": {"anyOf": [{"type": "null"}, {"type": "number"}]},
           "item_scores": {
-            "type": "array",
-            "description": "Eight scores in the same order as run.weights: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. A missing item is null.",
-            "minItems": 8,
-            "maxItems": 8,
-            "items": {"anyOf": [{"type": "null"}, {"type": "number"}]}
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Eight scores with the same keys as run.weights. Each value is a number. This schema does not supply a default.",
+            "required": [
+              "ability",
+              "pace",
+              "course",
+              "going",
+              "workout",
+              "gate_jockey",
+              "pedigree",
+              "rotation"
+            ],
+            "properties": {
+              "ability": {"type": "number", "description": "基礎能力・近走のレース内容"},
+              "pace": {"type": "number", "description": "展開・脚質適性"},
+              "course": {"type": "number", "description": "コース・距離適性"},
+              "going": {"type": "number", "description": "馬場適性・当日バイアス"},
+              "workout": {"type": "number", "description": "調教・仅上がり・馬体"},
+              "gate_jockey": {"type": "number", "description": "枠順・斤量・騎手"},
+              "pedigree": {"type": "number", "description": "血統適性"},
+              "rotation": {"type": "number", "description": "ローテーション・状態リスク"}
+            }
           },
           "data_coverage": {"anyOf": [{"type": "null"}, {"type": "number", "minimum": 0, "maximum": 1}]},
           "plus": {"anyOf": [{"type": "null"}, {"type": "number"}]},

@@ -205,7 +205,8 @@ def _cross_check(record: dict[str, Any], *, pending_only: bool) -> None:
     expected = expected_record_id(race["race_id"], run["edition"], run["run_at"])
     if record["record_id"] != expected:
         raise PredictionValidationError(f"record_id must be {expected}")
-    total = sum((Decimal(str(weight)) for weight in run["weights"]), Decimal(0))
+    weights = run["weights"]
+    total = sum((Decimal(str(weights[key])) for key in weights), Decimal(0))
     if total != Decimal(100):
         raise PredictionValidationError("weights must sum to 100")
     seen: set[int] = set()

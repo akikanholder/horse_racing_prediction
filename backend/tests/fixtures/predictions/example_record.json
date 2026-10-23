@@ -21,7 +21,16 @@
     "run_at": "2026-10-17T18:00:00+09:00",
     "engine": {"name": "example", "version": "0"},
     "cli_commit": null,
-    "weights": [20, 15, 15, 10, 10, 10, 10, 10],
+    "weights": {
+      "ability": 25,
+      "pace": 15,
+      "course": 15,
+      "going": 12,
+      "workout": 10,
+      "gate_jockey": 10,
+      "pedigree": 5,
+      "rotation": 8
+    },
     "rules": {
       "min_ev": 0.05,
       "labels": ["keep"],
@@ -47,7 +56,16 @@
       "horse_name": "サンプル",
       "scratch_status": "entered",
       "total_score": 78.5,
-      "item_scores": [80, 70, 75, 60, 65, 70, 72, 68],
+      "item_scores": {
+        "ability": 80,
+        "pace": 70,
+        "course": 75,
+        "going": 60,
+        "workout": 65,
+        "gate_jockey": 70,
+        "pedigree": 72,
+        "rotation": 68
+      },
       "data_coverage": 0.9,
       "plus": 1.2,
       "risk": 0.4,
