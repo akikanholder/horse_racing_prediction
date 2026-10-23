@@ -28,7 +28,7 @@ from backend.scrapers.runner_status import (
     read_price_cell,
     read_range_cell,
 )
-from backend.utils.date_utils import tokyo_now
+from backend.utils.date_utils import TOKYO, tokyo_now
 
 FINAL_ODDS_NOT_CONFIRMED = "final odds were not confirmed"
 FINAL_ODDS_NOT_ON_PAGE = "final odds were not on the page"
@@ -883,7 +883,7 @@ def _json_says_final(text: str) -> bool:
     return page_says_final_odds(label)
 
 
-def _has_price_text(html: str) -> bool:
+def has_price_text(html: str) -> bool:
     """True when a cell or a final JSON body actually prints a price.
 
     ``---.-`` and ``----`` are not prices. A range counts only when both ends
@@ -917,6 +917,31 @@ def _cell_is_price(text: str) -> bool:
         return False
     ranged = read_range_cell(parts[:2])
     return ranged is not None and ranged.odds_min is not None
+
+
+_has_price_text = has_price_text
+
+
+def label_final_market_quote(quote: OddsQuote) -> OddsQuote:
+    """Mark a final-odds API quote without changing a live-odds quote in place.
+
+    ``netkeiba_live`` on this path becomes ``netkeiba_result`` / ``result``.
+    A page source such as ``jra_html`` stays. A naive ``market_updated_at``
+    is Asia/Tokyo and is emitted as ``+09:00``.
+    """
+    update: dict[str, object] = {}
+    if quote.source == "netkeiba_live":
+        update["source"] = "netkeiba_result"
+        update["kind"] = "result"
+    stamped = quote.market_updated_at
+    if stamped is not None:
+        if stamped.tzinfo is None:
+            update["market_updated_at"] = stamped.replace(tzinfo=TOKYO)
+        else:
+            update["market_updated_at"] = stamped.astimezone(TOKYO)
+    if not update:
+        return quote
+    return quote.model_copy(update=update)
 
 
 def _horse_in_row(cells: list[Tag]) -> str | None:

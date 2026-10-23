@@ -29,6 +29,7 @@ from backend.models.race import Race, SettledRaceResult
 from backend.scrapers.final_odds import (
     FINAL_ODDS_NOT_CONFIRMED,
     FinalOddsParse,
+    label_final_market_quote,
     missing_market_warning,
     non_runners_from_finishers,
     parse_confirmed_odds,
@@ -531,7 +532,8 @@ class HistoricalService:
             runners.extend(snapshot.non_runners or [])
         if not quotes:
             return [], runners, None, win.reason or "final win odds were not on the page"
-        return quotes, runners, "netkeiba_live", None
+        labeled = [label_final_market_quote(quote) for quote in quotes]
+        return labeled, runners, "netkeiba_result", None
 
     def _fetch_bet(self, race_id: str, bet_type: BetType) -> RaceOdds:
         fetched_at = tokyo_now()
@@ -582,9 +584,13 @@ def _stop_line(race_id: str, warning: str | None) -> str:
 
 
 def _list_block_warning(exc: Exception) -> str | None:
-    """403 and a login wall stop the date list. Other errors do not."""
+    """403, captcha, a challenge, and a login wall stop the date list."""
     if isinstance(exc, AccessBlocked):
-        if exc.status == 403:
+        if exc.reason == "captcha":
+            return "race list returned a captcha"
+        if exc.reason == "challenge":
+            return "race list returned a challenge"
+        if exc.reason == "http_403" or exc.status == 403:
             return "race list returned 403"
         return "race list requires login"
     status = getattr(getattr(exc, "response", None), "status_code", None)

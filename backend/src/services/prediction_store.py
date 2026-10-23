@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -44,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 TOKYO = ZoneInfo("Asia/Tokyo")
 REFUND_NOT_NON_RUNNER = "refund horses are not scratched or excluded"
+_LOCK_TIMEOUT_ENV = "HRP_PREDICTION_LOCK_TIMEOUT"
+_LOCK_TIMEOUT_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.05
 _PAYOUT_TICKET = {
     "単勝": "win",
     "ワイド": "wide",
@@ -107,6 +112,8 @@ class PredictionStore:
             grouped.setdefault(day, []).append(record)
         paths = [self.path_for(day) for day in sorted(grouped)]
         with _exclusive_locks(paths):
+            for path in paths:
+                _cleanup_stale_tmp(path)
             staged: dict[date, list[dict[str, Any]]] = {}
             for day, incoming in grouped.items():
                 existing = self.read(day)
@@ -171,6 +178,7 @@ class PredictionStore:
             return report
         path = self.path_for(day)
         with _exclusive_locks([path]):
+            _cleanup_stale_tmp(path)
             fresh = self.read(day)
             changed = False
             updated_rows: list[dict[str, Any]] = []
@@ -635,21 +643,77 @@ class _exclusive_locks:
             self._held.pop().__exit__(None, None, None)
 
 
+def _lock_timeout_seconds() -> float:
+    """Positive finite seconds. ``HRP_PREDICTION_LOCK_TIMEOUT`` overrides 30."""
+    raw = os.environ.get(_LOCK_TIMEOUT_ENV)
+    if raw is None or raw.strip() == "":
+        return _LOCK_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise PredictionStoreError(
+            f"{_LOCK_TIMEOUT_ENV} must be a positive finite number"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise PredictionStoreError(f"{_LOCK_TIMEOUT_ENV} must be a positive finite number")
+    return value
+
+
+def _lock_clock() -> float:
+    return time.monotonic()
+
+
+def _lock_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def _lock_exclusive(handle: Any) -> None:
     if fcntl is not None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         return
     if msvcrt is not None:
-        handle.seek(0)
-        if handle.read(1) == b"":
-            handle.write(b"\0")
-            handle.flush()
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        _lock_msvcrt(handle)
         return
     raise PredictionStoreError(
         "exclusive prediction lock needs fcntl.flock or msvcrt.locking"
     )
+
+
+def _lock_msvcrt(handle: Any) -> None:
+    """Retry a non-blocking lock until the timeout. LK_LOCK gives up near 10s."""
+    handle.seek(0)
+    if handle.read(1) == b"":
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+    timeout = _lock_timeout_seconds()
+    deadline = _lock_clock() + timeout
+    while True:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if _lock_clock() >= deadline:
+                raise PredictionStoreError(
+                    f"exclusive prediction lock timed out after {timeout:g}s"
+                ) from None
+            remaining = deadline - _lock_clock()
+            _lock_sleep(min(_LOCK_POLL_SECONDS, max(remaining, 0.0)))
+
+
+def _cleanup_stale_tmp(path: Path) -> None:
+    """Remove interrupted writes for this date. Other dates are left in place."""
+    prefix = f".{path.name}."
+    try:
+        stale_files = list(path.parent.glob(f"{prefix}*.tmp"))
+    except OSError as exc:
+        logger.warning("Could not list stale prediction files for %s: %s", path, exc)
+        return
+    for stale in stale_files:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            logger.warning("Could not remove stale prediction file %s: %s", stale, exc)
 
 
 def _unlock(handle: Any) -> None:

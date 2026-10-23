@@ -1049,7 +1049,13 @@ def _result_source(value: str) -> str:
 
 def _result_block_warning(loaded: FallbackFetch) -> str:
     """Map a refused fetch onto the result warnings. The yen amount is not a status."""
-    if loaded.http_status == 403 and not loaded.login_required:
+    if loaded.blocked_reason == "captcha":
+        return loaded.warning or "netkeiba returned a captcha"
+    if loaded.blocked_reason == "challenge":
+        return loaded.warning or "netkeiba returned a challenge"
+    if loaded.blocked_reason == "http_403" or (
+        loaded.http_status == 403 and not loaded.login_required
+    ):
         return RACE_RESULT_FORBIDDEN
     return RACE_RESULT_LOGIN
 
@@ -1359,10 +1365,13 @@ def _assess_complete(
 
 
 def _result_stopped(settled: SettledRaceResult) -> bool:
-    """HTTP 401/403 or a login wall. ``--wait-complete`` must not open the URL again.
+    """HTTP 401/403, a login wall, a captcha, or a challenge.
 
-    A payout of 403円 or 1403円 is not a refusal. Only the fetch flags are.
+    ``--wait-complete`` must not open the URL again. A payout of 403円 or
+    1403円 is not a refusal. Only the fetch flags are.
     """
+    if settled.blocked_reason in {"captcha", "challenge", "login", "http_403"}:
+        return True
     return bool(settled.login_required or settled.http_status in {401, 403})
 
 
@@ -1797,6 +1806,10 @@ def _compose_horse_run_warning(
 def _horse_chain_extra(loaded: FallbackFetch) -> str | None:
     if loaded.status == "failed":
         return HORSE_RESULT_FETCH_FAILED
+    if loaded.blocked_reason == "captcha":
+        return loaded.warning or HORSE_RESULT_CAPTCHA
+    if loaded.blocked_reason == "challenge":
+        return loaded.warning or "horse result returned a challenge"
     warning = loaded.warning
     if not warning:
         return None
@@ -2289,6 +2302,7 @@ class NetkeibaScraper(BaseScraper):
                 _result_block_warning(loaded),
                 http_status=loaded.http_status,
                 login_required=loaded.login_required,
+                blocked_reason=loaded.blocked_reason,
             )
         if loaded.status == "failed" or not loaded.pages:
             return self._empty_settled_result(race_id, fetched, RACE_RESULT_FETCH_FAILED)
@@ -2300,6 +2314,7 @@ class NetkeibaScraper(BaseScraper):
                     "warning": _join_warnings(settled.warning, _result_block_warning(loaded)),
                     "http_status": loaded.http_status,
                     "login_required": loaded.login_required,
+                    "blocked_reason": loaded.blocked_reason,
                 }
             )
         elif (
@@ -2335,6 +2350,7 @@ class NetkeibaScraper(BaseScraper):
         *,
         http_status: int | None = None,
         login_required: bool = False,
+        blocked_reason: str | None = None,
     ) -> SettledRaceResult:
         identity = header or _SettledHeader()
         return SettledRaceResult(
@@ -2358,6 +2374,7 @@ class NetkeibaScraper(BaseScraper):
             warning=warning,
             http_status=http_status,
             login_required=login_required,
+            blocked_reason=blocked_reason,  # type: ignore[arg-type]
         )
 
     def _parse_settled_race_result(
@@ -2859,6 +2876,7 @@ class NetkeibaScraper(BaseScraper):
         notes: list[str | None] = []
         payout_status: int | None = None
         payout_login = False
+        payout_reason: str | None = None
         if settled.payouts or settled.refunds:
             key = _official_payout_key(header, self.VENUE_CODES)
             if key is None:
@@ -2888,6 +2906,8 @@ class NetkeibaScraper(BaseScraper):
                 if checked.http_status in {401, 403} or checked.login_required:
                     payout_status = checked.http_status
                     payout_login = checked.login_required
+                if checked.blocked_reason in {"captcha", "challenge", "login", "http_403"}:
+                    payout_reason = checked.blocked_reason
             refunds, refund_note = _merge_refunds(
                 settled.refunds, official, settled.fetched_at, jra_source=jra_source
             )
@@ -2914,6 +2934,8 @@ class NetkeibaScraper(BaseScraper):
         if payout_status in {401, 403} or payout_login:
             update["http_status"] = payout_status
             update["login_required"] = payout_login
+        if payout_reason is not None and settled.blocked_reason is None:
+            update["blocked_reason"] = payout_reason
         if not update:
             return settled
         return settled.model_copy(update=update)

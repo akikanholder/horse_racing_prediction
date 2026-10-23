@@ -944,7 +944,10 @@ def test_round_title_is_not_a_denial_and_a_challenge_stops():
     )
     assert seen == []
     assert fetched.status == "blocked"
-    assert fetched.http_status == 403
+    assert fetched.blocked_reason == "challenge"
+    assert fetched.http_status is None
+    assert fetched.login_required is False
+    assert fetched.warning == "jra returned a challenge"
     assert fetched.pages == []
 
 

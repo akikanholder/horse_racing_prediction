@@ -345,11 +345,14 @@ def apply_measurement_freshness(
 
 
 def track_blocked(info: TrackInfo) -> bool:
-    """HTTP 401/403 or a login wall. A later retry must not open the same URL again.
+    """HTTP 401/403, a login wall, a captcha, or a challenge.
 
-    The flag is set by the fetch. A warning that only mentions 403, such as a
-    reading note, is not a block.
+    A later retry must not open the same URL again. The flag is set by the
+    fetch. A warning that only mentions 403, such as a reading note, is not
+    a block.
     """
+    if info.blocked_reason in {"captcha", "challenge", "login", "http_403"}:
+        return True
     return bool(info.login_required or info.http_status in {401, 403})
 
 

@@ -9,9 +9,14 @@ import pytest
 from bs4 import BeautifulSoup
 
 import backend.scrapers.page_cache as page_cache
+from backend.scrapers.jra_scraper import JRAScraper
 from backend.scrapers.jra_track_scraper import JRATrackScraper, measurement_sections_from_soup
 from backend.scrapers.page_cache import _REPLAYABLE_VERSION, CachingHTTPClient
-from backend.scrapers.page_fallback import PageFallback, looks_like_forbidden_page
+from backend.scrapers.page_fallback import (
+    PageFallback,
+    looks_like_forbidden_page,
+    page_block_reason,
+)
 from backend.services.historical_service import HistoricalService
 from backend.services.race_trend_service import RaceTrendService
 from backend.utils.date_utils import TOKYO
@@ -148,8 +153,30 @@ def test_cloudflare_title_must_be_exact_and_japanese_captcha_stops():
     )
     assert seen == []
     assert fetched.status == "blocked"
-    assert fetched.http_status == 403
+    assert fetched.blocked_reason == "captcha"
+    assert fetched.http_status is None
+    assert fetched.login_required is False
+    assert fetched.warning == "jra returned a captcha"
     assert fetched.pages == []
+
+    denied = PageFallback(object(), site="jra", headless_render=render).load(
+        url="https://www.jra.go.jp/keiba/baba/index.html",
+        params=None,
+        headers=None,
+        encoding="cp932",
+        fetched_at=FETCHED,
+        should_fallback=lambda _html: True,
+        still_incomplete=lambda _pages: True,
+        html_body=(
+            "<html><head><title>403 Forbidden</title></head>"
+            "<body><h1>Access Denied</h1></body></html>"
+        ),
+    )
+    assert seen == []
+    assert denied.status == "blocked"
+    assert denied.blocked_reason == "http_403"
+    assert denied.http_status is None
+    assert denied.warning == "jra returned 403"
 
 
 def test_old_replayable_mark_is_rechecked_and_legacy_denial_is_memoized(
@@ -401,3 +428,74 @@ def test_past_jra_page_is_cached_from_the_request_date(tmp_path: Path, monkeypat
     denied.post(ACCESS_H, data=past)
     denied.post(ACCESS_H, data=past)
     assert calls == ["denied", "denied"]
+
+
+def test_jsd_script_on_a_normal_page_is_not_a_challenge():
+    html = (FIXTURES / "normal_page_with_jsd_script.html").read_text(encoding="utf-8")
+    assert "/cdn-cgi/challenge-platform/scripts/jsd/main.js" in html
+    assert page_block_reason(html) is None
+    assert looks_like_forbidden_page(html) is False
+    seen: list[str] = []
+
+    def render(url: str) -> str:
+        seen.append(url)
+        return "<html><body>bypassed</body></html>"
+
+    fetched = PageFallback(object(), site="jra", headless_render=render).load(
+        url="https://www.jra.go.jp/JRADB/accessD.html",
+        params=None,
+        headers=None,
+        encoding="cp932",
+        fetched_at=FETCHED,
+        should_fallback=lambda _html: False,
+        still_incomplete=lambda _pages: False,
+        html_body=html,
+    )
+    assert fetched.status == "ok"
+    assert fetched.blocked_reason is None
+    assert fetched.http_status is None
+    assert fetched.pages
+    assert seen == []
+
+    bare = (
+        "<html><head><title>Just a moment...</title></head>"
+        "<body><script>cf_chl_opt</script></body></html>"
+    )
+    assert page_block_reason(bare) == "challenge"
+    with_table = (
+        "<html><head><title>出馬表</title></head><body>"
+        "<script>cf_chl_opt</script><table><tr><td>"
+        + ("馬番 " * 20)
+        + "</td></tr></table></body></html>"
+    )
+    assert page_block_reason(with_table) is None
+
+
+def test_race_date_metadata_does_not_change_the_jra_form_body(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        page_cache,
+        "tokyo_now",
+        lambda: datetime(2026, 10, 18, 12, 0, tzinfo=TOKYO),
+    )
+    bodies: list[dict] = []
+
+    class _Transport:
+        def post(self, url, data=None, headers=None, encoding=None):
+            bodies.append(dict(data or {}))
+            return "<html><head><title>払戻</title></head><body>100円</body></html>"
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            raise AssertionError(url)
+
+    client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    scraper = JRAScraper(http_client=client, headless_render="off", fetch_mode="html")  # type: ignore[arg-type]
+    past = date(2025, 11, 20)
+    first = scraper._post_jra(ACCESS_H, UNDATED, encoding="cp932", race_date=past)
+    second = scraper._post_jra(ACCESS_H, UNDATED, encoding="cp932", race_date=past)
+    assert first == second
+    assert bodies == [{"cname": UNDATED}]
+
+    bodies.clear()
+    scraper._post_jra(ACCESS_H, UNDATED, encoding="cp932", race_date=date(2026, 10, 18))
+    scraper._post_jra(ACCESS_H, UNDATED, encoding="cp932", race_date=date(2026, 10, 18))
+    assert bodies == [{"cname": UNDATED}, {"cname": UNDATED}]

@@ -220,10 +220,11 @@ __marimo__/
 # Generated race CSV exports (date/venue directories and CSV files)
 *.csv
 *.jsonl
+*.jsonl.lock
 backend/csv_output/
 
-# Default directory for prediction JSONL (`predictions add`)
-/predictions/
+# Prediction JSONL at any depth (`predictions add`, including backend/predictions)
+predictions/
 
 # Cached public pages for historical date ranges
 backend/.cache/

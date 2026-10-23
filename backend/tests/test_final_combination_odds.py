@@ -30,7 +30,13 @@ from backend.scrapers.final_odds import (
 )
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
-from backend.scrapers.page_fallback import FetchedBody, headless_browser_installed, render_headless
+from backend.scrapers.page_fallback import (
+    HEADLESS_UNAVAILABLE,
+    FetchedBody,
+    HeadlessUnavailableError,
+    headless_browser_installed,
+    render_headless,
+)
 from backend.services.final_odds_service import FinalOddsService
 from backend.services.race_service import RaceService
 
@@ -339,7 +345,7 @@ def test_confirmed_race_returns_final_combination_odds():
     assert snapshot.race_phase == "post"
     assert snapshot.result_phase == "confirmed"
     assert snapshot.complete is True
-    assert snapshot.status == "live"
+    assert snapshot.status == "result"
     assert snapshot.warning is None
     assert snapshot.bet_types == ["wide", "umaren", "sanrenpuku"]
     _assert_final_clock(snapshot)
@@ -522,6 +528,24 @@ def test_headless_renders_a_shell_and_html_mode_does_not():
     assert empty.quotes == []
     assert empty.odds_final is False
     assert "headless browser is not installed" not in (empty.warning or "")
+
+
+def test_missing_headless_browser_warns_on_final_odds(monkeypatch):
+    def _missing(url: str) -> str:
+        raise HeadlessUnavailableError("playwright is not installed")
+
+    monkeypatch.setattr("backend.services.final_odds_service.render_headless", _missing)
+    service, _client, _jra = _service(
+        _result_html(),
+        PublicOddsPages([], None, False),
+        odds_html="<html><body>読み込み中</body></html>",
+        headless_render="auto",
+    )
+    snapshot = service.get(RACE_ID, bet_types="wide")
+    assert snapshot.quotes == []
+    assert snapshot.odds_final is False
+    assert snapshot.warning is not None
+    assert HEADLESS_UNAVAILABLE in snapshot.warning
 
 
 def test_netkeiba_403_stops_the_chain():
@@ -774,7 +798,15 @@ def test_placeholder_shell_uses_the_result_api():
     assert wide.popularity == 4
     assert trio.odds == 32.4
     assert trio.popularity == 4
-    assert all(quote.source == "netkeiba_live" for quote in snapshot.quotes)
+    assert snapshot.status == "result"
+    assert all(quote.source == "netkeiba_result" for quote in snapshot.quotes)
+    assert all(quote.kind == "result" for quote in snapshot.quotes)
+    assert all(
+        quote.market_updated_at is not None
+        and quote.market_updated_at.isoformat().endswith("+09:00")
+        for quote in snapshot.quotes
+    )
+    assert snapshot.quotes[0].market_updated_at == datetime(2026, 10, 18, 15, 28, 7, tzinfo=TOKYO)
     assert {str((params or {}).get("type")) for params in client.params} >= {"4", "5", "7"}
     assert any((params or {}).get("action") == "init" for params in client.params)
     assert any((params or {}).get("compress") == "0" for params in client.params)

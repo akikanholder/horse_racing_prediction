@@ -29,8 +29,8 @@ from backend.scrapers.jra_headless import HeadlessTransport
 from backend.scrapers.page_fallback import (
     FetchedBody,
     PageFallback,
-    looks_like_forbidden_page,
     looks_like_login_wall,
+    page_block_reason,
 )
 from backend.scrapers.track_freshness import (
     CACHED_COPY,
@@ -257,6 +257,8 @@ class JRATrackScraper(BaseScraper):
     )
     BABA_ENCODING = "cp932"
     BABA_403 = "JRA baba returned 403"
+    BABA_CAPTCHA = "JRA baba returned a captcha"
+    BABA_CHALLENGE = "JRA baba returned a challenge"
     BABA_NOT_MEETING = "JRA baba page is not the requested meeting"
     BABA_UNPARSEABLE = "JRA baba page could not be parsed"
     BABA_FETCH_FAILED = "JRA baba fetch failed"
@@ -350,18 +352,32 @@ class JRATrackScraper(BaseScraper):
         requested = self._requested_name(racecourse)
         if racecourse and requested is None:
             return empty_track_info("JRA", self.BABA_UNPARSEABLE)
-        pages, sources, saw_403, saw_error, saw_login = self._load_meeting_tabs(requested)
+        (
+            pages,
+            sources,
+            saw_403,
+            saw_http_403,
+            saw_error,
+            saw_login,
+            saw_captcha,
+            saw_challenge,
+        ) = self._load_meeting_tabs(requested)
 
         chosen = self._choose_page(pages, requested)
         if chosen is None:
             htmls = [html for _, html in pages]
-            warning = self._miss_warning(htmls, saw_403, saw_error, saw_login)
+            warning = self._miss_warning(
+                htmls, saw_403, saw_error, saw_login, saw_captcha, saw_challenge
+            )
             return self._finish(
                 self._with_access(
                     empty_track_info("JRA", warning),
                     warning=warning,
                     saw_403=saw_403,
+                    saw_http_403=saw_http_403,
                     saw_login=saw_login,
+                    saw_captcha=saw_captcha,
+                    saw_challenge=saw_challenge,
                 ),
                 race_date=race_date,
                 today=today,
@@ -421,7 +437,7 @@ class JRATrackScraper(BaseScraper):
 
     def _load_meeting_tabs(
         self, requested: str | None
-    ) -> tuple[list[tuple[str, str]], dict[str, str], bool, bool, bool]:
+    ) -> tuple[list[tuple[str, str]], dict[str, str], bool, bool, bool, bool, bool, bool]:
         """The two known tabs, then further ``indexN.html`` links when needed.
 
         A requested meeting that is already on ``index.html`` or ``index2.html``
@@ -431,13 +447,16 @@ class JRATrackScraper(BaseScraper):
         pages: list[tuple[str, str]] = []
         sources: dict[str, str] = {}
         saw_403 = False
+        saw_http_403 = False
         saw_error = False
         saw_login = False
+        saw_captcha = False
+        saw_challenge = False
         seen: set[str] = set()
 
         def fetch(url: str) -> str | None:
-            nonlocal saw_403, saw_error, saw_login
-            if url in seen or saw_login:
+            nonlocal saw_403, saw_http_403, saw_error, saw_login, saw_captcha, saw_challenge
+            if url in seen or saw_login or saw_captcha or saw_challenge:
                 return None
             seen.add(url)
             try:
@@ -446,9 +465,17 @@ class JRATrackScraper(BaseScraper):
                 )
             except Exception as e:
                 status = getattr(getattr(e, "response", None), "status_code", None)
-                if status == 403:
+                reason = getattr(e, "reason", None)
+                if reason == "captcha":
+                    saw_captcha = True
+                elif reason == "challenge":
+                    saw_challenge = True
+                elif status == 403:
                     saw_403 = True
-                elif status == 401:
+                    saw_http_403 = True
+                elif reason == "http_403":
+                    saw_403 = True
+                elif status == 401 or reason == "login":
                     saw_login = True
                 else:
                     saw_error = True
@@ -458,9 +485,18 @@ class JRATrackScraper(BaseScraper):
                 saw_login = True
                 logger.info("JRA baba requires login for %s", url)
                 return None
-            if looks_like_forbidden_page(html):
+            blocked = page_block_reason(html)
+            if blocked == "captcha":
+                saw_captcha = True
+                logger.info("JRA baba returned a captcha for %s", url)
+                return None
+            if blocked == "challenge":
+                saw_challenge = True
+                logger.info("JRA baba returned a challenge for %s", url)
+                return None
+            if blocked == "http_403":
                 saw_403 = True
-                logger.info("JRA baba returned a denied or challenge page for %s", url)
+                logger.info("JRA baba returned a denied page for %s", url)
                 return None
             pages.append((url, html))
             sources[url] = "headless" if self._transport.used_headless else "jra_html"
@@ -478,7 +514,16 @@ class JRATrackScraper(BaseScraper):
                 html = fetch(url)
                 if html and self._title_venue(html) == requested:
                     break
-        return pages, sources, saw_403, saw_error, saw_login
+        return (
+            pages,
+            sources,
+            saw_403,
+            saw_http_403,
+            saw_error,
+            saw_login,
+            saw_captcha,
+            saw_challenge,
+        )
 
     def _requested_name(self, racecourse: str | None) -> str | None:
         """Japanese meeting name for a code or name. Unknown codes stay unset."""
@@ -503,11 +548,21 @@ class JRATrackScraper(BaseScraper):
         return None
 
     def _miss_warning(
-        self, pages: list[str], saw_403: bool, saw_error: bool, saw_login: bool = False
+        self,
+        pages: list[str],
+        saw_403: bool,
+        saw_error: bool,
+        saw_login: bool = False,
+        saw_captcha: bool = False,
+        saw_challenge: bool = False,
     ) -> str:
         """Why no tab was copied. A foreign title is not this meeting."""
         if saw_login:
             return self.BABA_LOGIN
+        if saw_captcha:
+            return self.BABA_CAPTCHA
+        if saw_challenge:
+            return self.BABA_CHALLENGE
         if any(self._title_venue(html) for html in pages):
             return self.BABA_NOT_MEETING
         if saw_403:
@@ -532,11 +587,17 @@ class JRATrackScraper(BaseScraper):
 
     def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the baba warnings. Do not read the body."""
+        reason = getattr(loaded, "blocked_reason", None)
+        warning = getattr(loaded, "warning", None)
+        if reason == "captcha":
+            return warning if isinstance(warning, str) and warning else self.BABA_CAPTCHA
+        if reason == "challenge":
+            return warning if isinstance(warning, str) and warning else self.BABA_CHALLENGE
         status = getattr(loaded, "http_status", None)
         login = bool(getattr(loaded, "login_required", False))
-        if status == 403 and not login:
+        if reason == "http_403" or (status == 403 and not login):
             return self.BABA_403
-        if login or status == 401:
+        if reason == "login" or login or status == 401:
             return self.BABA_LOGIN
         return self.BABA_FETCH_FAILED
 
@@ -547,25 +608,73 @@ class JRATrackScraper(BaseScraper):
         warning: str,
         saw_403: bool,
         saw_login: bool,
+        saw_http_403: bool = False,
+        saw_captcha: bool = False,
+        saw_challenge: bool = False,
     ) -> TrackInfo:
         """Set the refusal flags only when that refusal is why the meeting was missed.
 
         A 403 on one tab does not mark the result blocked when another tab names
         a venue. The warning is then "not this meeting", and ``http_status`` stays null.
+        Captcha and challenge set ``blocked_reason`` and leave ``http_status`` null.
         """
         if warning == self.BABA_LOGIN and saw_login:
-            return info.model_copy(update={"http_status": 401, "login_required": True})
+            return info.model_copy(
+                update={
+                    "http_status": 401,
+                    "login_required": True,
+                    "blocked_reason": "login",
+                }
+            )
+        if warning == self.BABA_CAPTCHA and saw_captcha:
+            return info.model_copy(
+                update={"http_status": None, "login_required": False, "blocked_reason": "captcha"}
+            )
+        if warning == self.BABA_CHALLENGE and saw_challenge:
+            return info.model_copy(
+                update={
+                    "http_status": None,
+                    "login_required": False,
+                    "blocked_reason": "challenge",
+                }
+            )
         if warning == self.BABA_403 and saw_403:
-            return info.model_copy(update={"http_status": 403, "login_required": False})
+            return info.model_copy(
+                update={
+                    "http_status": 403 if saw_http_403 else None,
+                    "login_required": False,
+                    "blocked_reason": "http_403",
+                }
+            )
         return info
 
     def _with_fetch_block(self, info: TrackInfo, loaded: object) -> TrackInfo:
         """Copy a fallback refusal onto the track info. Text in the body is not a status."""
         status = getattr(loaded, "http_status", None)
         login = bool(getattr(loaded, "login_required", False))
-        if status not in {401, 403} and not login:
+        reason = getattr(loaded, "blocked_reason", None)
+        if (
+            reason not in {"captcha", "challenge", "login", "http_403"}
+            and status
+            not in {
+                401,
+                403,
+            }
+            and not login
+        ):
             return info
-        return info.model_copy(update={"http_status": status, "login_required": login})
+        update: dict[str, object] = {}
+        if reason in {"captcha", "challenge", "login", "http_403"}:
+            update["blocked_reason"] = reason
+        if reason in {"captcha", "challenge"}:
+            update["http_status"] = None
+            update["login_required"] = False
+        elif status in {401, 403} or login:
+            update["http_status"] = status
+            update["login_required"] = login
+        if not update:
+            return info
+        return info.model_copy(update=update)
 
     def _enrich(
         self,

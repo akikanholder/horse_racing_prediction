@@ -6,9 +6,10 @@ stored and is not replayed, including a copy left from an earlier run.
 A race list for today or a later day in Asia/Tokyo is not stored either.
 JRA payout (accessH), odds (accessO), and race-card (accessD) pages for
 today or later are not stored. A cname whose date cannot be read is stored
-when the request carries a past ``race_date`` or a project ``race_id``
-(``YYYYMMDD`` plus venue and race). A netkeiba race id is not a calendar
-date. An undated menu with no such day is not stored.
+when cache metadata, or the request itself, carries a past ``race_date`` or
+a project ``race_id`` (``YYYYMMDD`` plus venue and race). Metadata is not a
+form field: the JRA POST body stays ``cname`` only. A netkeiba race id is
+not a calendar date. An undated menu with no such day is not stored.
 The netkeiba odds API is stored only when its status is ``result``, ``data``
 is not empty, and the odds map has at least one combination. An
 ``official_datetime`` of today or later in Asia/Tokyo is not stored.
@@ -30,11 +31,13 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from backend.scrapers.final_odds import _has_price_text, odds_api_is_replayable
+from backend.scrapers.final_odds import has_price_text, odds_api_is_replayable
 from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
@@ -117,7 +120,7 @@ def _result_replayable(url: str, body: str) -> bool:
     if _ODDS_API in url:
         return odds_api_is_replayable(body)
     if "odds/index.html" in url:
-        return _has_price_text(body)
+        return has_price_text(body)
     if "result.html" not in url:
         return True
     if result_html_is_partial(body):
@@ -144,41 +147,79 @@ def _cname_meeting_day(url: str, params: dict | None) -> date | None:
     return day
 
 
-def jra_live_request(url: str, params: dict | None = None, *, today: date | None = None) -> bool:
+def jra_live_request(
+    url: str,
+    params: dict | None = None,
+    *,
+    today: date | None = None,
+    metadata: dict[str, str] | None = None,
+) -> bool:
     """True when this JRA page must not be stored.
 
     A past meeting may stay cached. The day is the cname ``ymd`` when that
-    reads as a date. When it does not, a ``race_date`` on the request, or a
-    project ``race_id`` (``YYYYMMDD`` plus venue and race), is that day. A
-    netkeiba race id does not contain a calendar date and is not used. An
-    undated menu with no such day is the live card. Today or later is live.
-    The odds API is not decided here.
+    reads as a date. When it does not, ``race_date`` from cache metadata or
+    the request, or a project ``race_id`` (``YYYYMMDD`` plus venue and race),
+    is that day. Metadata is not sent as a form field. A netkeiba race id
+    does not contain a calendar date and is not used. An undated menu with
+    no such day is the live card. Today or later is live. The odds API is
+    not decided here.
     """
     if not any(marker in url for marker in _JRA_LIVE_URLS):
         return False
-    day = _jra_meeting_day(url, params)
+    day = _jra_meeting_day(url, params, metadata)
     if day is None:
         return True
     current = today or tokyo_now().date()
     return day >= current
 
 
-def _jra_meeting_day(url: str, params: dict | None) -> date | None:
+def _jra_meeting_day(
+    url: str,
+    params: dict | None,
+    metadata: dict[str, str] | None = None,
+) -> date | None:
     """Meeting day for an accessH, accessO, or accessD request.
 
-    The cname ``ymd`` wins when it is a date. Otherwise the request's own
-    ``race_date``, then a project ``race_id``. Nothing is invented from a
-    netkeiba id.
+    The cname ``ymd`` wins when it is a date. Otherwise cache metadata, then
+    the request's own ``race_date``, then a project ``race_id``. Nothing is
+    invented from a netkeiba id. Metadata is not part of the form body.
     """
     day = _cname_meeting_day(url, params)
     if day is not None:
         return day
-    stated = _request_value(url, params, "race_date")
+    stated = _metadata_value(metadata, "race_date") or _request_value(url, params, "race_date")
     if stated is not None:
         parsed, warning = parse_race_day(stated)
         if parsed is not None and not warning:
             return parsed
-    return _project_race_id_day(_request_value(url, params, "race_id"))
+    race_id = _metadata_value(metadata, "race_id") or _request_value(url, params, "race_id")
+    return _project_race_id_day(race_id)
+
+
+def _metadata_value(metadata: dict[str, str] | None, key: str) -> str | None:
+    if not metadata:
+        return None
+    raw = metadata.get(key)
+    if raw in (None, ""):
+        return None
+    return str(raw)
+
+
+@contextmanager
+def bind_page_cache_metadata(client: object, **fields: str) -> Iterator[None]:
+    """Attach cache metadata for one JRA post. The form body is unchanged.
+
+    A client without ``cache_metadata`` is left alone. Empty fields are not
+    written. The metadata is included in the cache key only while the
+    context is open.
+    """
+    binder = getattr(client, "cache_metadata", None)
+    present = {key: value for key, value in fields.items() if value not in (None, "")}
+    if callable(binder) and present:
+        with binder(**present):
+            yield
+        return
+    yield
 
 
 def _request_value(url: str, params: dict | None, key: str) -> str | None:
@@ -280,6 +321,31 @@ class CachingHTTPClient(HTTPClient):
         self._legacy_denial: dict[str, tuple[int, bool]] = {}
         # Set for a race whose meeting day is today or later. Odds pages are not stored.
         self.replay_disabled = False
+        # race_date / race_id for the cache decision. Not sent as form fields.
+        self._cache_metadata: dict[str, str] = {}
+
+    @contextmanager
+    def cache_metadata(self, **fields: str) -> Iterator[None]:
+        """Remember metadata for the cache key and the live-day decision.
+
+        The POST body and query string are not changed. Nested calls restore
+        the previous metadata. Empty values are ignored.
+        """
+        previous = dict(self._cache_metadata)
+        merged = dict(previous)
+        for key, value in fields.items():
+            if value not in (None, ""):
+                merged[key] = str(value)
+        self._cache_metadata = merged
+        try:
+            yield
+        finally:
+            self._cache_metadata = previous
+
+    def _metadata_for_key(self) -> dict[str, str] | None:
+        if not self._cache_metadata:
+            return None
+        return dict(self._cache_metadata)
 
     def cached_fetched_at(
         self,
@@ -289,13 +355,14 @@ class CachingHTTPClient(HTTPClient):
         data: dict | None = None,
     ) -> datetime | None:
         """When this URL was fetched. None when it is not a replayable page."""
+        meta = self._metadata_for_key()
         if (
             should_bypass_page_cache(url, params)
             or live_race_list(url, params)
-            or jra_live_request(url, params)
+            or jra_live_request(url, params, metadata=meta)
         ):
             return None
-        path = self._path(self._cache_key(method, url, params, data))
+        path = self._path(self._cache_key(method, url, params, data, meta))
         payload = self._load(path)
         if payload is None or self._legacy_denied(path, payload):
             return None
@@ -316,7 +383,8 @@ class CachingHTTPClient(HTTPClient):
         headers: dict | None = None,
         encoding: str | None = None,
     ) -> str:
-        key = self._cache_key("GET", url, params, None)
+        meta = self._metadata_for_key()
+        key = self._cache_key("GET", url, params, None, meta)
         if self._may_read_cache(url, params):
             cached = self._cached_body(key, url)
             if cached is not None:
@@ -333,7 +401,8 @@ class CachingHTTPClient(HTTPClient):
         headers: dict | None = None,
         encoding: str | None = None,
     ) -> str:
-        key = self._cache_key("POST", url, None, data)
+        meta = self._metadata_for_key()
+        key = self._cache_key("POST", url, None, data, meta)
         if self._may_read_cache(url, data):
             cached = self._cached_body(key, url)
             if cached is not None:
@@ -375,7 +444,7 @@ class CachingHTTPClient(HTTPClient):
         return (
             not should_bypass_page_cache(url, params)
             and not live_race_list(url, params)
-            and not jra_live_request(url, params)
+            and not jra_live_request(url, params, metadata=self._metadata_for_key())
         )
 
     def _cached_body(self, key: str, url: str) -> str | None:
@@ -505,10 +574,16 @@ class CachingHTTPClient(HTTPClient):
         url: str,
         params: dict | None,
         data: dict | None,
+        metadata: dict[str, str] | None = None,
     ) -> str:
-        raw = json.dumps(
-            {"method": method, "url": url, "params": params or {}, "data": data or {}},
-            sort_keys=True,
-            ensure_ascii=False,
-        )
+        payload: dict[str, object] = {
+            "method": method,
+            "url": url,
+            "params": params or {},
+            "data": data or {},
+        }
+        # An empty metadata dict would change keys written before this field.
+        if metadata:
+            payload["metadata"] = metadata
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()

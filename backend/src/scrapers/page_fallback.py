@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 HEADLESS_UNAVAILABLE = "headless browser is not installed"
 PAGE_FORBIDDEN = "returned 403"
 PAGE_LOGIN = "requires login"
+PAGE_CAPTCHA = "returned a captcha"
+PAGE_CHALLENGE = "returned a challenge"
+
+BlockedReason = Literal["captcha", "challenge", "login", "http_403"]
 
 _JSON_URL = re.compile(
     r"""(?:url|URL)\s*:\s*['"]([^'"]+)['"]""",
@@ -44,12 +48,28 @@ class _StatusResponse:
 
 
 class AccessBlocked(Exception):
-    """The site refused the page. Do not try another identity."""
+    """The site refused the page. Do not try another identity.
 
-    def __init__(self, status: int, message: str):
+    ``status`` is an HTTP status only when the response itself was 401 or 403.
+    A captcha or challenge page leaves it null and sets ``reason``.
+    """
+
+    def __init__(
+        self,
+        status: int | None,
+        message: str,
+        *,
+        reason: BlockedReason | None = None,
+    ):
         super().__init__(message)
-        self.status = status
-        self.response = _StatusResponse(status)
+        if reason is None:
+            if status == 401:
+                reason = "login"
+            elif status == 403:
+                reason = "http_403"
+        self.reason = reason
+        self.status = status if isinstance(status, int) else None
+        self.response = _StatusResponse(self.status) if self.status is not None else None
 
 
 class HeadlessUnavailableError(Exception):
@@ -70,9 +90,10 @@ class FetchedBody:
 class FallbackFetch:
     """Bodies collected before the chain stopped.
 
-    ``http_status`` and ``login_required`` are set only when the fetch itself
-    was refused (HTTP 401/403 or a login wall). A later warning that merely
-    contains the digits 403, such as a payout of 403円, does not set them.
+    ``http_status`` is set only for a real HTTP 401 or 403. A captcha page,
+    a challenge page, and a payout of 403円 do not set it. ``blocked_reason``
+    names the stop: ``captcha``, ``challenge``, ``login``, or ``http_403``.
+    ``login_required`` is true only for a login wall.
     """
 
     status: Literal["ok", "blocked", "failed"]
@@ -80,6 +101,7 @@ class FallbackFetch:
     warning: str | None = None
     http_status: int | None = None
     login_required: bool = False
+    blocked_reason: BlockedReason | None = None
 
 
 def looks_like_login_wall(html: str) -> bool:
@@ -101,37 +123,98 @@ def looks_like_login_wall(html: str) -> bool:
 # only contains those words is not a challenge. Japanese captcha titles such
 # as 「CAPTCHA認証」 have no word boundary after the Latin token, so captcha
 # is not limited to ``\b``.
-_DENIAL_LABEL = re.compile(
-    r"\baccess\s+denied\b"
-    r"|\b403\s*forbidden\b"
-    r"|captcha"
-    r"|キャプチャ"
-    r"|画像認証",
-    re.IGNORECASE,
-)
-_SHORT_DENIAL = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
+_CAPTCHA_LABEL = re.compile(r"captcha|キャプチャ|画像認証", re.IGNORECASE)
+_FORBIDDEN_LABEL = re.compile(r"\baccess\s+denied\b|\b403\s*forbidden\b", re.IGNORECASE)
+_SHORT_FORBIDDEN = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
 _CLOUDFLARE_TITLE = re.compile(r"just a moment(?:\.\.\.|…)", re.IGNORECASE)
-_CHALLENGE_MARKER = re.compile(
-    r"cf-browser-verification"
-    r"|challenge-platform"
-    r"|cf-challenge"
-    r"|cdn-cgi/challenge"
-    r"|__cf_chl"
-    r"|cf_chl_opt",
+# A challenge form or id. Cloudflare also injects
+# ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` into ordinary pages.
+# That script tag is not a challenge page.
+_CHALLENGE_FORM = re.compile(
+    r"""\b(?:id|name)\s*=\s*['"](?:cf-challenge|challenge-form|cf-browser-verification)['"]""",
     re.IGNORECASE,
 )
+_CF_CHL_OPT = re.compile(r"\bcf_chl_opt\b", re.IGNORECASE)
 
 
-def _denial_label(label: str) -> bool:
-    """True when this title, heading, or short body is a refusal or a captcha."""
-    compact = " ".join(label.split())
+def _compact_label(label: str) -> str:
+    return " ".join(label.split())
+
+
+def _captcha_label(label: str) -> bool:
+    compact = _compact_label(label)
+    return bool(compact) and _CAPTCHA_LABEL.search(compact) is not None
+
+
+def _forbidden_label(label: str) -> bool:
+    compact = _compact_label(label)
     if not compact:
         return False
-    if _CLOUDFLARE_TITLE.fullmatch(compact):
+    if _FORBIDDEN_LABEL.search(compact):
         return True
-    if _DENIAL_LABEL.search(compact):
-        return True
-    return _SHORT_DENIAL.fullmatch(compact) is not None
+    return _SHORT_FORBIDDEN.fullmatch(compact) is not None
+
+
+def _challenge_title(label: str) -> bool:
+    compact = _compact_label(label)
+    return bool(compact) and _CLOUDFLARE_TITLE.fullmatch(compact) is not None
+
+
+def _lacks_real_content(soup: BeautifulSoup) -> bool:
+    """True when the document is an interstitial, not a race or article page.
+
+    ``cf_chl_opt`` on a page that already has a table or a long body is not
+    treated as the challenge. The challenge form ids are.
+    """
+    for script in soup.find_all("script"):
+        script.decompose()
+    text = soup.get_text(" ", strip=True)
+    if soup.find("table") and len(text) > 40:
+        return False
+    return len(text) <= 180
+
+
+def _page_labels(html: str) -> tuple[BeautifulSoup, str, str, str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
+    heading = ""
+    h1 = soup.find("h1")
+    if h1 is not None:
+        heading = h1.get_text(" ", strip=True)
+    text = soup.get_text(" ", strip=True)
+    return soup, title, heading, text
+
+
+def page_block_reason(html: str) -> BlockedReason | None:
+    """Why this document is a refusal, or None when it is a normal page.
+
+    A captcha title is ``captcha``. A challenge form (``cf-challenge``,
+    ``challenge-form``) or the exact title 「Just a moment...」 is
+    ``challenge``. ``cf_chl_opt`` is a challenge only when the page has no
+    real content. The script ``/cdn-cgi/challenge-platform/scripts/jsd/main.js``
+    is not a challenge. An access-denied title is ``http_403`` without claiming
+    that an HTTP status was observed.
+    """
+    raw = html or ""
+    soup, title, heading, text = _page_labels(raw)
+    if _challenge_title(title) or _challenge_title(heading):
+        return "challenge"
+    if _CHALLENGE_FORM.search(raw):
+        return "challenge"
+    if _CF_CHL_OPT.search(raw) and _lacks_real_content(soup):
+        return "challenge"
+    if _captcha_label(title) or _captcha_label(heading):
+        return "captcha"
+    if _forbidden_label(title) or _forbidden_label(heading):
+        return "http_403"
+    if len(text) <= 80:
+        if _captcha_label(text):
+            return "captcha"
+        if _forbidden_label(text):
+            return "http_403"
+        if _challenge_title(text):
+            return "challenge"
+    return None
 
 
 def looks_like_forbidden_page(html: str) -> bool:
@@ -139,25 +222,28 @@ def looks_like_forbidden_page(html: str) -> bool:
 
     A payout of 403円, a title 「第403回」, or 「403万円」 is not a refusal.
     The title and the first heading name the page. Cloudflare is a challenge
-    only when the title is exactly 「Just a moment...」 or the document carries
-    a challenge marker (``cf-challenge``, ``challenge-platform``, and the
-    same). A title that merely contains "just a moment" is not a challenge.
+    only when the title is exactly 「Just a moment...」, the document has a
+    challenge form (``cf-challenge``, ``challenge-form``), or ``cf_chl_opt``
+    appears on a page with no real content. A normal page that only includes
+    ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` is not a challenge.
+    A title that merely contains "just a moment" is not a challenge.
     「CAPTCHA認証」 and 「キャプチャ」 are captcha titles: callers stop and do
     not try another identity.
     """
-    raw = html or ""
-    if _CHALLENGE_MARKER.search(raw):
-        return True
-    soup = BeautifulSoup(raw, "lxml")
-    title = soup.title.get_text(" ", strip=True) if soup.title is not None else ""
-    heading = ""
-    h1 = soup.find("h1")
-    if h1 is not None:
-        heading = h1.get_text(" ", strip=True)
-    if _denial_label(title) or _denial_label(heading):
-        return True
-    text = soup.get_text(" ", strip=True)
-    return len(text) <= 80 and _denial_label(text)
+    return page_block_reason(html) in {"captcha", "challenge", "http_403"}
+
+
+def _blocked_for_page(html: str) -> AccessBlocked | None:
+    """An HTML refusal. HTTP status stays null unless the caller saw one."""
+    reason = page_block_reason(html)
+    if reason == "captcha":
+        return AccessBlocked(None, PAGE_CAPTCHA, reason="captcha")
+    if reason == "challenge":
+        return AccessBlocked(None, PAGE_CHALLENGE, reason="challenge")
+    if reason == "http_403":
+        # The title says forbidden. That is not an HTTP status.
+        return AccessBlocked(None, PAGE_FORBIDDEN, reason="http_403")
+    return None
 
 
 def _open_shared_browser() -> object | None:
@@ -218,6 +304,28 @@ RESULT_TABLE_READY_JS = """() => {
 }"""
 
 
+# Odds pages paint ``---.-`` and fill the cells from the page's own script.
+# A timeout is that shell. The caller parses it and does not invent a price.
+ODDS_CELL_WAIT_MS = 12_000
+ODDS_CELL_READY_JS = """() => {
+  const compact = (el) => (el.textContent || '').replace(/\\s+/g, '');
+  const placeholders = new Set(['---.-', '----', '']);
+  const nodes = Array.from(document.querySelectorAll(
+    'span[id^="odds-"], span[id^="oddsmin-"], span[id^="oddsmax-"], td.Odds, span.Odds'
+  ));
+  const priced = nodes.some((el) => {
+    const text = compact(el);
+    return text && !placeholders.has(text) && /\\d/.test(text);
+  });
+  if (priced) return true;
+  const headings = Array.from(document.querySelectorAll('title, h1, h2, h3, h4, caption, th'));
+  return headings.some((el) => {
+    const text = compact(el);
+    return text.includes('確定オッズ') || text.includes('最終オッズ');
+  });
+}"""
+
+
 # The baba page fills ``#cushion_list`` / ``#moist_list`` from its own script
 # after DOMContentLoaded. A timeout is that shell. The caller parses it and
 # does not fetch again.
@@ -234,15 +342,23 @@ BABA_READING_READY_JS = """() => {
 def await_page_ready(page: object, url: str) -> None:
     """Wait until the document has the reading the page itself fills in.
 
-    A result URL waits for the full finishing table. A baba URL waits for the
-    measurement dropdown. Anything else returns immediately. A timeout is the
-    page still short. The caller parses that document and does not fetch again.
+    A result URL waits for the full finishing table. An odds URL waits until a
+    cell leaves ``---.-`` or a final heading is printed. A baba URL waits for
+    the measurement dropdown. Anything else returns immediately. A timeout is
+    the page still short. The caller parses that document and does not fetch
+    again.
     """
     if "/race/result.html" in url:
         script, timeout, note = (
             RESULT_TABLE_READY_JS,
             RESULT_TABLE_WAIT_MS,
             "Result table was still short",
+        )
+    elif "/odds/" in url:
+        script, timeout, note = (
+            ODDS_CELL_READY_JS,
+            ODDS_CELL_WAIT_MS,
+            "Odds cells were still placeholders",
         )
     elif "/keiba/baba/" in url:
         script, timeout, note = (
@@ -296,15 +412,20 @@ def render_headless(url: str) -> str:
             response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             status = response.status if response is not None else None
             if status in {401, 403}:
-                raise AccessBlocked(status, PAGE_FORBIDDEN if status == 403 else PAGE_LOGIN)
+                raise AccessBlocked(
+                    status,
+                    PAGE_FORBIDDEN if status == 403 else PAGE_LOGIN,
+                    reason="http_403" if status == 403 else "login",
+                )
             await_page_ready(page, url)
             html = str(page.content())
         finally:
             browser.close()
     if looks_like_login_wall(html):
-        raise AccessBlocked(401, PAGE_LOGIN)
-    if looks_like_forbidden_page(html):
-        raise AccessBlocked(403, PAGE_FORBIDDEN)
+        raise AccessBlocked(401, PAGE_LOGIN, reason="login")
+    blocked = _blocked_for_page(html)
+    if blocked is not None:
+        raise blocked
     return html
 
 
@@ -435,9 +556,10 @@ class PageFallback:
             html = html_body
 
         if looks_like_login_wall(html):
-            return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN))
-        if looks_like_forbidden_page(html):
-            return blocked_fetch(self.site, AccessBlocked(403, PAGE_FORBIDDEN))
+            return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN, reason="login"))
+        blocked = _blocked_for_page(html)
+        if blocked is not None:
+            return blocked_fetch(self.site, blocked)
 
         page_url = _with_query(url, params)
         first_source = document_source or f"{self.site}_html"
@@ -475,9 +597,12 @@ class PageFallback:
                 logger.warning("Result endpoint %s failed: %s", endpoint, exc)
                 continue
             if looks_like_login_wall(body):
-                return blocked_fetch(self.site, AccessBlocked(401, PAGE_LOGIN), pages)
-            if looks_like_forbidden_page(body):
-                return blocked_fetch(self.site, AccessBlocked(403, PAGE_FORBIDDEN), pages)
+                return blocked_fetch(
+                    self.site, AccessBlocked(401, PAGE_LOGIN, reason="login"), pages
+                )
+            blocked = _blocked_for_page(body)
+            if blocked is not None:
+                return blocked_fetch(self.site, blocked, pages)
             fragment_source = f"{self.site}_js"
             if document_source == "headless" and getattr(self.http_client, "used_headless", False):
                 fragment_source = "headless"
@@ -527,7 +652,8 @@ class PageFallback:
             status = _status_code(exc)
             if status in {401, 403}:
                 message = PAGE_FORBIDDEN if status == 403 else PAGE_LOGIN
-                raise AccessBlocked(status, message) from exc
+                reason: BlockedReason = "http_403" if status == 403 else "login"
+                raise AccessBlocked(status, message, reason=reason) from exc
             raise
         if not isinstance(body, str):
             raise TypeError("http client get did not return text")
@@ -557,19 +683,32 @@ def blocked_fetch(
     blocked: AccessBlocked,
     pages: list[FetchedBody] | None = None,
 ) -> FallbackFetch:
-    """Stop the chain. The refusal is the HTTP status, not a substring of the warning."""
-    status = blocked.status if blocked.status in {401, 403} else None
+    """Stop the chain. ``http_status`` is a real HTTP status, not the warning text."""
+    reason = blocked.reason
+    if reason is None:
+        if blocked.status == 403:
+            reason = "http_403"
+        elif blocked.status == 401:
+            reason = "login"
+    http_status = blocked.status if blocked.status in {401, 403} else None
+    if reason in {"captcha", "challenge"}:
+        http_status = None
     return FallbackFetch(
         status="blocked",
         pages=list(pages or []),
-        warning=_blocked_warning(site, blocked),
-        http_status=status,
-        login_required=status == 401,
+        warning=_blocked_warning(site, reason),
+        http_status=http_status,
+        login_required=reason == "login",
+        blocked_reason=reason,
     )
 
 
-def _blocked_warning(site: str, blocked: AccessBlocked) -> str:
-    if blocked.status == 403 or blocked.args[0] == PAGE_FORBIDDEN:
+def _blocked_warning(site: str, reason: BlockedReason | None) -> str:
+    if reason == "captcha":
+        return f"{site} returned a captcha"
+    if reason == "challenge":
+        return f"{site} returned a challenge"
+    if reason == "http_403":
         return f"{site} returned 403"
     return f"{site} requires login"
 

@@ -72,6 +72,8 @@ class NetkeibaTrackScraper(BaseScraper):
 
     RACECOURSE_NAME_TO_ID = {v: k for k, v in RACECOURSE_ID_MAPPING.items()}
     TRACK_403 = "netkeiba track returned 403"
+    TRACK_CAPTCHA = "netkeiba track returned a captcha"
+    TRACK_CHALLENGE = "netkeiba track returned a challenge"
     TRACK_LOGIN = "netkeiba track requires login"
     TRACK_NOT_MEETING = "netkeiba track page is not the requested meeting"
     TRACK_UNPARSEABLE = "netkeiba track page could not be parsed"
@@ -275,11 +277,17 @@ class NetkeibaTrackScraper(BaseScraper):
 
     def _blocked_warning(self, loaded: object) -> str:
         """Map a stopped chain onto the track warnings. Do not read the body."""
+        reason = getattr(loaded, "blocked_reason", None)
+        warning = getattr(loaded, "warning", None)
+        if reason == "captcha":
+            return warning if isinstance(warning, str) and warning else self.TRACK_CAPTCHA
+        if reason == "challenge":
+            return warning if isinstance(warning, str) and warning else self.TRACK_CHALLENGE
         status = getattr(loaded, "http_status", None)
         login = bool(getattr(loaded, "login_required", False))
-        if status == 403 and not login:
+        if reason == "http_403" or (status == 403 and not login):
             return self.TRACK_403
-        if login or status == 401:
+        if reason == "login" or login or status == 401:
             return self.TRACK_LOGIN
         return self.TRACK_FETCH_FAILED
 
@@ -287,9 +295,29 @@ class NetkeibaTrackScraper(BaseScraper):
         """Copy a fallback refusal onto the track info. A yen amount is not a status."""
         status = getattr(loaded, "http_status", None)
         login = bool(getattr(loaded, "login_required", False))
-        if status not in {401, 403} and not login:
+        reason = getattr(loaded, "blocked_reason", None)
+        if (
+            reason not in {"captcha", "challenge", "login", "http_403"}
+            and status
+            not in {
+                401,
+                403,
+            }
+            and not login
+        ):
             return info
-        return info.model_copy(update={"http_status": status, "login_required": login})
+        update: dict[str, object] = {}
+        if reason in {"captcha", "challenge", "login", "http_403"}:
+            update["blocked_reason"] = reason
+        if reason in {"captcha", "challenge"}:
+            update["http_status"] = None
+            update["login_required"] = False
+        elif status in {401, 403} or login:
+            update["http_status"] = status
+            update["login_required"] = login
+        if not update:
+            return info
+        return info.model_copy(update=update)
 
     def _needs_fallback(self, html: str) -> bool:
         """True when this meeting's cushion slot is empty. A foreign tab is not read."""
