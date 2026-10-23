@@ -13,7 +13,8 @@ OpenAPI（起動中の `http://localhost:8000/openapi.json` と `/docs`）は型
 | 出馬表、近走、血統、脚質の集計、調教の時計、当日バイアスのラベル、オッズ引用、確定着順と払戻の取得と正規化 | ツール |
 | 欠測を `null` と `warning` / `data_sufficiency` / `reason` のまま返す | ツール |
 | 単勝・ワイド・馬連・三連複の確率 | EV |
-| 期待値、買うかどうか、金額 | EV |
+| レース前の期待値、買うかどうか、金額、`rules` の中身 | EV |
+| 予想記録の保存と、確定後の的中・返還・回収の記録 | ツール |
 | `short_distance_front_under_specified` や `thin` をどう感度に使うか | EV |
 | `prefer=live` が空のとき `prefer=yoso` を明示して取り直すか | EV |
 
@@ -55,7 +56,7 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 
 | サブコマンド | `--json` の標準出力 |
 |---|---|
-| `odds` `result` `history` `trends` `track` | JSON だけ |
+| `odds` `result` `history` `trends` `track` `predictions` | JSON だけ |
 | `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
 
 混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
@@ -86,6 +87,9 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | （CLI なし） | `GET /api/courses/{venue}/conditions` | `CourseCondition` |
 | `python -m backend.cli venues --json` | `GET /api/venues` | `WeeklyVenueSchedule` の配列 |
 | `python -m backend.cli track --venue 中山 --merge --json` | `GET /api/tracks?venue=中山&merge=true` | `jra` / `netkeiba` / `merged` をキーにした `TrackInfo` |
+| `python -m backend.cli predictions add sheet.json --json` | `POST /api/predictions` | 予想記録を検証して開催日の JSONL へ追記する。重複 `record_id` は拒否 |
+| `python -m backend.cli predictions show --date 20261018 --json` | `GET /api/predictions?date=20261018` | その開催日の予想記録 |
+| `python -m backend.cli predictions settle --date 20261018 --json` | `POST /api/predictions/settle?date=20261018` | 確定かつ complete のレースだけ `result` を埋める。未確定は pending のまま |
 | （CLI なし） | `POST /api/races/export?date=YYYY-MM-DD` | CSV 書き出し。予想の入力ではない |
 
 オッズの例:
@@ -887,9 +891,107 @@ JRA が 403、またはクッション値の数値が無いときは、同じ場
 
 掲載が無くソース自体が空のときの HTTP は 404。
 
+## 予想記録 `hrp.prediction`
+
+EV が決めた予想を、開催日ごとの JSONL に残し、レース後に確定結果だけを同じ行へ足す。確率、期待値、買うかどうか、金額は EV が書いて渡す。このツールはそれを計算しない。`rules` の中身も EV が決める。キーを足したり捨てたりしない。
+
+精算は `result` だけを書く。予想のフィールドは書いたあと変えない。同じ `record_id` の再追加は拒否する。形は [JSON Schema](schemas/hrp.prediction.schema.json)。この節とスキーマが食い違ったらスキーマに合わせ、この節を直す。精算の手順はこの節が正。
+
+### ファイル
+
+`{directory}/YYYY-MM-DD.jsonl`。日付は `race.date`（開催日）。1行が1レース × 1回の予想。`day_before` と `pre_post_45m` は別の行。
+
+ディレクトリは `--dir`、無ければ環境変数 `HRP_PREDICTIONS_DIR`、それも無ければカレントの `predictions`。API は `--dir` を受けず、環境変数か既定の `predictions`。
+
+書き込みは同じディレクトリの一時ファイルへ出してから置き換える。行の順は保つ。変わった行が無いときはファイルを書き換えない。
+
+### 識別と単位
+
+`record_id` は `{race_id}_{edition}_{run_at を詰めた形}`。`run_at` が `2026-10-18T14:35:00+09:00` のとき詰めは `20261018T143500+0900`。`race_id`、`edition`、`run_at` と一致しない ID は拒否する。
+
+時刻は ISO 8601 でオフセット `+09:00`。ナイーブ時刻と他のオフセットは拒否する。`race.post_time` は `15:40+09:00` のように時刻だけでも、日付付きでもよい。
+
+確率と EV は小数。`0.36` は +36%。オッズは倍率。金額は整数の円。距離はメートル。`weights` は 8 個で合計 100。`item_scores` も 8 個。欠測は null。金額も着順も払戻も作らない。
+
+`schema` は `hrp.prediction`。`schema_version` は `1.0.0`。
+
+`_example` は見本の印。本番の行には要らない。見本は `backend/tests/fixtures/predictions/example_record.json`。
+
+### フィールド
+
+`race`: `race_id`（netkeiba の12桁）、`date`、`venue`、`race_number`、`race_name`、`surface`（芝/ダート/障害）、`distance_m`、`post_time`、`field_size`、`going`（良/稍重/重/不良）、`weather`。レース名、発走、馬場、天候は無いとき null。
+
+`run`: `edition`（`day_before` または `pre_post_45m`）、`run_at`、`engine`（`name` と `version`）、`cli_commit`、`weights`、`rules`。`rules` はオブジェクトなら何でも残す。中のキーはこのツールでは定めない。
+
+`sources[]`: `kind`（`odds_win` / `odds_combo` / `track` / `training` / `past9` / `trends` / `card`）、`provider`、`fetched_at`、`measured_at`、`market_updated_at`、`status`、`is_today`、`stale`、`note`。測定時刻と市場の更新時刻、状態、当日、鮮度、注記は無いとき null。
+
+`horses[]`: `horse_number`、`horse_name`、`scratch_status`（`entered` / `scratched` / `excluded` / `unknown`）、`total_score`、`item_scores`、`data_coverage`（0 から 1）、`plus`、`risk`、`confidence`（高/中/低）、`win_prob`、`win_prob_range`（`[lo, hi]`）、`fair_odds`、`odds_win`、`odds_fetched_at`、`ev`、`ev_conservative`、`ability_mark`、`buy_mark`（◎ ○ ▲ △ ☆、または null）、`market_view`（過小評価/妥当/過剰人気）。`horses` は EV が点を付けた馬で、出走頭数そのものではない。
+
+`decision`: `pass_race`、`ability_top`（馬番または null）、`reason`。
+
+`bets[]`: `ticket_type`、`combination`（馬番の昇順。単勝は1、ワイドと馬連は2、三連複は3）、`prob`、`odds`、`odds_min`、`odds_max`、`ev`、`ev_conservative`、`stake_yen`、`status`（`bought` または `reference`）、`reason`。ワイドは `odds` を null にし、幅は `odds_min` と `odds_max`。片方だけは拒否する。ほかの券種は `odds_min` と `odds_max` を null にする。`bought` の `stake_yen` は 0 以上の整数。
+
+| `ticket_type` | 払戻の表記 | オッズ API |
+|---|---|---|
+| `win` | 単勝 | `win` |
+| `wide` | ワイド | `wide` |
+| `quinella` | 馬連 | `umaren` |
+| `trio` | 3連複（`三連複` も同じ） | `sanrenpuku` |
+
+### 結果
+
+追加するときの `result` は `{"status": "pending"}` だけ。確定結果で埋めるのは `predictions settle`。
+
+埋めるのは、既存の確定結果の取得が `result_phase` が `confirmed` かつ `complete` が true のときだけ。それ以外は行を変えず、応答の `pending` に `record_id`、`race_id`、`result_phase`、`complete`、`warning` を残す。取得が 401 / 403 またはログインで止まったときも行を変えず、同じレースをもう一度開かない。User-Agent の差し替え、captcha、別の身元はしない。`settle` は待ちの再取得（`result` の `--wait-complete`）もしない。
+
+すでに `settled` の行は取りにいかない。もう一度 `settle` しても `filled_at` は変えない。
+
+埋めた `result`:
+
+| フィールド | 意味 | 欠測 |
+|---|---|---|
+| `status` | `settled` | |
+| `result_phase` | 取得の `confirmed` | |
+| `complete` | true | |
+| `filled_at` | 精算した時刻。`+09:00` | |
+| `finishes` | `horse_number`、`rank`、`status`、`dead_heat`。着順の並びのまま。入着で同じ着順が複数のとき `dead_heat` は true | 馬番や着順が無い行は null |
+| `payouts` | `ticket_type`、`combination`（馬番の昇順）、`yen_per_100`。上の4券種だけ。金額は払戻表の円。同着で行が分かれていれば、その行のまま残し、平均も分割も作らない | 馬番にできない組は捨て、warning |
+| `settlement.bets` | 予想の `bets` と同じ順。`index`、`hit`、`refunded`、`payout_yen` | |
+| `settlement.stake_total_yen` | `bought` の `stake_yen` の合計 | どれか null なら合計も null |
+| `settlement.payout_total_yen` | その `payout_yen` の合計 | どれか null なら合計も null |
+| `settlement.roi` | `payout_total_yen / stake_total_yen - 1`。小数4桁、四捨五入。0 が元返し | `bought` が無い、賭け金が 0、または合計が null のときは null。0.0 にはしない |
+| `warning` | 取得の warning と、精算で金額を作れなかった理由。複数は `; ` | 無ければ null |
+
+`reference` は `settlement.bets` に載る。合計と ROI には入れない。
+
+的中は払戻表にその組があるとき。組の並びがページと逆でも、馬番の集合が同じならその行を使う。その馬券種の行が一つでもあり、組が無いときは外れで `payout_yen` は 0。その馬券種の行がページに無いときは `hit` も `payout_yen` も null。同じ組の金額が食い違うときは `hit` は true、`payout_yen` は null。`payout rows disagree for {ticket_type} {combination}`。
+
+当たったときの `payout_yen` は `yen_per_100 * stake_yen / 100`。整数の円にならないときは null。`payout is not an integer yen`。`stake_yen` が null のときは null。`stake_yen was not on the record`。
+
+返還は、組のどれかが着順の `scratched` または `excluded` のとき、その券を全部返還にする。取得の `refunds` がその馬番を含み、`bet_types` が null かその券種を名指ししているときも返還にする。`bet_types` が空の配列のときは、その印字だけでは返還にしない。印字された券種の外へは広げない。`hit` は false、`refunded` は true。ページは返還の金額を出さない。`payout_yen` は記録にある `stake_yen`（賭け金が戻る）。`stake_yen` が null のときだけ `payout_yen` も null。入着馬が返還に出ているときは `refund horses are not scratched or excluded: 5`。中止と失格は返還にしない。
+
+`bought` が一つも無いときは合計を 0 にし、ROI は null。`no bought bets`。
+
+### コマンド
+
+```bash
+python -m backend.cli predictions add sheet.json
+python -m backend.cli predictions add - --dir /tmp/predictions --json
+python -m backend.cli predictions show --date 20261018 --json
+python -m backend.cli predictions settle --date 2026-10-18 --json
+```
+
+`add` の入力は JSON オブジェクト、オブジェクトの配列、または1行1件の JSONL。`-` は標準入力。検証に失敗したとき、重複の `record_id` のときは、どのファイルも変えない。終了コードは 1。
+
+`show` はファイルが無い日は `records` が空。終了コードは 0。
+
+`settle` の `--json` は `date`、`path`、`settled`、`pending`。`YYYY-MM-DD` も受け付ける。
+
+HTTP は同じ意味。検証失敗は 422。重複は 409。日付が読めないときは 400。サービス未初期化の精算は 503。未確定でも精算の HTTP は 200 で、`pending` を見る。
+
 ## 対象外
 
-- 組み合わせ確率、期待値、買い目
+- 組み合わせ確率、レース前の期待値、買うかどうか、金額の決定（記録された金額と確定払戻からの精算は「予想記録」）
 - 予想ブログ、netkeiba マスターコースのトラックバイアス
 - オッズ API に無い馬券種の新規取得
 - 競馬ブック Smart 画面の列位置からのハロン推定

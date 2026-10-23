@@ -1,0 +1,101 @@
+{
+  "_example": true,
+  "schema": "hrp.prediction",
+  "schema_version": "1.0.0",
+  "record_id": "202610180811_day_before_20261017T180000+0900",
+  "race": {
+    "race_id": "202610180811",
+    "date": "2026-10-18",
+    "venue": "東京",
+    "race_number": 11,
+    "race_name": "例",
+    "surface": "芝",
+    "distance_m": 1600,
+    "post_time": "15:40+09:00",
+    "field_size": 16,
+    "going": "良",
+    "weather": "晴"
+  },
+  "run": {
+    "edition": "day_before",
+    "run_at": "2026-10-17T18:00:00+09:00",
+    "engine": {"name": "example", "version": "0"},
+    "cli_commit": null,
+    "weights": [20, 15, 15, 10, 10, 10, 10, 10],
+    "rules": {
+      "min_ev": 0.05,
+      "labels": ["keep"],
+      "nested": {"free": true}
+    }
+  },
+  "sources": [
+    {
+      "kind": "odds_win",
+      "provider": "netkeiba",
+      "fetched_at": "2026-10-17T17:55:00+09:00",
+      "measured_at": null,
+      "market_updated_at": "2026-10-17T17:50:00+09:00",
+      "status": "yoso",
+      "is_today": false,
+      "stale": false,
+      "note": null
+    }
+  ],
+  "horses": [
+    {
+      "horse_number": 7,
+      "horse_name": "サンプル",
+      "scratch_status": "entered",
+      "total_score": 78.5,
+      "item_scores": [80, 70, 75, 60, 65, 70, 72, 68],
+      "data_coverage": 0.9,
+      "plus": 1.2,
+      "risk": 0.4,
+      "confidence": "高",
+      "win_prob": 0.22,
+      "win_prob_range": [0.16, 0.28],
+      "fair_odds": 4.5,
+      "odds_win": 6.2,
+      "odds_fetched_at": "2026-10-17T17:55:00+09:00",
+      "ev": 0.36,
+      "ev_conservative": 0.08,
+      "ability_mark": "A",
+      "buy_mark": "◎",
+      "market_view": "過小評価"
+    }
+  ],
+  "decision": {
+    "pass_race": false,
+    "ability_top": 7,
+    "reason": "example"
+  },
+  "bets": [
+    {
+      "ticket_type": "win",
+      "combination": [7],
+      "prob": 0.22,
+      "odds": 6.2,
+      "odds_min": null,
+      "odds_max": null,
+      "ev": 0.36,
+      "ev_conservative": 0.08,
+      "stake_yen": 1000,
+      "status": "bought",
+      "reason": "example"
+    },
+    {
+      "ticket_type": "wide",
+      "combination": [3, 7],
+      "prob": null,
+      "odds": null,
+      "odds_min": 2.1,
+      "odds_max": 3.4,
+      "ev": 0.05,
+      "ev_conservative": -0.04,
+      "stake_yen": null,
+      "status": "reference",
+      "reason": null
+    }
+  ],
+  "result": {"status": "pending"}
+}
