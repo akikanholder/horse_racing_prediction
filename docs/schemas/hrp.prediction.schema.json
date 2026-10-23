@@ -102,7 +102,7 @@
             "pace": {"type": "number", "minimum": 0, "description": "展開・脚質適性"},
             "course": {"type": "number", "minimum": 0, "description": "コース・距離適性"},
             "going": {"type": "number", "minimum": 0, "description": "馬場適性・当日バイアス"},
-            "workout": {"type": "number", "minimum": 0, "description": "調教・仅上がり・馬体"},
+            "workout": {"type": "number", "minimum": 0, "description": "調教・仕上がり・馬体"},
             "gate_jockey": {"type": "number", "minimum": 0, "description": "枠順・斤量・騎手"},
             "pedigree": {"type": "number", "minimum": 0, "description": "血統適性"},
             "rotation": {"type": "number", "minimum": 0, "description": "ローテーション・状態リスク"}
@@ -220,7 +220,7 @@
               "pace": {"type": "number", "description": "展開・脚質適性"},
               "course": {"type": "number", "description": "コース・距離適性"},
               "going": {"type": "number", "description": "馬場適性・当日バイアス"},
-              "workout": {"type": "number", "description": "調教・仅上がり・馬体"},
+              "workout": {"type": "number", "description": "調教・仕上がり・馬体"},
               "gate_jockey": {"type": "number", "description": "枠順・斤量・騎手"},
               "pedigree": {"type": "number", "description": "血統適性"},
               "rotation": {"type": "number", "description": "ローテーション・状態リスク"}
