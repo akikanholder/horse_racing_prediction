@@ -123,6 +123,19 @@ def _assert_null_measurement(info) -> None:
     assert "8.1" not in blob
 
 
+def test_jra_challenge_page_is_not_parsed():
+    challenge = (
+        "<html><head><title>Just a moment...</title></head>"
+        "<body><p>クッション値 9.9</p><p>ゴール前 14.7</p></body></html>"
+    )
+    client = _Gets(gets={BABA_TOKYO: challenge, BABA_KYOTO: challenge})
+    info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
+    _assert_null_measurement(info)
+    assert info.warning == JRATrackScraper.BABA_403
+    assert info.http_status == 403
+    assert "9.9" not in _json_without_clocks(info)
+
+
 def test_jra_403_is_trackinfo_with_null_venue_and_measurements():
     client = _Gets(errors={BABA_TOKYO: _http_error(403), BABA_KYOTO: _http_error(403)})
     info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
@@ -164,11 +177,17 @@ def test_jra_matching_meeting_copies_venue_and_only_parsed_numbers():
     client = _Gets(gets={BABA_TOKYO: _tokyo_measured(), BABA_KYOTO: _baba("京都")})
     info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
     assert info.racecourse == "東京"
-    assert info.warning is None
+    assert info.warning == (
+        f"{JRATrackScraper.CUSHION_UNDATED}; {JRATrackScraper.MOISTURE_UNDATED}"
+    )
+    assert info.measured_at is None
+    assert info.stale is None
     assert info.turf is not None
     assert info.turf.cushion is not None
     assert info.turf.cushion.value == 9.8
+    assert info.turf.cushion.measured_at is None
     assert info.turf.moisture is not None
+    assert info.turf.moisture.measured_at is None
     assert info.turf.moisture.goal_front == 12.1
     assert info.turf.moisture.fourth_corner == 11.4
     assert info.dirt is not None
@@ -225,7 +244,11 @@ def test_niigata_meeting_follows_the_kaisai_tab_not_a_venue_url():
     )
     info = JRATrackScraper(http_client=client).scrape("niigata")  # type: ignore[arg-type]
     assert info.racecourse == "新潟"
-    assert info.warning is None
+    assert info.warning == (
+        f"{JRATrackScraper.CUSHION_UNDATED}; {JRATrackScraper.MOISTURE_UNDATED}"
+    )
+    assert info.measured_at is None
+    assert info.stale is None
     assert info.turf is not None and info.turf.cushion is not None
     assert info.turf.cushion.value == 10.2
     assert info.turf.moisture is not None

@@ -28,7 +28,9 @@ from backend.scrapers.page_cache import CachingHTTPClient
 from backend.scrapers.page_fallback import (
     AccessBlocked,
     FetchedBody,
+    PageFallback,
     headless_browser_installed,
+    looks_like_forbidden_page,
     render_headless,
 )
 from backend.services.historical_service import HistoricalService
@@ -686,7 +688,76 @@ def test_login_wall_is_not_cached(tmp_path: Path):
     assert calls == [1, 1]
 
 
-def test_jra_odds_chain_reads_same_site_json_and_stops_on_403():
+def test_cached_login_wall_and_forbidden_page_are_not_replayed(tmp_path: Path):
+    login = (
+        "<html><head><title>ログイン</title></head><body>"
+        "<form><input type='password'></form></body></html>"
+    )
+    forbidden = (
+        "<html><head><title>403 Forbidden</title></head>"
+        "<body><h1>Access Denied</h1></body></html>"
+    )
+    ok = "<html><head><title>結果</title></head><body>確定オッズ 403円</body></html>"
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls.append(url)
+            return ok
+
+    url = "https://example.test/kept"
+    transport = _Transport()
+    client = CachingHTTPClient(tmp_path, transport=transport, min_request_interval=0)
+    key = client._cache_key("GET", url, None, None)
+    path = client._path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def seed(body: str, *, replayable: bool | None) -> None:
+        payload: dict[str, object] = {
+            "url": url,
+            "fetched_at": "2026-10-18T07:00:00",
+            "body": body,
+        }
+        if replayable is not None:
+            payload["replayable"] = replayable
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    seed(login, replayable=None)
+    assert client.cached_fetched_at("GET", url) is None
+    assert client.get(url) == ok
+    assert transport.calls == [url]
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "確定オッズ" in stored["body"]
+    assert "password" not in stored["body"]
+
+    seed(forbidden, replayable=None)
+    assert client.get(url) == ok
+    assert transport.calls == [url, url]
+
+    client.get(url)
+    assert transport.calls == [url, url]
+    assert "403円" in client.get(url)
+
+    marked = (
+        "<html><head><title>403 Forbidden</title></head>"
+        "<body><h1>Access Denied</h1><p>kept because write time already checked</p></body></html>"
+    )
+    seed(marked, replayable=True)
+
+    def _must_not_parse(body: str) -> bool:
+        raise AssertionError(body)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(page_cache, "looks_like_login_wall", _must_not_parse)
+    monkeypatch.setattr(page_cache, "looks_like_forbidden_page", _must_not_parse)
+    try:
+        assert client.get(url) == marked
+        assert transport.calls == [url, url]
+        assert client.cached_fetched_at("GET", url) == datetime.fromisoformat("2026-10-18T07:00:00")
+    finally:
+        monkeypatch.undo()
     shutuba = (
         "<html><body><a onclick=\"doAction('/JRADB/accessO.html','pw01ode0105202501010120250105/AB');\">"
         "オッズ</a></body></html>"
@@ -738,6 +809,49 @@ def test_jra_odds_chain_reads_same_site_json_and_stops_on_403():
     assert refused.warning == "JRA odds returned 403"
     assert refused.pages == []
     assert blocked_http.gets == []
+
+
+def test_round_title_is_not_a_denial_and_a_challenge_stops():
+    derby = (
+        "<html><head><title>第403回 日本ダービー</title></head>"
+        "<body><h1>403万円</h1><p>確定オッズ 403円</p></body></html>"
+    )
+    assert looks_like_forbidden_page(derby) is False
+    forbidden = (
+        "<html><head><title>403 Forbidden</title></head>"
+        "<body><h1>Access Denied</h1></body></html>"
+    )
+    assert looks_like_forbidden_page(forbidden) is True
+    challenge = (
+        "<html><head><title>Just a moment...</title></head><body>"
+        + ("please wait " * 40)
+        + "</body></html>"
+    )
+    assert looks_like_forbidden_page(challenge) is True
+    seen: list[str] = []
+
+    class _Http:
+        def get(self, url, params=None, headers=None, encoding=None):
+            return challenge
+
+    def render(url: str) -> str:
+        seen.append(url)
+        return "<html><body>bypassed</body></html>"
+
+    fetched = PageFallback(_Http(), site="jra", headless_render=render).load(
+        url="https://www.jra.go.jp/keiba/baba/index.html",
+        params=None,
+        headers=None,
+        encoding="cp932",
+        fetched_at=FETCHED,
+        should_fallback=lambda _html: True,
+        still_incomplete=lambda _pages: True,
+        html_body=challenge,
+    )
+    assert seen == []
+    assert fetched.status == "blocked"
+    assert fetched.http_status == 403
+    assert fetched.pages == []
 
 
 def _http_error(status: int) -> requests.HTTPError:

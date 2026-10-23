@@ -72,15 +72,36 @@ def wait_budget_spent(started: float, now: float, interval: float, budget: float
 
 
 _FUTURE_CLOCK = ("発走", "発表", "予定")
+# Longer clocks first so 「8時半」 is not read as a bare 「8時」.
+_TIME_TOKEN = re.compile(
+    r"\d{1,2}\s*時\s*半"
+    r"|\d{1,2}\s*[時:：]\s*\d{1,2}"
+    r"|\d{1,2}\s*時"
+    r"|正午"
+)
+# A label that introduces the next clock on the line. A bare 発走 stays with
+# the earlier clock (「15時40分 ブラジルC 発走」). 「発走は15時40分」 points
+# at the following clock, so the earlier measurement stays.
+_NEXT_LABEL = re.compile(
+    r"(?:[（(]\s*(?:次回\s*)?(?:発表予定|発表|予定|発走)"
+    r"|次回\s*(?:発表予定|発表|予定|発走)"
+    r"|(?:発表予定|発表|予定)"
+    r"|発走\s*[は:：](?:\s*\d{4}\s*年)?(?:\s*\d{1,2}\s*月\s*\d{1,2}\s*日)?)"
+    r"\s*$"
+)
 
 
 def measurement_times(text: str, year: int | None) -> list[datetime]:
     """Clocks printed as ``M月D日 H時M分``, ``H時半``, ``H時``, or ``正午``.
 
     ``H時`` with no minutes is ``H:00``. ``H時半`` is ``H:30``. ``正午`` is
-    ``12:00``. A 発走 or 発表予定 clock is not a measurement. The whole line
-    is checked, so ``15時40分 ブラジルC 発走`` is not a measurement. A marker
-    on the previous or next line does not hide this line's clock.
+    ``12:00``. A 発走 or 発表予定 clock is not a measurement. Only the text
+    that belongs to that clock is checked: the span up to the next clock on
+    the line, or the line end when there is no next clock. ``7時00分 測定
+    （次回発表 12時）`` keeps 07:00. ``5時30分 測定 発走は15時40分`` keeps
+    05:30, because 発走は names the following clock. ``15時40分 ブラジルC
+    発走`` does not. A marker on the previous or next line does not hide this
+    line's clock.
 
     The year is the one printed in the same stamp, otherwise ``year``. A stamp
     with no year stays out of the list. Nothing is filled from the fetch time.
@@ -122,17 +143,62 @@ def _clock_hm(match: re.Match[str]) -> tuple[int, int]:
 
 
 def _future_clock(text: str, match: re.Match[str]) -> bool:
-    """True when 発走, 発表, or 予定 sits anywhere on this stamp's line.
+    """True when 発走, 発表, or 予定 belongs to this clock.
 
-    The next line's 発表予定, and the previous line's, do not count.
+    The next line's 発表予定, and the previous line's, do not count. On one
+    line, 「7時00分 測定（次回発表 12時）」 keeps 07:00: 発表 introduces 12時.
+    「5時30分 測定 発走は15時40分」 keeps 05:30. 「15時40分 ブラジルC 発走」
+    does not keep 15:40.
+    """
+    owned = _clock_text(text, match)
+    return any(mark in owned for mark in _FUTURE_CLOCK)
+
+
+def _clock_text(text: str, match: re.Match[str]) -> str:
+    """Text that labels this clock, not the next clock on the line.
+
+    The span after this clock belongs to it until the next clock, except a
+    trailing 発表 / 予定 label or 「発走は」, which belongs to that next clock.
+    A bare 発走 stays with this clock. The span before the first clock on the
+    line belongs to the first clock, so 「発表予定 10月18日 8時」 is still
+    excluded.
     """
     start, end = match.start(), match.end()
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
     if line_end < 0:
         line_end = len(text)
-    line = text[line_start:line_end]
-    return any(mark in line for mark in _FUTURE_CLOCK)
+    times = list(_TIME_TOKEN.finditer(text, line_start, line_end))
+    index = None
+    for i, token in enumerate(times):
+        if token.start() < end <= token.end() or token.end() == end:
+            index = i
+            break
+    if index is None:
+        return text[line_start:line_end]
+    prev_end = times[index - 1].end() if index else line_start
+    this_start = times[index].start()
+    this_end = times[index].end()
+    has_next = index + 1 < len(times)
+    boundary = times[index + 1].start() if has_next else line_end
+    prefix = text[prev_end:this_start]
+    suffix = text[this_end:boundary]
+    parts: list[str] = []
+    if index == 0:
+        parts.append(prefix)
+    else:
+        label = _NEXT_LABEL.search(prefix)
+        if label is not None:
+            parts.append(label.group(0))
+    if has_next:
+        label = _NEXT_LABEL.search(suffix)
+        if label is not None:
+            parts.append(suffix[: label.start()])
+        else:
+            parts.append(suffix)
+    else:
+        parts.append(suffix)
+    return "\n".join(parts)
 
 
 def page_measurement_time(text: str, year: int | None) -> datetime | None:
