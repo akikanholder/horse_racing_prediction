@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 OddsSource = Literal[
     "netkeiba_yoso",
     "netkeiba_live",
+    "netkeiba_result",
     "jradb",
     "jra_html",
     "jra_js",
@@ -21,9 +22,9 @@ OddsSource = Literal[
     "netkeiba_js",
     "headless",
 ]
-OddsKind = Literal["yoso", "live"]
+OddsKind = Literal["yoso", "live", "result"]
 BetType = Literal["win", "wide", "umaren", "sanrenpuku", "place"]
-OddsStatus = Literal["live", "yoso", "unavailable"]
+OddsStatus = Literal["live", "yoso", "unavailable", "result"]
 OddsPrefer = Literal["live", "yoso"]
 NonRunnerStatus = Literal["scratched", "excluded", "unknown"]
 PageFetchSource = Literal["jra_html", "jra_js", "netkeiba_html", "netkeiba_js", "headless"]
@@ -99,10 +100,14 @@ class OddsQuote(BaseModel):
         ...,
         description=(
             "取得元。発売中の引用は netkeiba_yoso / netkeiba_live。"
-            "過去の確定オッズはページの jra_html / jra_js / netkeiba_html / netkeiba_js / headless もあり得る"
+            "確定オッズの API は netkeiba_result。過去の確定オッズはページの"
+            " jra_html / jra_js / netkeiba_html / netkeiba_js / headless もあり得る"
         ),
     )
-    kind: OddsKind = Field(..., description="yoso=発売前の予想、live=発売後の市場")
+    kind: OddsKind = Field(
+        ...,
+        description="yoso=発売前の予想、live=発売後の市場、result=確定オッズ",
+    )
     fetched_at: datetime = Field(..., description="取得日時")
     market_updated_at: datetime | None = Field(None, description="ページが示すオッズ更新日時")
     non_runner: bool = Field(
@@ -121,6 +126,10 @@ class OddsQuote(BaseModel):
             raise ValueError("kind=yoso requires source=netkeiba_yoso")
         if self.kind == "live" and self.source == "netkeiba_yoso":
             raise ValueError("kind=live cannot use source=netkeiba_yoso")
+        if self.kind == "result" and self.source != "netkeiba_result":
+            raise ValueError("kind=result requires source=netkeiba_result")
+        if self.source == "netkeiba_result" and self.kind != "result":
+            raise ValueError("source=netkeiba_result requires kind=result")
         if self.bet_type == "win":
             self._check_win()
         elif self.bet_type == "place":
@@ -235,7 +244,10 @@ class RaceOdds(BaseModel):
         "live",
         description="優先する種別。live が unavailable でも yoso へは切り替えない",
     )
-    status: OddsStatus = Field(..., description="live / yoso / unavailable")
+    status: OddsStatus = Field(
+        ...,
+        description="live / yoso / unavailable。確定オッズの報告は result",
+    )
     reason: str | None = Field(
         None,
         description=(

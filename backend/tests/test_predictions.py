@@ -247,8 +247,12 @@ def test_add_rejects_bad_weights_timezone_and_wide_price():
         validate_prediction(extra, pending_only=True)
     scored = _example()
     scored["horses"][0]["item_scores"]["ability"] = None
-    with pytest.raises(PredictionValidationError, match="item_scores.ability must be number"):
-        validate_prediction(scored, pending_only=True)
+    accepted = validate_prediction(scored, pending_only=True)
+    assert accepted["horses"][0]["item_scores"]["ability"] is None
+    weight_null = _example()
+    weight_null["run"]["weights"]["ability"] = None
+    with pytest.raises(PredictionValidationError, match="weights.ability must be number"):
+        validate_prediction(weight_null, pending_only=True)
 
     naive = _example()
     naive["run"]["run_at"] = "2026-10-17T18:00:00"
@@ -713,7 +717,7 @@ def test_windows_lock_uses_msvcrt(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     calls: list[int] = []
 
     class _Msvcrt:
-        LK_LOCK = 0
+        LK_NBLCK = 2
         LK_UNLCK = 1
 
         def locking(self, fd: int, mode: int, length: int) -> None:
@@ -723,9 +727,131 @@ def test_windows_lock_uses_msvcrt(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(store_mod, "fcntl", None)
     monkeypatch.setattr(store_mod, "msvcrt", _Msvcrt())
     PredictionStore(tmp_path).add([_example()])
-    assert calls[0] == _Msvcrt.LK_LOCK
+    assert calls[0] == _Msvcrt.LK_NBLCK
     assert _Msvcrt.LK_UNLCK in calls
     assert PredictionStore(tmp_path).read(datetime.strptime(DAY, "%Y-%m-%d").date())
+
+
+def test_windows_lock_retries_until_the_configured_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import backend.services.prediction_store as store_mod
+
+    clock = {"t": 0.0}
+
+    class _Busy:
+        LK_NBLCK = 2
+        LK_UNLCK = 1
+
+        def locking(self, fd: int, mode: int, length: int) -> None:
+            raise OSError("locked")
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(store_mod, "fcntl", None)
+    monkeypatch.setattr(store_mod, "msvcrt", _Busy())
+    monkeypatch.setenv("HRP_PREDICTION_LOCK_TIMEOUT", "0.2")
+    monkeypatch.setattr(store_mod, "_lock_clock", lambda: clock["t"])
+    monkeypatch.setattr(store_mod, "_lock_sleep", _sleep)
+    with pytest.raises(
+        PredictionStoreError, match=r"exclusive prediction lock timed out after 0\.2s"
+    ):
+        PredictionStore(tmp_path).add([_example()])
+    assert list(tmp_path.glob("*.jsonl")) == []
+
+    monkeypatch.setenv("HRP_PREDICTION_LOCK_TIMEOUT", "nan")
+    with pytest.raises(PredictionStoreError, match="positive finite number"):
+        PredictionStore(tmp_path).add([_example()])
+
+
+def test_stale_tmp_for_that_date_is_removed_under_the_lock(tmp_path: Path):
+    store = _store(tmp_path)
+    day = datetime.strptime(DAY, "%Y-%m-%d").date()
+    path = store.path_for(day)
+    stale = path.parent / f".{path.name}.interrupted.tmp"
+    other = path.parent / ".2026-10-19.jsonl.keep.tmp"
+    stale.write_text("partial", encoding="utf-8")
+    other.write_text("keep", encoding="utf-8")
+    store.add([_example()])
+    assert not stale.exists()
+    assert other.read_text(encoding="utf-8") == "keep"
+
+    later = path.parent / f".{path.name}.settle.tmp"
+    later.write_text("later", encoding="utf-8")
+
+    def fetch(race_id: str) -> SettledRaceResult:
+        return _settled(
+            phase=None, complete=False, http_status=403, warning="race result returned 403"
+        )
+
+    _settle(store, fetch)
+    assert not later.exists()
+    assert other.is_file()
+
+
+def test_schema_path_accepts_a_directory_install_under_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import tempfile
+
+    import backend.services.prediction_validate as validate
+
+    schema = tmp_path / "installed" / "hrp.prediction.schema.json"
+    schema.parent.mkdir()
+    schema.write_bytes(
+        (
+            Path(__file__).resolve().parents[2] / "docs" / "schemas" / "hrp.prediction.schema.json"
+        ).read_bytes()
+    )
+
+    def files(_package: str):
+        class _Root:
+            def joinpath(self, name: str) -> Path:
+                assert name == "hrp.prediction.schema.json"
+                return schema
+
+        return _Root()
+
+    monkeypatch.setattr("importlib.resources.files", files)
+    monkeypatch.setattr(validate, "_repo_schema_path", lambda: None)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    assert validate.schema_path() == schema
+
+
+def test_schema_path_rejects_a_zip_extract_that_lives_under_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import tempfile
+    from contextlib import contextmanager
+
+    import backend.services.prediction_validate as validate
+
+    extracted = tmp_path / "extract" / "hrp.prediction.schema.json"
+    extracted.parent.mkdir()
+    extracted.write_text("{}", encoding="utf-8")
+
+    class _Zip:
+        def is_file(self) -> bool:
+            return True
+
+    def files(_package: str):
+        class _Root:
+            def joinpath(self, _name: str) -> _Zip:
+                return _Zip()
+
+        return _Root()
+
+    @contextmanager
+    def as_file(_resource: object):
+        yield extracted
+
+    monkeypatch.setattr("importlib.resources.files", files)
+    monkeypatch.setattr("importlib.resources.as_file", as_file)
+    monkeypatch.setattr(validate, "_repo_schema_path", lambda: None)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    with pytest.raises(PredictionValidationError, match="was not found"):
+        validate.schema_path()
 
 
 def test_missing_file_lock_is_a_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

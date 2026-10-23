@@ -19,6 +19,7 @@ from backend.scrapers.jra_headless import HEADLESS_RENDER_FAILED, shared_session
 from backend.scrapers.page_fallback import (
     HEADLESS_UNAVAILABLE,
     AccessBlocked,
+    BlockedReason,
     HeadlessUnavailableError,
 )
 
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 JRA_PAYOUT_UNREACHABLE = "JRA official payout was not reachable"
 JRA_PAYOUT_FORBIDDEN = "JRA payout returned 403"
+JRA_PAYOUT_CAPTCHA = "JRA payout returned a captcha"
+JRA_PAYOUT_CHALLENGE = "JRA payout returned a challenge"
 JRA_PAYOUT_MISMATCH = "JRA payout mismatch"
 JRA_REFUND_MISMATCH = "JRA refund mismatch"
 JRA_POPULARITY_NOTE = "JRA popularity"
@@ -96,6 +99,7 @@ class PayoutCheck(NamedTuple):
     login_required: bool = False
     phase: str | None = None
     popularity: tuple[PopularityNote, ...] = ()
+    blocked_reason: str | None = None
 
 
 def cross_check_payouts(
@@ -123,40 +127,44 @@ def cross_check_payouts(
     post = getattr(http_client, "post", None)
     if not callable(post):
         return PayoutCheck(JRA_PAYOUT_UNREACHABLE, None, "jra_html")
+    from backend.scrapers.page_cache import bind_page_cache_metadata
+
     poster, source_of, extra = _payout_poster(post, fetch_mode, session)
-    try:
-        index = _post(poster, PAYOUT_INDEX_CNAME)
-    except Exception as exc:
-        logger.warning("JRA payout index was not reachable: %s", exc)
-        return _failure_check(exc, extra(), source_of())
-    cname = _meeting_cname(index, key)
-    if cname is None:
-        return PayoutCheck(_join_note(JRA_PAYOUT_UNREACHABLE, extra()), None, source_of())
-    try:
-        day_html = _post(poster, cname)
-    except Exception as exc:
-        logger.warning("JRA payout day page was not reachable: %s", exc)
-        return _failure_check(exc, extra(), source_of())
-    refunds = _race_refunds(day_html, key.race_number)
-    phase = _official_phase(day_html, key.race_number)
-    if not payouts:
-        return PayoutCheck(extra(), refunds, source_of(), phase=phase)
-    official = _race_tickets(day_html, key.race_number)
-    if official is None:
+    fields = {"race_date": key.race_date.strftime("%Y%m%d")}
+    with bind_page_cache_metadata(http_client, **fields):
+        try:
+            index = _post(poster, PAYOUT_INDEX_CNAME)
+        except Exception as exc:
+            logger.warning("JRA payout index was not reachable: %s", exc)
+            return _failure_check(exc, extra(), source_of())
+        cname = _meeting_cname(index, key)
+        if cname is None:
+            return PayoutCheck(_join_note(JRA_PAYOUT_UNREACHABLE, extra()), None, source_of())
+        try:
+            day_html = _post(poster, cname)
+        except Exception as exc:
+            logger.warning("JRA payout day page was not reachable: %s", exc)
+            return _failure_check(exc, extra(), source_of())
+        refunds = _race_refunds(day_html, key.race_number)
+        phase = _official_phase(day_html, key.race_number)
+        if not payouts:
+            return PayoutCheck(extra(), refunds, source_of(), phase=phase)
+        official = _race_tickets(day_html, key.race_number)
+        if official is None:
+            return PayoutCheck(
+                _join_note(JRA_PAYOUT_UNREACHABLE, extra()),
+                refunds,
+                source_of(),
+                phase=phase,
+            )
+        warning, notes = _compare(payouts, official)
         return PayoutCheck(
-            _join_note(JRA_PAYOUT_UNREACHABLE, extra()),
+            _join_note(warning, extra()),
             refunds,
             source_of(),
             phase=phase,
+            popularity=notes,
         )
-    warning, notes = _compare(payouts, official)
-    return PayoutCheck(
-        _join_note(warning, extra()),
-        refunds,
-        source_of(),
-        phase=phase,
-        popularity=notes,
-    )
 
 
 def _join_note(warning: str | None, extra: str | None) -> str | None:
@@ -221,28 +229,55 @@ def _payout_poster(
     return poster, source_of, extra
 
 
-def _failure_warning(exc: BaseException) -> str:
+def _exc_status(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if status is None:
         status = getattr(exc, "status", None)
     if status in {401, 403}:
+        return status
+    return None
+
+
+def _exc_reason(exc: BaseException) -> BlockedReason | None:
+    reason = getattr(exc, "reason", None)
+    if reason in {"captcha", "challenge", "login", "http_403"}:
+        return reason
+    status = _exc_status(exc)
+    if status == 403:
+        return "http_403"
+    if status == 401:
+        return "login"
+    return None
+
+
+def _failure_warning(exc: BaseException) -> str:
+    reason = _exc_reason(exc)
+    if reason == "captcha":
+        return JRA_PAYOUT_CAPTCHA
+    if reason == "challenge":
+        return JRA_PAYOUT_CHALLENGE
+    if reason in {"http_403", "login"}:
         return JRA_PAYOUT_FORBIDDEN
     return JRA_PAYOUT_UNREACHABLE
 
 
 def _failure_check(exc: BaseException, extra: str | None, source: str) -> PayoutCheck:
-    """A refused payout fetch carries the status. Other failures stay unreachable."""
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if status is None:
-        status = getattr(exc, "status", None)
+    """A refused payout fetch carries the status. Other failures stay unreachable.
+
+    Captcha and challenge set ``blocked_reason`` and leave ``http_status`` null.
+    """
+    reason = _exc_reason(exc)
+    status = None if reason in {"captcha", "challenge"} else _exc_status(exc)
     warning = _join_note(_failure_warning(exc), extra)
-    if status == 403:
-        return PayoutCheck(warning, None, source, 403, False)
-    if status == 401:
-        return PayoutCheck(warning, None, source, 401, True)
-    return PayoutCheck(warning, None, source)
+    return PayoutCheck(
+        warning,
+        None,
+        source,
+        status,
+        reason == "login",
+        blocked_reason=reason,
+    )
 
 
 def _post(post: object, cname: str) -> str:

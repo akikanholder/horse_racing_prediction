@@ -131,8 +131,10 @@ def test_jra_challenge_page_is_not_parsed():
     client = _Gets(gets={BABA_TOKYO: challenge, BABA_KYOTO: challenge})
     info = JRATrackScraper(http_client=client).scrape("tokyo")  # type: ignore[arg-type]
     _assert_null_measurement(info)
-    assert info.warning == JRATrackScraper.BABA_403
-    assert info.http_status == 403
+    assert info.warning == JRATrackScraper.BABA_CHALLENGE
+    assert info.blocked_reason == "challenge"
+    assert info.http_status is None
+    assert info.login_required is False
     assert "9.9" not in _json_without_clocks(info)
 
 

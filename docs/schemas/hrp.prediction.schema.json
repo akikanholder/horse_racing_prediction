@@ -204,7 +204,7 @@
           "item_scores": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Eight scores with the same keys as run.weights. Each value is a number. This schema does not supply a default.",
+            "description": "Eight scores with the same keys as run.weights. The scale is defined by the predictor, not this tool. Each value is a number, or null when that item is unknown. Weights stay required numbers. This schema does not supply a default.",
             "required": [
               "ability",
               "pace",
@@ -216,14 +216,14 @@
               "rotation"
             ],
             "properties": {
-              "ability": {"type": "number", "description": "基礎能力・近走のレース内容"},
-              "pace": {"type": "number", "description": "展開・脚質適性"},
-              "course": {"type": "number", "description": "コース・距離適性"},
-              "going": {"type": "number", "description": "馬場適性・当日バイアス"},
-              "workout": {"type": "number", "description": "調教・仕上がり・馬体"},
-              "gate_jockey": {"type": "number", "description": "枠順・斤量・騎手"},
-              "pedigree": {"type": "number", "description": "血統適性"},
-              "rotation": {"type": "number", "description": "ローテーション・状態リスク"}
+              "ability": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "基礎能力・近走のレース内容"},
+              "pace": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "展開・脚質適性"},
+              "course": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "コース・距離適性"},
+              "going": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "馬場適性・当日バイアス"},
+              "workout": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "調教・仕上がり・馬体"},
+              "gate_jockey": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "枠順・斤量・騎手"},
+              "pedigree": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "血統適性"},
+              "rotation": {"anyOf": [{"type": "null"}, {"type": "number"}], "description": "ローテーション・状態リスク"}
             }
           },
           "data_coverage": {"anyOf": [{"type": "null"}, {"type": "number", "minimum": 0, "maximum": 1}]},

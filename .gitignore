@@ -220,10 +220,17 @@ __marimo__/
 # Generated race CSV exports (date/venue directories and CSV files)
 *.csv
 *.jsonl
+*.jsonl.lock
 backend/csv_output/
 
-# Default directory for prediction JSONL (`predictions add`)
-/predictions/
+# Prediction JSONL at any depth (`predictions add`, including backend/predictions)
+predictions/
+# Fixtures under this name stay tracked. A parent directory ignore cannot be
+# re-included unless the directory itself is un-ignored first.
+!backend/tests/fixtures/predictions/
+!backend/tests/fixtures/predictions/**
+# The exception above re-includes lock files. Keep those ignored.
+backend/tests/fixtures/predictions/*.jsonl.lock
 
 # Cached public pages for historical date ranges
 backend/.cache/

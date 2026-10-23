@@ -65,13 +65,20 @@ def schema_path() -> Path:
 
 
 def _packaged_schema_path() -> Path | None:
-    """Real file from importlib.resources. Zip extracts are not a stable path."""
+    """Real file from importlib.resources. Zip extracts are not a stable path.
+
+    A directory install is a real path even when that directory is under the
+    temp dir. Only a zip extract, which disappears when ``as_file`` exits, is
+    rejected.
+    """
     try:
         from importlib.resources import as_file, files
 
         resource = files("backend.services").joinpath(_SCHEMA_NAME)
         if not resource.is_file():
             return None
+        if isinstance(resource, Path):
+            return resource
         with as_file(resource) as extracted:
             path = Path(extracted)
             if not path.is_file():

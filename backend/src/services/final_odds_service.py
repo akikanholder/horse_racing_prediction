@@ -24,6 +24,7 @@ from backend.scrapers.final_odds import (
     FINAL_ODDS_NOT_SETTLED,
     PublicOddsPages,
     final_odds_need_fallback,
+    label_final_market_quote,
     parse_confirmed_odds,
     payout_disagreements,
     priced_without_final_label,
@@ -178,18 +179,19 @@ class FinalOddsService:
                 result_phase="confirmed",
                 complete=True,
             )
+        labeled = [label_final_market_quote(quote) for quote in quotes]
         return FinalRaceOdds(
             race_id=race_id,
             bet_types=selected,
             prefer="live",
-            status="live",
+            status="result",
             reason=None,
             encoding=ODDS_ENCODING,
             race_phase="post",
             result_phase="confirmed",
             complete=True,
             odds_final=True,
-            quotes=quotes,
+            quotes=labeled,
             non_runners=runners,
             warning=warning,
             fetched_at=fetched_at,
@@ -272,11 +274,15 @@ class FinalOddsService:
             runners = _merge_runners(runners, api_runners) or []
             if _covers(quotes, bet_type) or _printed_live_board(loaded.pages):
                 continue
-            rendered, blocked = _render_odds_page(race_id, bet_type, self.headless_render)
+            rendered, blocked, missing_browser = _render_odds_page(
+                race_id, bet_type, self.headless_render
+            )
             if blocked is not None:
                 notes.append(_netkeiba_block_warning(_block_text(blocked)))
                 stopped = True
                 break
+            if missing_browser:
+                notes.append(missing_browser)
             if rendered is None:
                 continue
             page = FetchedBody(rendered, "headless", fetched_at, _odds_url(race_id, bet_type))
@@ -408,27 +414,37 @@ def _render_odds_page(
     race_id: str,
     bet_type: BetType,
     headless_render: HeadlessChoice,
-) -> tuple[str | None, AccessBlocked | None]:
-    """Headless only. ``auto`` with no browser returns no warning."""
+) -> tuple[str | None, AccessBlocked | None, str | None]:
+    """Headless only. A missing browser is a warning, not an access denial.
+
+    ``off`` stays silent. ``auto`` and an explicit renderer attach
+    ``headless browser is not installed`` when the browser is absent.
+    """
     if headless_render == "off":
-        return None, None
+        return None, None, None
     render = render_headless if headless_render == "auto" else headless_render
     try:
         body = render(_odds_url(race_id, bet_type))
     except AccessBlocked as blocked:
-        return None, blocked
+        return None, blocked, None
     except HeadlessUnavailableError:
-        return None, None
+        return None, None, HEADLESS_UNAVAILABLE
     except Exception as exc:
         logger.warning("Headless odds render failed for %s %s: %s", race_id, bet_type, exc)
-        return None, None
+        return None, None, None
     if not isinstance(body, str):
-        return None, None
-    return body, None
+        return None, None, None
+    return body, None, None
 
 
 def _block_text(blocked: AccessBlocked) -> str:
-    if blocked.status == 403:
+    """Name the refusal. A captcha or challenge is not a login wall."""
+    reason = blocked.reason
+    if reason == "captcha":
+        return "netkeiba returned a captcha"
+    if reason == "challenge":
+        return "netkeiba returned a challenge"
+    if reason == "http_403" or blocked.status == 403:
         return "netkeiba returned 403"
     return "netkeiba requires login"
 

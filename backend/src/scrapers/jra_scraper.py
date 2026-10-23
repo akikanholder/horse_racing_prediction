@@ -19,6 +19,7 @@ from backend.scrapers.final_odds import (
     same_site_odds_urls,
 )
 from backend.scrapers.jra_headless import HeadlessTransport
+from backend.scrapers.page_cache import bind_page_cache_metadata
 from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
@@ -135,6 +136,21 @@ class _RaceLookup:
                 and meeting.day_number == self.day_number
             )
         return meeting.race_date == self.race_date
+
+
+def _odds_refusal_warning(loaded: object) -> str:
+    """Keep a captcha or challenge warning. Do not relabel it as login."""
+    reason = getattr(loaded, "blocked_reason", None)
+    warning = getattr(loaded, "warning", None)
+    if reason == "captcha":
+        return warning if isinstance(warning, str) and warning else "jra returned a captcha"
+    if reason == "challenge":
+        return warning if isinstance(warning, str) and warning else "jra returned a challenge"
+    status = getattr(loaded, "http_status", None)
+    login = bool(getattr(loaded, "login_required", False))
+    if reason == "http_403" or (status == 403 and not login):
+        return JRA_ODDS_FORBIDDEN
+    return JRA_ODDS_LOGIN
 
 
 def _row_in_exclusion_block(row: Tag) -> bool:
@@ -601,7 +617,7 @@ class JRAScraper(BaseScraper):
             if cname is None:
                 logger.info("No accessD card found for %s", race_id)
                 return None
-            html = self._fetch_access_d(cname.cname)
+            html = self._fetch_access_d(cname.cname, race_date=lookup.race_date)
             fetched = tokyo_now()
             if looks_like_login_wall(html):
                 logger.warning(
@@ -656,7 +672,7 @@ class JRAScraper(BaseScraper):
         if cname is None:
             return None, "not_found"
         try:
-            return self._fetch_access_d(cname.cname), "ok"
+            return self._fetch_access_d(cname.cname, race_date=lookup.race_date), "ok"
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 403:
@@ -682,17 +698,37 @@ class JRAScraper(BaseScraper):
             update={"warning": join_warnings(card.warning, self._transport.fallback_warning)}
         )
 
-    def _fetch_access_d(self, cname: str) -> str:
-        """POST one accessD command and cache the HTML."""
+    def _post_jra(
+        self,
+        url: str,
+        cname: str,
+        *,
+        encoding: str,
+        race_date: date | None,
+    ) -> str:
+        """POST ``cname`` only. ``race_date`` is cache metadata, not a form field."""
+        data = {"cname": cname}
+        fields: dict[str, str] = {}
+        if race_date is not None:
+            fields["race_date"] = race_date.strftime("%Y%m%d")
+        with bind_page_cache_metadata(self.http_client, **fields):
+            return self.http_client.post(url, data=data, encoding=encoding)
+
+    def _fetch_access_d(self, cname: str, *, race_date: date | None = None) -> str:
+        """POST one accessD command and cache the HTML.
+
+        ``race_date`` is cache metadata. It is not added to the form body.
+        """
         cached = self._access_d_html.get(cname)
         if cached is not None:
             self._transport.used_headless = self._access_d_source.get(cname) == "headless"
             self._note_transport_source()
             return cached
-        html = self.http_client.post(
+        html = self._post_jra(
             self.ACCESS_D_URL,
-            data={"cname": cname},
+            cname,
             encoding=self.ACCESS_D_ENCODING,
+            race_date=race_date,
         )
         source = self._note_transport_source()
         self._access_d_html[cname] = html
@@ -701,7 +737,7 @@ class JRAScraper(BaseScraper):
 
     def _find_race_cname(self, lookup: _RaceLookup) -> _ParsedRaceCname | None:
         """Find the race token within two hops of the shutuba index."""
-        index_html = self._fetch_access_d(self.SHUTUBA_INDEX_CNAME)
+        index_html = self._fetch_access_d(self.SHUTUBA_INDEX_CNAME, race_date=lookup.race_date)
         races, meetings = self._scan_access_d(index_html)
         matched = self._first_matching_race(races, lookup)
         if matched is not None:
@@ -710,7 +746,7 @@ class JRAScraper(BaseScraper):
         for meeting in meetings:
             if not lookup.matches_meeting(meeting):
                 continue
-            meeting_html = self._fetch_access_d(meeting.cname)
+            meeting_html = self._fetch_access_d(meeting.cname, race_date=lookup.race_date)
             meeting_races, _nested = self._scan_access_d(meeting_html)
             matched = self._first_matching_race(meeting_races, lookup)
             if matched is not None:
@@ -862,7 +898,7 @@ class JRAScraper(BaseScraper):
         if cname is None:
             return ScratchPage(None, set(), "JRA odds page was not on the card", False)
         try:
-            shutuba = self._fetch_access_d(cname.cname)
+            shutuba = self._fetch_access_d(cname.cname, race_date=lookup.race_date)
         except Exception as exc:
             return self._odds_block(exc)
         if looks_like_login_wall(shutuba):
@@ -871,10 +907,11 @@ class JRAScraper(BaseScraper):
         if odds_cname is None:
             return self._scratches_from_shutuba(shutuba, fetched)
         try:
-            odds_html = self.http_client.post(
+            odds_html = self._post_jra(
                 self.ACCESS_O_URL,
-                data={"cname": odds_cname},
+                odds_cname,
                 encoding=self.ACCESS_D_ENCODING,
+                race_date=lookup.race_date,
             )
         except Exception as exc:
             blocked = self._odds_block(exc)
@@ -908,7 +945,7 @@ class JRAScraper(BaseScraper):
         if cname is None:
             return PublicOddsPages([], "JRA odds page was not on the card", False)
         try:
-            shutuba = self._fetch_access_d(cname.cname)
+            shutuba = self._fetch_access_d(cname.cname, race_date=lookup.race_date)
         except Exception as exc:
             blocked = self._odds_block(exc)
             return PublicOddsPages([], blocked.warning, blocked.blocked)
@@ -918,10 +955,11 @@ class JRAScraper(BaseScraper):
         if odds_cname is None:
             return PublicOddsPages([], "JRA odds page was not on the card", False)
         try:
-            odds_html = self.http_client.post(
+            odds_html = self._post_jra(
                 self.ACCESS_O_URL,
-                data={"cname": odds_cname},
+                odds_cname,
                 encoding=self.ACCESS_D_ENCODING,
+                race_date=lookup.race_date,
             )
         except Exception as exc:
             blocked = self._odds_block(exc)
@@ -956,9 +994,7 @@ class JRAScraper(BaseScraper):
         warning = join_warnings(loaded.warning, self._transport.fallback_warning)
         refused = loaded.status == "blocked"
         if refused:
-            warning = (
-                JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
-            )
+            warning = _odds_refusal_warning(loaded)
         elif loaded.warning == HEADLESS_UNAVAILABLE:
             warning = HEADLESS_UNAVAILABLE
         return PublicOddsPages(loaded.pages, warning, refused)
@@ -1041,16 +1077,11 @@ class JRAScraper(BaseScraper):
             document_source=source,
         )
         if loaded.status == "blocked" and not loaded.pages:
-            warning = (
-                JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
-            )
-            return ScratchPage(None, set(), warning, True)
+            return ScratchPage(None, set(), _odds_refusal_warning(loaded), True)
         merged = self._marks_from_pages(loaded.pages, fetched_at)
         warning = None
         if loaded.status == "blocked":
-            warning = (
-                JRA_ODDS_FORBIDDEN if loaded.warning and "403" in loaded.warning else JRA_ODDS_LOGIN
-            )
+            warning = _odds_refusal_warning(loaded)
         elif loaded.warning == HEADLESS_UNAVAILABLE and not merged.complete:
             warning = HEADLESS_UNAVAILABLE
         elif self._transport.fallback_warning and not merged.complete:

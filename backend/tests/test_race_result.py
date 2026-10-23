@@ -39,6 +39,8 @@ from backend.scrapers.netkeiba_scraper import (
 from backend.scrapers.page_fallback import (
     BABA_READING_READY_JS,
     BABA_READING_WAIT_MS,
+    ODDS_CELL_READY_JS,
+    ODDS_CELL_WAIT_MS,
     RESULT_TABLE_READY_JS,
     RESULT_TABLE_WAIT_MS,
     await_page_ready,
@@ -1457,10 +1459,12 @@ def test_result_headless_waits_for_the_full_table_and_swallows_timeout():
             waited.append((script, timeout or 0))
 
     await_page_ready(_Page(), "https://race.netkeiba.com/race/result.html?race_id=1")
+    await_page_ready(_Page(), "https://race.netkeiba.com/odds/index.html?race_id=1")
     await_page_ready(_Page(), "https://www.jra.go.jp/keiba/baba/index.html")
     await_page_ready(_Page(), "https://example.test/other")
     assert waited == [
         (RESULT_TABLE_READY_JS, RESULT_TABLE_WAIT_MS),
+        (ODDS_CELL_READY_JS, ODDS_CELL_WAIT_MS),
         (BABA_READING_READY_JS, BABA_READING_WAIT_MS),
     ]
 
@@ -1469,6 +1473,7 @@ def test_result_headless_waits_for_the_full_table_and_swallows_timeout():
             raise TimeoutError("still the early rows")
 
     await_page_ready(_Slow(), "https://race.netkeiba.com/race/result.html?race_id=1")
+    await_page_ready(_Slow(), "https://race.netkeiba.com/odds/index.html?race_id=1")
     await_page_ready(_Slow(), "https://www.jra.go.jp/keiba/baba/index.html")
 
 

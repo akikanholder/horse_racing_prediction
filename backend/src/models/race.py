@@ -379,12 +379,19 @@ class SettledRaceResult(BaseModel):
         None,
         description=(
             "取得が HTTP 401 または 403 で止まったときのステータス。"
-            "払戻金の「403円」など、警告の文字列からは付けない"
+            "払戻金の「403円」、captcha、チャレンジ画面からは付けない"
         ),
     )
     login_required: bool = Field(
         False,
         description="ログイン画面で止まったとき true。払戻の文面からは付けない",
+    )
+    blocked_reason: Literal["captcha", "challenge", "login", "http_403"] | None = Field(
+        None,
+        description=(
+            "取得を止めた理由。captcha / challenge / login / http_403。"
+            "止まっていないときは null。http_status は実レスポンスのときだけ"
+        ),
     )
     source: str | None = Field(
         None,

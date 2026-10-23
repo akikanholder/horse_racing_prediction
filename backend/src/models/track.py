@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -191,12 +192,17 @@ class TrackInfo(BaseModel):
         None,
         description=(
             "取得が HTTP 401 または 403 で止まったときのステータス。"
-            "本文に 403 という数字があっても、拒否そのもの以外では null"
+            "本文に 403 という数字があっても、拒否そのもの以外では null。"
+            "captcha とチャレンジからは付けない"
         ),
     )
     login_required: bool = Field(
         False,
         description="ログイン画面で止まったとき true。本文の文字列からは付けない",
+    )
+    blocked_reason: Literal["captcha", "challenge", "login", "http_403"] | None = Field(
+        None,
+        description="馬場ページを止めた理由。止まっていないときは null",
     )
     warning: str | None = Field(
         None, description="取得できない理由。取れたときは null"

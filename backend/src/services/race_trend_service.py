@@ -312,7 +312,11 @@ def previous_meeting_date(
             listed = list(list_races(day))
         except AccessBlocked as exc:
             logger.warning("Race list blocked for %s: %s", day, exc)
-            if exc.status == 403:
+            if exc.reason == "captcha":
+                return None, "race list returned a captcha", True
+            if exc.reason == "challenge":
+                return None, "race list returned a challenge", True
+            if exc.reason == "http_403" or exc.status == 403:
                 return None, "race list returned 403", True
             return None, "race list requires login", True
         except Exception as exc:

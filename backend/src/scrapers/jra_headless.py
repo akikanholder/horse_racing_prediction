@@ -12,7 +12,8 @@ from __future__ import annotations
 import html
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -22,8 +23,8 @@ from backend.scrapers.page_fallback import (
     PAGE_LOGIN,
     AccessBlocked,
     HeadlessUnavailableError,
+    _blocked_for_page,
     await_page_ready,
-    looks_like_forbidden_page,
     looks_like_login_wall,
 )
 from backend.scrapers.track_freshness import cached_copy_warning, fresh_track_headers
@@ -76,12 +77,11 @@ def _with_query(url: str, params: dict[str, str] | None) -> str:
 def _denied(status: int | None, body: str) -> AccessBlocked | None:
     if status in {401, 403}:
         message = PAGE_FORBIDDEN if status == 403 else PAGE_LOGIN
-        return AccessBlocked(status, message)
+        reason = "http_403" if status == 403 else "login"
+        return AccessBlocked(status, message, reason=reason)
     if looks_like_login_wall(body):
-        return AccessBlocked(401, PAGE_LOGIN)
-    if looks_like_forbidden_page(body):
-        return AccessBlocked(403, PAGE_FORBIDDEN)
-    return None
+        return AccessBlocked(401, PAGE_LOGIN, reason="login")
+    return _blocked_for_page(body)
 
 
 class HeadlessSession:
@@ -317,6 +317,16 @@ class HeadlessTransport:
         self.last_response_headers = dict(headers or {})
         if getattr(source, "served_cached_copy", False):
             self.served_cached_copy = True
+
+    @contextmanager
+    def cache_metadata(self, **fields: str) -> Iterator[None]:
+        """Forward cache metadata to the inner client. The form body stays as posted."""
+        binder = getattr(self._inner, "cache_metadata", None)
+        if callable(binder) and fields:
+            with binder(**fields):
+                yield
+            return
+        yield
 
     def get(
         self,
