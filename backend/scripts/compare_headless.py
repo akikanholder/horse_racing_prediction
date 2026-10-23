@@ -504,10 +504,10 @@ def snapshot(
 def _confirmed_win(odds_html: str | None, race_id: str, fetched: datetime) -> Json:
     """Production parser output, plus the printed 最終オッズ win column.
 
-    ``parse_confirmed_odds`` keeps a price only when the page says 確定オッズ.
-    The official odds button for a finished race is labelled 最終オッズ. Both
-    are recorded so a label gap is visible and the printed prices can still
-    be compared.
+    ``parse_confirmed_odds`` keeps a price when the page says 確定オッズ or
+    最終オッズ. The official odds button for a finished race is labelled
+    最終オッズ. Both are recorded so a label gap is visible and the printed
+    prices can still be compared.
     """
     if not odds_html or "パラメータエラー" in odds_html:
         return {
@@ -886,7 +886,7 @@ def render_doc(
         "captcha stop the run.",
         "",
         "The production odds parser accepts a price only when the page says 確定オッズ.",
-        "Finished JRA odds pages say 最終オッズ. `parser_confirmed` is that gate.",
+        "Finished JRA odds pages say 最終オッズ. The parser treats that label as final.",
         "`printed_win` is the 単勝 column on that page, parsed with `read_price_cell`",
         "(float, or null when the cell is 取消 or ----). Both sides use the same",
         "parser, so a label gap shows up as confirmed=false on both, not as a",

@@ -739,6 +739,33 @@ class PriceCell:
     status_label: str | None
 
 
+def read_popularity(value: object) -> int | None:
+    """Popularity printed beside a price. A missing rank stays null.
+
+    On an odds array this is the third field (``[odds, change, popularity]``
+    or ``[odds_min, odds_max, popularity]``). A scalar price has no rank.
+    ``人気`` on a table cell is stripped. Zero and a blank stay null.
+    """
+    if isinstance(value, list | tuple):
+        if len(value) < 3:
+            return None
+        value = value[2]
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if value <= 0 or value != int(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().replace("人気", "").replace(",", "")
+        if text.isdigit():
+            number = int(text)
+            return number if number > 0 else None
+    return None
+
+
 def read_price_cell(value: object) -> PriceCell | None:
     """Read ``[odds, change, popularity]`` or a scalar.
 

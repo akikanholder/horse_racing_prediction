@@ -12,7 +12,7 @@ from typing import Any
 
 from backend.models.historical import HistoricalBatch, HistoricalRace
 from backend.models.horse import Horse, HorsePerformance, PedigreeHorse
-from backend.models.odds import OddsQuote
+from backend.models.odds import FinalRaceOdds, OddsQuote
 from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, TrackBias
 from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
@@ -447,6 +447,53 @@ def cmd_track(args):
             moisture = _moisture_text(info.dirt.moisture)
             if moisture:
                 print(f"  ダート含水率: {moisture}")
+
+
+def cmd_final_odds(args):
+    """Final wide, umaren, and sanrenpuku odds for a past race."""
+    with _open_service(RaceService, args) as service:
+        snapshot = service.get_final_combination_odds(
+            args.race_id,
+            bet_types=args.bet_types,
+        )
+
+    if args.json:
+        print_json(snapshot)
+        return
+
+    print(f"\n=== 確定{_odds_title(snapshot.bet_types)}: {snapshot.race_id} ===")
+    print(f"状態: {snapshot.status}")
+    print(f"局面: {_race_phase_label(snapshot.race_phase)}")
+    print(f"着順: {_result_phase_label(snapshot)}")
+    print(f"確定オッズ: {'あり' if snapshot.odds_final else 'なし'}")
+    print(f"文字コード: {snapshot.encoding}")
+    if snapshot.reason:
+        print(f"理由: {snapshot.reason}")
+    if snapshot.warning:
+        print(f"警告: {snapshot.warning}")
+    print(f"取得時刻: {snapshot.fetched_at}")
+    if not snapshot.quotes:
+        return
+    print()
+    for quote in snapshot.quotes:
+        print(_format_final_quote(quote))
+
+
+def _result_phase_label(snapshot: FinalRaceOdds) -> str:
+    """Text label for the settled phase. complete is part of finality."""
+    phase = snapshot.result_phase or "不明"
+    if snapshot.complete is True:
+        return f"{phase} / complete"
+    if snapshot.complete is False:
+        return f"{phase} / incomplete"
+    return phase
+
+
+def _format_final_quote(quote: OddsQuote) -> str:
+    line = _format_odds_quote(quote)
+    if quote.popularity is None:
+        return line
+    return f"{line} {quote.popularity}人気"
 
 
 def cmd_odds(args):
@@ -1071,6 +1118,29 @@ def main():
     )
     odds_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     odds_parser.set_defaults(func=cmd_odds)
+
+    final_odds_parser = subparsers.add_parser(
+        "final-odds",
+        parents=[jra_flags],
+        help="過去レースのワイド・馬連・三連複の確定オッズを取得",
+        description=(
+            "過去レースの確定したワイド・馬連・三連複。"
+            "encoding は utf-8。combination は ASCII の馬番（3-7、1-2-5）。"
+            "ワイドは odds_min と odds_max。馬連と三連複は単一の odds。"
+            "人気がページにあれば popularity。source と fetched_at（+09:00）。"
+            "race_phase は確定オッズを載せたとき post。result_phase は着順の局面。"
+            "確定かつ complete のときだけ odds_final。それ以外は quotes が空で warning。"
+            "価格は作らない。403・ログイン・captcha で取得を止める。"
+        ),
+    )
+    final_odds_parser.add_argument("race_id", help="レースID")
+    final_odds_parser.add_argument(
+        "--bet-types",
+        default="wide,umaren,sanrenpuku",
+        help="馬券種（カンマ区切り。wide、umaren、sanrenpuku）",
+    )
+    final_odds_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
+    final_odds_parser.set_defaults(func=cmd_final_odds)
 
     history_parser = subparsers.add_parser(
         "history",

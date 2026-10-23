@@ -14,7 +14,7 @@ from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.export import DailyRaceCsvExport
 from backend.models.historical import HistoricalBatch, HistoricalExport
 from backend.models.horse import Horse, HorseBasicInfo
-from backend.models.odds import RaceOdds
+from backend.models.odds import FinalRaceOdds, RaceOdds
 from backend.models.race import Race, RaceCard, RaceSchedule, SettledRaceResult
 from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
@@ -124,6 +124,9 @@ async def root():
             "race_trends": "/api/races/trends?date=YYYY-MM-DD",
             "race_odds": (
                 "/api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live"
+            ),
+            "final_odds": (
+                "/api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku"
             ),
             "horses": "/api/horses/{horse_id}",
             "courses": "/api/courses",
@@ -511,6 +514,51 @@ async def get_race_odds(
         )
     except Exception as e:
         logger.error(f"Failed to get odds for {race_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/races/{race_id}/final-odds", response_model=FinalRaceOdds, tags=["Races"])
+async def get_final_combination_odds(
+    race_id: str,
+    bet_types: Annotated[
+        str,
+        Query(
+            description=(
+                "カンマ区切り。wide（ワイド）、umaren（馬連）、sanrenpuku（三連複）。"
+                "encoding は utf-8。race_phase は確定オッズを載せたとき post。"
+                "result_phase が confirmed かつ complete のときだけ odds_final"
+            )
+        ),
+    ] = "wide,umaren,sanrenpuku",
+    fetch_mode: JraFetchMode = "html",
+):
+    """過去レースのワイド・馬連・三連複の確定オッズ。
+
+    着順が確定かつ complete のときだけ価格を返す。それ以外は quotes が空で warning。
+    ワイドは odds_min と odds_max。馬連と三連複は単一の odds。
+    人気がページにあれば popularity。無いときは null。
+    fetched_at は Asia/Tokyo（+09:00）。source はページの取得元。
+    取り方は HTML、ページ内の JSON、ページ自身が呼ぶ同一サイトのオッズAPI、ヘッドレス。
+    fetch_mode が html のときはヘッドレスを開かない。
+    403、ログイン、captcha はそこで止め、別の身元では取りにいかない。
+    払戻からオッズは作らない。
+
+    Args:
+        race_id: レースID
+        bet_types: wide、umaren、sanrenpuku。カンマ区切り
+
+    Returns:
+        FinalRaceOdds: 確定の組み合わせオッズ。欠測は null と warning
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        return race_service.get_final_combination_odds(
+            race_id, bet_types=bet_types, **_mode_arg(fetch_mode)
+        )
+    except Exception as e:
+        logger.error(f"Failed to get final odds for {race_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
