@@ -53,6 +53,17 @@ def shared_session() -> HeadlessSession:
     return _shared
 
 
+def running_shared_session() -> HeadlessSession | None:
+    """The Chromium already started for this process, or None.
+
+    Does not launch a browser. A second Playwright driver must not be started
+    while this session is open.
+    """
+    if _shared is None or _shared._browser is None:
+        return None
+    return _shared
+
+
 def _with_query(url: str, params: dict[str, str] | None) -> str:
     if not params:
         return url

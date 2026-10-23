@@ -1,9 +1,10 @@
 """Final odds from a public page.
 
-A price is final only when the page says 確定オッズ or 最終オッズ, or the page
-is a post-race result (not 確定前). Live and yoso numbers are not copied.
+A price is final only when the odds heading or table says 確定オッズ or
+最終オッズ, or the page is a post-race result (not 確定前). A menu, button,
+or nav label is not that mark. Live and yoso numbers are not copied.
 Missing prices stay null. Wide ranges need both ends. Place may be a single
-price or a printed range.
+price or a printed range. ``---.-`` is an empty cell, not a price.
 """
 
 from __future__ import annotations
@@ -39,6 +40,9 @@ PAYOUT_DISAGREE = "final odds and payout disagree"
 _PAYOUT_ROUNDING_YEN = 10
 
 _FINAL_MARKS = ("確定オッズ", "最終オッズ")
+# The odds heading and the table. A menu button can say the same words.
+_FINAL_HEADINGS = ("title", "h1", "h2", "h3", "h4", "caption", "th")
+_FINAL_CHROME = frozenset({"a", "button", "nav"})
 _PAYOUT_BET = {"ワイド": "wide", "馬連": "umaren", "3連複": "sanrenpuku", "三連複": "sanrenpuku"}
 _DATED = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})")
 _DATED_COMPACT = re.compile(r"(\d{4})(\d{2})(\d{2})")
@@ -89,12 +93,66 @@ class FinalOddsParse:
 
 
 def page_says_final_odds(text: str) -> bool:
-    """True for the printed words 確定オッズ or 最終オッズ.
+    """True for 確定オッズ or 最終オッズ in the odds heading or table.
 
-    結果確定 is not this. A finished JRA odds page is labelled 最終オッズ.
+    A plain label is the whole string, so ``確 定 オッズ`` still matches and
+    ``結果確定`` does not. In HTML the words count only in ``title``, ``h1``
+    to ``h4``, ``caption``, or ``th``. A menu, a button, a nav link, or a
+    link wrapped inside a heading does not make the page final.
     """
-    compact = re.sub(r"\s+", "", text)
-    return any(mark in compact for mark in _FINAL_MARKS)
+    if "<" not in text:
+        compact = re.sub(r"\s+", "", text)
+        return any(mark in compact for mark in _FINAL_MARKS)
+    soup = BeautifulSoup(text, "lxml")
+    for tag in soup.find_all(_FINAL_HEADINGS):
+        if not isinstance(tag, Tag) or _inside_chrome(tag):
+            continue
+        compact = re.sub(r"\s+", "", _unlinked_text(tag))
+        if any(mark in compact for mark in _FINAL_MARKS):
+            return True
+    return False
+
+
+def _inside_chrome(tag: Tag) -> bool:
+    """True when a heading sits inside a link, a button, or navigation."""
+    for parent in tag.parents:
+        if getattr(parent, "name", None) in _FINAL_CHROME:
+            return True
+    return False
+
+
+def _unlinked_text(tag: Tag) -> str:
+    """Heading text, leaving out words that belong to a link or a button."""
+    parts: list[str] = []
+    for child in tag.descendants:
+        if not isinstance(child, str):
+            continue
+        parent = child.parent
+        if isinstance(parent, Tag) and _chrome_between(parent, tag):
+            continue
+        parts.append(child)
+    return "".join(parts)
+
+
+def _chrome_between(node: Tag, stop: Tag) -> bool:
+    current: Tag | None = node
+    while current is not None and current is not stop:
+        if current.name in _FINAL_CHROME:
+            return True
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return False
+
+
+def priced_without_final_label(html: str) -> bool:
+    """True when a document prints a price and does not say the odds are final.
+
+    Those numbers are a live board. A later render must not replace them.
+    ``---.-`` is not a price.
+    """
+    if page_says_final_odds(html) or _json_says_final(html):
+        return False
+    return _has_price_text(html)
 
 
 def result_is_post_race(settled: SettledRaceResult) -> bool:
@@ -826,9 +884,14 @@ def _json_says_final(text: str) -> bool:
 
 
 def _has_price_text(html: str) -> bool:
-    if _json_says_final(html.strip()) or '"win"' in html or '"単勝"' in html:
-        if re.search(r"\d+\.\d+", html):
-            return True
+    """True when a cell or a final JSON body actually prints a price.
+
+    ``---.-`` and ``----`` are not prices. A range counts only when both ends
+    are numbers. A decimal anywhere in a script is not a price.
+    """
+    stripped = html.strip()
+    if _json_says_final(stripped) and re.search(r"\d+\.\d+", stripped):
+        return True
     soup = BeautifulSoup(html, "lxml")
     for cell in soup.find_all(["td", "span"]):
         if not isinstance(cell, Tag):
@@ -838,12 +901,22 @@ def _has_price_text(html: str) -> bool:
         if not text:
             continue
         interesting = any(token in classes for token in ("odds", "tan", "fuku", "price"))
-        if interesting and read_price_cell(text.split("-")[0]) is not None:
-            return True
         if cell.get("data-combination") or interesting:
-            if re.fullmatch(r"\d+\.\d+", text) or _RANGE_SPLIT.search(text):
+            if _cell_is_price(text):
                 return True
     return False
+
+
+def _cell_is_price(text: str) -> bool:
+    """A number, or a range with two numbers. Placeholders and ``----`` are not."""
+    cell = read_price_cell(text)
+    if cell is not None and not cell.withheld and cell.odds is not None:
+        return True
+    parts = [part for part in _RANGE_SPLIT.split(text) if part]
+    if len(parts) < 2:
+        return False
+    ranged = read_range_cell(parts[:2])
+    return ranged is not None and ranged.odds_min is not None
 
 
 def _horse_in_row(cells: list[Tag]) -> str | None:

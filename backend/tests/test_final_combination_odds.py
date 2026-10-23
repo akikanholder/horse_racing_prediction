@@ -19,6 +19,7 @@ from backend.main import app
 from backend.models.odds import FinalRaceOdds, OddsQuote
 from backend.scrapers.final_odds import (
     PublicOddsPages,
+    final_odds_need_fallback,
     odds_api_is_final_payload,
     odds_api_is_replayable,
     page_says_final_odds,
@@ -28,7 +29,7 @@ from backend.scrapers.final_odds import (
 )
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.page_cache import CachingHTTPClient
-from backend.scrapers.page_fallback import FetchedBody
+from backend.scrapers.page_fallback import FetchedBody, headless_browser_installed, render_headless
 from backend.services.final_odds_service import FinalOddsService
 from backend.services.race_service import RaceService
 
@@ -188,7 +189,10 @@ class _Router:
                 raise self.result_error
             return self.result_html
         if "api_get_jra_odds.html" in url:
-            return self.api[_query_type(url)]
+            kind = _query_type(url) or str((params or {}).get("type") or "")
+            if kind not in self.api:
+                return '{"status":"middle","data":""}'
+            return self.api[kind]
         if "odds/index.html" in url:
             if self.odds_error is not None:
                 raise self.odds_error
@@ -273,6 +277,17 @@ def test_last_odds_label_is_final_and_keeps_popularity():
     assert page_says_final_odds("最終オッズ") is True
     assert page_says_final_odds("確 定 オッズ") is True
     assert page_says_final_odds("結果確定") is False
+    menu = (
+        "<html><body><nav><a>最終オッズ</a></nav><button>最終オッズ</button>"
+        "<h1><a>最終オッズ</a></h1>"
+        "<table><tr data-combination='1-3'><td class='odds'>1.1</td></tr></table>"
+        "</body></html>"
+    )
+    assert page_says_final_odds(menu) is False
+    assert parse_confirmed_odds([_page(menu)], RACE_ID).quotes == []
+    heading = "<html><head><title>レース</title></head><body><h1>最終オッズ</h1></body></html>"
+    assert page_says_final_odds(heading) is True
+    assert page_says_final_odds("<table><tr><th>最終オッズ</th></tr></table>") is True
 
     parsed = parse_confirmed_odds([_page(_load("jra_last_odds.html"))], RACE_ID)
     assert parsed.confirmed is True
@@ -692,6 +707,180 @@ def test_cli_final_odds_json(monkeypatch, capsys):
     assert payload["quotes"][0]["popularity"] == 2
     assert payload["quotes"][0]["odds_min"] == 2.2
     assert payload["fetched_at"].endswith("+09:00")
+
+
+def test_placeholder_shell_uses_the_result_api():
+    """A real odds page prints ---.- and names the API. Prices come from status result."""
+    shell = _load("netkeiba_odds_index_202605040711.html")
+    assert "---.-" in shell
+    assert "apiUrl:'/api/api_get_jra_odds.html'" in shell
+    assert "raceId:'202605040711'" in shell
+    assert "oddsType:'4'" in shell
+    assert final_odds_need_fallback(shell) is True
+    assert page_says_final_odds(shell) is False
+    assert parse_confirmed_odds([_page(shell, "netkeiba_html")], "202605040711").quotes == []
+
+    race_id = "202605040711"
+    api = {
+        "4": _load("netkeiba_jra_odds_result_umaren_202605040711.json"),
+        "5": _load("netkeiba_jra_odds_result_wide_202605040711.json"),
+        "7": _load("netkeiba_jra_odds_result_sanrenpuku_202605040711.json"),
+    }
+    payouts = "".join(
+        [
+            _payout_row("ワイド", [("9", "11")], [620], [4]),
+            _payout_row("馬連", [("9", "11")], [1770], [5]),
+            _payout_row("3連複", [("6", "9", "11")], [3240], [4]),
+        ]
+    )
+    headless = _Headless(_load("jra_last_odds.html"))
+    service, client, _jra = _service(
+        _result_html(payouts=payouts),
+        PublicOddsPages([], None, False),
+        odds_html=shell,
+        api=api,
+        headless_render=headless,
+    )
+    snapshot = service.get(race_id)
+
+    assert headless.calls == []
+    assert snapshot.odds_final is True
+    assert snapshot.race_phase == "post"
+    assert snapshot.result_phase == "confirmed"
+    assert snapshot.complete is True
+    assert snapshot.warning is None
+    by_type = {
+        bet: [quote for quote in snapshot.quotes if quote.bet_type == bet]
+        for bet in ("umaren", "wide", "sanrenpuku")
+    }
+    assert len(by_type["umaren"]) == 78
+    assert len(by_type["wide"]) == 78
+    assert len(by_type["sanrenpuku"]) == 286
+    by_key = _by_key(snapshot.quotes)
+    umaren = by_key[("umaren", "9-11")]
+    wide = by_key[("wide", "9-11")]
+    trio = by_key[("sanrenpuku", "6-9-11")]
+    assert umaren.odds == 17.7
+    assert umaren.popularity == 5
+    assert wide.odds_min == 6.2
+    assert wide.odds_max == 6.7
+    assert wide.popularity == 4
+    assert trio.odds == 32.4
+    assert trio.popularity == 4
+    assert all(quote.source == "netkeiba_live" for quote in snapshot.quotes)
+    assert {str((params or {}).get("type")) for params in client.params} >= {"4", "5", "7"}
+    assert any((params or {}).get("action") == "init" for params in client.params)
+    assert any((params or {}).get("compress") == "0" for params in client.params)
+    _assert_final_clock(snapshot)
+
+
+def test_missing_result_keeps_the_not_found_warning():
+    service, _client, jra = _service(
+        "<html><body>missing</body></html>",
+        PublicOddsPages([], None, False),
+    )
+    snapshot = service.get(RACE_ID)
+
+    assert jra.calls == []
+    assert snapshot.quotes == []
+    assert snapshot.odds_final is False
+    assert snapshot.warning == "race result not found"
+
+
+def test_placeholder_odds_index_is_not_cached(tmp_path: Path):
+    calls: list[str] = []
+
+    class _Transport:
+        def get(self, url, params=None, headers=None, encoding=None):
+            calls.append(url)
+            if "priced" in url:
+                return "<html><td class='odds'>12.4</td></html>"
+            return "<html><td class='Odds'><span>---.-</span></td></html>"
+
+    client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    shell = "https://race.netkeiba.com/odds/index.html?race=shell"
+    priced = "https://race.netkeiba.com/odds/index.html?race=priced"
+    client.get(shell)
+    client.get(shell)
+    client.get(priced)
+    client.get(priced)
+    assert calls.count(shell) == 2
+    assert calls.count(priced) == 1
+
+    planted = "<html><td class='odds'>---.-</td></html>"
+    key = CachingHTTPClient._cache_key("GET", shell, None, None)
+    path = client._path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"url": shell, "replayable": True, "body": planted}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    client.get(shell)
+    assert calls.count(shell) == 3
+
+
+def test_failed_playwright_start_still_sees_the_open_browser(monkeypatch):
+    import sys
+    import types
+
+    from backend.scrapers import jra_headless
+
+    session = type("Session", (), {"_browser": object()})()
+    seen = {"n": 0}
+
+    def _running():
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return None
+        return session
+
+    class _Driver:
+        def __enter__(self):
+            raise RuntimeError("already started")
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    fake_sync = types.ModuleType("playwright.sync_api")
+    fake_sync.sync_playwright = lambda: _Driver()  # type: ignore[attr-defined]
+    fake_playwright = types.ModuleType("playwright")
+    fake_playwright.sync_api = fake_sync  # type: ignore[attr-defined]
+    monkeypatch.setattr(jra_headless, "running_shared_session", _running)
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    assert headless_browser_installed() is True
+    assert seen["n"] == 2
+
+
+def test_open_shared_browser_renders_without_a_second_driver(monkeypatch):
+    import sys
+    import types
+
+    from backend.scrapers import jra_headless
+
+    class _Session:
+        def __init__(self) -> None:
+            self._browser = object()
+            self.calls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.calls.append(url)
+            return "<html><h1>最終オッズ</h1></html>"
+
+    session = _Session()
+    monkeypatch.setattr(jra_headless, "_shared", session)
+    fake_sync = types.ModuleType("playwright.sync_api")
+
+    def _boom():
+        raise AssertionError("second playwright start")
+
+    fake_sync.sync_playwright = _boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync)
+    url = "https://race.netkeiba.com/odds/index.html?type=b4&race_id=202605040711"
+    assert headless_browser_installed() is True
+    assert render_headless(url) == "<html><h1>最終オッズ</h1></html>"
+    assert session.calls == [url]
 
 
 def test_final_odds_api_returns_the_snapshot(monkeypatch):

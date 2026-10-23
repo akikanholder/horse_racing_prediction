@@ -2,7 +2,9 @@
 
 Wide, umaren, and sanrenpuku. A price is final only when the settled result
 is confirmed and complete. The page chain is static HTML, JSON already in
-that page, a same-site odds file the page itself names, then headless.
+that page, a same-site odds file the page itself names, then the same
+netkeiba odds API the live ``odds`` command calls. Headless runs only when
+that API did not return a final market and the HTML is not a live board.
 A 403, a login wall, or a challenge stops that chain. Prices are not invented
 from payouts, and a live board is not copied.
 """
@@ -24,11 +26,13 @@ from backend.scrapers.final_odds import (
     final_odds_need_fallback,
     parse_confirmed_odds,
     payout_disagreements,
+    priced_without_final_label,
     quotes_from_result_api,
     same_site_odds_urls,
 )
 from backend.scrapers.jra_headless import FetchMode, close_shared
 from backend.scrapers.jra_scraper import JRAScraper
+from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import (
     RACE_RESULT_FORBIDDEN,
     RACE_RESULT_LOGIN,
@@ -37,8 +41,11 @@ from backend.scrapers.netkeiba_scraper import (
 from backend.scrapers.page_cache import CachingHTTPClient, default_page_cache_dir
 from backend.scrapers.page_fallback import (
     HEADLESS_UNAVAILABLE,
+    AccessBlocked,
     FetchedBody,
+    HeadlessUnavailableError,
     PageFallback,
+    render_headless,
 )
 from backend.scrapers.runner_status import (
     NETKEIBA_ODDS_FORBIDDEN,
@@ -229,22 +236,21 @@ class FinalOddsService:
         bet_types: list[BetType],
         fetched_at: datetime,
     ) -> tuple[list[OddsQuote], list[NonRunner], str | None, bool]:
-        """One odds page per missing bet type. A refusal stops the rest."""
+        """HTML, then the odds API, then headless. A refusal stops the rest.
+
+        The API is the one ``odds`` calls. Only ``race_phase`` ``post`` is
+        kept. A live board that already prints numbers is not sent to headless.
+        """
         client = self._http_client()
         if client is None:
             return [], [], None, False
+        scraper = NetkeibaOddsScraper(http_client=client)  # type: ignore[arg-type]
         quotes: list[OddsQuote] = []
         runners: list[NonRunner] = []
         notes: list[str | None] = []
         stopped = False
         for bet_type in bet_types:
-            loaded = _load_odds_page(
-                client,
-                race_id,
-                bet_type,
-                fetched_at,
-                self.headless_render,
-            )
+            loaded = _load_odds_page(client, race_id, bet_type, fetched_at, "off")
             if loaded.blocked:
                 notes.append(_netkeiba_block_warning(loaded.warning))
                 stopped = True
@@ -253,6 +259,30 @@ class FinalOddsService:
             extra, extra_runners = _quotes_from_pages(loaded.pages, race_id, [bet_type])
             quotes = _fill(quotes, extra)
             runners = _merge_runners(runners, extra_runners) or []
+            if _covers(quotes, bet_type):
+                continue
+            api_quotes, api_runners, api_note, api_stopped = _result_api_quotes(
+                scraper, race_id, bet_type, fetched_at
+            )
+            if api_stopped:
+                notes.append(api_note)
+                stopped = True
+                break
+            quotes = _fill(quotes, api_quotes)
+            runners = _merge_runners(runners, api_runners) or []
+            if _covers(quotes, bet_type) or _printed_live_board(loaded.pages):
+                continue
+            rendered, blocked = _render_odds_page(race_id, bet_type, self.headless_render)
+            if blocked is not None:
+                notes.append(_netkeiba_block_warning(_block_text(blocked)))
+                stopped = True
+                break
+            if rendered is None:
+                continue
+            page = FetchedBody(rendered, "headless", fetched_at, _odds_url(race_id, bet_type))
+            head_quotes, head_runners = _quotes_from_pages([page], race_id, [bet_type])
+            quotes = _fill(quotes, head_quotes)
+            runners = _merge_runners(runners, head_runners) or []
         return quotes, runners, join_warnings(*notes), stopped
 
     def _http_client(self) -> object | None:
@@ -325,12 +355,82 @@ def _quotes_from_pages(
     return quotes, list(parsed.non_runners)
 
 
+def _covers(quotes: list[OddsQuote], bet_type: BetType) -> bool:
+    return any(_priced(quote) for quote in quotes if quote.bet_type == bet_type)
+
+
 def _priced(quote: OddsQuote) -> bool:
     if quote.withheld:
         return True
     if quote.bet_type == "wide":
         return quote.odds_min is not None and quote.odds_max is not None
     return quote.odds is not None
+
+
+def _printed_live_board(pages: list[FetchedBody]) -> bool:
+    """True when the HTML already printed numbers that are not final."""
+    return any(priced_without_final_label(page.body) for page in pages)
+
+
+def _odds_url(race_id: str, bet_type: BetType) -> str:
+    return f"{_ODDS_PAGE}?type={_PAGE_TYPE[bet_type]}&race_id={race_id}"
+
+
+def _result_api_quotes(
+    scraper: NetkeibaOddsScraper,
+    race_id: str,
+    bet_type: BetType,
+    fetched_at: datetime,
+) -> tuple[list[OddsQuote], list[NonRunner], str | None, bool]:
+    """The odds-command API. Only a non-empty ``result`` market is kept.
+
+    ``middle`` and ``yoso`` are discarded and do not become a warning.
+    HTTP 401 and 403 stop the chain.
+    """
+    fetch = {
+        "wide": scraper.get_wide_odds,
+        "umaren": scraper.get_umaren_odds,
+        "sanrenpuku": scraper.get_sanrenpuku_odds,
+    }[bet_type]
+    snapshot = fetch(race_id, fetched_at=fetched_at)
+    reason = snapshot.reason or ""
+    if reason.startswith("http 403"):
+        return [], [], NETKEIBA_ODDS_FORBIDDEN, True
+    if reason.startswith("http 401"):
+        return [], [], NETKEIBA_ODDS_LOGIN, True
+    if snapshot.race_phase != "post":
+        return [], [], None, False
+    quotes = [quote for quote in snapshot.quotes if quote.bet_type == bet_type and _priced(quote)]
+    return quotes, list(snapshot.non_runners or []), None, False
+
+
+def _render_odds_page(
+    race_id: str,
+    bet_type: BetType,
+    headless_render: HeadlessChoice,
+) -> tuple[str | None, AccessBlocked | None]:
+    """Headless only. ``auto`` with no browser returns no warning."""
+    if headless_render == "off":
+        return None, None
+    render = render_headless if headless_render == "auto" else headless_render
+    try:
+        body = render(_odds_url(race_id, bet_type))
+    except AccessBlocked as blocked:
+        return None, blocked
+    except HeadlessUnavailableError:
+        return None, None
+    except Exception as exc:
+        logger.warning("Headless odds render failed for %s %s: %s", race_id, bet_type, exc)
+        return None, None
+    if not isinstance(body, str):
+        return None, None
+    return body, None
+
+
+def _block_text(blocked: AccessBlocked) -> str:
+    if blocked.status == 403:
+        return "netkeiba returned 403"
+    return "netkeiba requires login"
 
 
 def _missing(selected: list[BetType], quotes: list[OddsQuote]) -> list[BetType]:
@@ -380,11 +480,12 @@ def _result_blocked(settled: SettledRaceResult) -> bool:
 
 
 def _not_final_warning(settled: SettledRaceResult) -> str:
+    """Keep the result page's own reason. Do not rewrite a miss as incomplete."""
     if settled.result_phase == "provisional":
         return "result phase is provisional"
+    if settled.warning:
+        return settled.warning
     if not settled.complete:
-        if settled.warning and "incomplete" in settled.warning:
-            return settled.warning
         return "race result is not complete"
     if settled.result_phase is None:
         return "result phase was not on the page"

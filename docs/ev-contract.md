@@ -347,7 +347,7 @@ CLI の `--fetch-mode` と API の `fetch_mode` は `html`（既定）、`headle
 
 `headless` でブラウザが無い、または描画に失敗したときは HTTP に戻り、`headless browser is not installed` または `headless render failed` を付ける。401/403、captcha、ログイン画面は HTTP に戻さず、null と今までの警告で止める。UA はブラウザ自身。差し替え、プロキシ、回避のための再試行はしない。間隔は 1.5 秒以上。
 
-確定オッズのパーサは `確定オッズ` と `最終オッズ` の印字を確定とする。JRA の確定後ページが `最終オッズ` と出すとき、そのページの価格は確定引用になる。発売中の数字をこのラベル無しで確定にはしない。
+確定オッズのパーサは、見出しか表（`title`、`h1`〜`h4`、`caption`、`th`）にある `確定オッズ` と `最終オッズ` を確定とする。メニュー、ボタン、ナビの同じ文言は確定にしない。過去レースの確定オッズも同じ判定を使う。JRA の確定後ページが見出しに `最終オッズ` と出すとき、そのページの価格は確定引用になる。発売中の数字をこのラベル無しで確定にはしない。
 
 オッズの cname はページに印刷されたものを使う。メニューの `doAction` が先にあり、レースの `151ou` があるときはレース側を使う。`Z/` は最終オッズのボタン。チェックサムは計算しない。
 
@@ -484,9 +484,9 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 ### 過去の確定組み合わせオッズ `FinalRaceOdds`
 
 ```bash
-python -m backend.cli final-odds 202505030811 --bet-types wide --json
-python -m backend.cli final-odds 202505030811 --bet-types umaren --json
-python -m backend.cli final-odds 202505030811 --bet-types sanrenpuku --fetch-mode auto --json
+python -m backend.cli final-odds 202605040711 --bet-types wide --json
+python -m backend.cli final-odds 202605040711 --bet-types umaren --json
+python -m backend.cli final-odds 202605040711 --bet-types sanrenpuku --fetch-mode auto --json
 ```
 
 `GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku`。既定の馬券種はワイド、馬連、三連複。`win` はこのコマンドでは捨てる。
@@ -498,17 +498,17 @@ python -m backend.cli final-odds 202505030811 --bet-types sanrenpuku --fetch-mod
 | 局面 | `warning` |
 |---|---|
 | `result_phase` が `provisional` | `result phase is provisional` |
-| `complete` が false | `race result is not complete`（着順の未完了の文があるときはその文） |
-| 局面が null | `result phase was not on the page` |
+| `complete` が false、または結果が無い | 着順の警告をそのまま出す（`race result not found`、`race result incomplete: …`）。警告が無いときだけ `race result is not complete` |
+| 局面が null で警告も無い | `result phase was not on the page` |
 | 結果ページが 403 / ログイン | 着順の警告のまま。オッズのページは開かない |
 
-取り方は、静的 HTML、ページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの URL（netkeiba の `api_get_jra_odds.html` を含む）、任意のヘッドレス。`--fetch-mode html` はヘッドレスを開かない。`headless` はブラウザを使い、無いときは HTTP に戻して `headless browser is not installed`。`auto` はブラウザがあれば使い、無ければ警告しない。403、captcha、Cloudflare の `Just a moment`、ログイン画面はそこで止め、User-Agent の差し替えはしない。JRA が 403 のあとは netkeiba に一度だけ進む。JRA の次のページは開かない。netkeiba が 403 のあとはヘッドレスも残りの馬券種も開かない。
+取り方は、静的 HTML、ページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの URL、それから `odds` と同じ netkeiba オッズ API（`/api/api_get_jra_odds.html`、`race_id`、`type`、`action=init`、`compress=0`）。価格がまだ無く、発売中の数字でもないときだけヘッドレス。`--fetch-mode html` はヘッドレスを開かない。`headless` はブラウザを使う。JRA が先に開いたブラウザがあればそれを使い、もう一つは起動しない。ブラウザが本当に無いときは HTTP に戻して `headless browser is not installed`。`auto` はブラウザがあれば使い、無ければ警告しない。403、captcha、Cloudflare の `Just a moment`、ログイン画面はそこで止め、User-Agent の差し替えはしない。JRA が 403 のあとは netkeiba に一度だけ進む。JRA の次のページは開かない。netkeiba が 403 のあとは API もヘッドレスも残りの馬券種も開かない。
 
-ページの `確定オッズ` と `最終オッズ` はどちらも確定。オッズ API は `status` が `result` で組み合わせが空でないときだけ確定価格にする。`middle` と `yoso` は捨てる。
+ページの見出しか表にある `確定オッズ` と `最終オッズ` はどちらも確定。メニューやボタンの同じ文言は確定にしない。オッズ API は `status` が `result` で組み合わせが空でないときだけ確定価格にする。着順が `confirmed` かつ `complete` なら、ページに見出しが無くてもこの API の価格を確定にする。`middle` と `yoso` は捨てる。`---.-` のような空欄は価格にしない。
 
 ワイドは範囲。払戻が `odds_min × 100` から `odds_max × 100` のあいだ（10円単位の端数）なら一致。馬連と三連複は `払戻 ≈ odds × 100`（10円以内）。違うときは価格を置き換えず、`warning` に `final odds and payout disagree: umaren 1-3`。ページに無い組は作らない。`combination odds were not on the page: wide` のように欠測の馬券種を書く。
 
-過去の確定オッズは `backend/.cache/pages` に残す。オッズ API は `status` が `result` かつオッズが空でないときだけ。`official_datetime` が今日（Asia/Tokyo）以降のときは保存しない。開催日が今日以降のレースは、結果ページの日付を見てオッズ本文を保存しない。今日以降の開催一覧と JRA の当日ページは従来どおり保存しない。
+過去の確定オッズは `backend/.cache/pages` に残す。オッズ API は `status` が `result` かつオッズが空でないときだけ。`official_datetime` が今日（Asia/Tokyo）以降のときは保存しない。`odds/index.html` は価格を読めたときだけ保存する。`---.-` だけの文書は保存しないし、保存済みでも読み返さない。開催日が今日以降のレースは、結果ページの日付を見てオッズ本文を保存しない。今日以降の開催一覧と JRA の当日ページは従来どおり保存しない。
 
 オッズ API のこのコマンドに無い馬券種（複勝、枠連、馬単、三連単）は、発売中の `odds` では取らない。複勝の確定オッズだけは過去レースが、ページに印字があるとき `bet_type=place` で持つ。確定結果の払戻表にそれらの名前が出ても、発売中のオッズ面の `bet_type` にはならない。
 
@@ -549,7 +549,7 @@ python -m backend.cli history --from 2025-01-05 --to 2025-01-06 --resume-from 20
 
 確定オッズにするのは次だけ。
 
-- ページに `確定オッズ` または `最終オッズ` と印字がある。
+- ページの見出しか表（`title`、`h1`〜`h4`、`caption`、`th`）に `確定オッズ` または `最終オッズ` と印字がある。メニューやボタンは含めない。
 - またはレース後のページ（着順表がある。`result_phase` が `provisional` のときは含めない）。netkeiba オッズ API は `race_phase=post`（API の `status=result`）のときだけ。
 
 発売中（`middle` / `yoso` / `race_phase=pre`）の数字は確定オッズにしない。`final_odds` は null、`warning` は `final odds were not confirmed`。結果ページに単勝が印字されていれば、それはレース後のページなので単勝の確定オッズにしてよい。複勝と組み合わせは、そのページに価格が無いときは作らない。払戻からオッズは作らない。

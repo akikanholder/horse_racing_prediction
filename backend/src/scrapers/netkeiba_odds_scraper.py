@@ -1033,3 +1033,4 @@ def _pair_sort(key: str, pair: tuple[int, int]) -> tuple[int, int, int, str]:
     elif text == f"{pair[0]}-{pair[1]}":
         ordered = 0
     return (pair[0], pair[1], ordered, text)
+

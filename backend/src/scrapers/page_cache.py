@@ -8,14 +8,16 @@ JRA payout (accessH), odds (accessO), and race-card (accessD) pages for
 today or later, and undated menus on those endpoints, are not stored.
 The netkeiba odds API is stored only when its status is ``result`` and the
 odds map is non-empty. An ``official_datetime`` of today or later in
-Asia/Tokyo is not stored. A caller that already knows the race day is today
-can set ``replay_disabled`` so the odds pages are not stored either.
-HTTP 403, a login wall, and a challenge page are not stored. A legacy file
-with no replayable mark is checked again on read, so an old denial is not
-replayed. A file this client marked replayable was checked at write time
-and is not parsed again for that denial. ``result.html`` and the odds API
-are still judged from the body. This client does not change the User-Agent
-or send credentials.
+Asia/Tokyo is not stored. ``odds/index.html`` is stored only when a price
+was extracted. A shell of ``---.-`` is not stored and is not replayed, even
+when an older file was marked replayable. A caller that already knows the
+race day is today can set ``replay_disabled`` so the odds pages are not
+stored either. HTTP 403, a login wall, and a challenge page are not stored.
+A legacy file with no replayable mark is checked again on read, so an old
+denial is not replayed. A file this client marked replayable was checked at
+write time and is not parsed again for that denial. ``result.html``, the
+odds API, and ``odds/index.html`` are still judged from the body. This
+client does not change the User-Agent or send credentials.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from backend.scrapers.final_odds import odds_api_is_replayable
+from backend.scrapers.final_odds import _has_price_text, odds_api_is_replayable
 from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
@@ -80,12 +82,14 @@ def _result_replayable(url: str, body: str) -> bool:
     A flash or short table fails first. An unsettled page and a provisional
     label fail the finality check. The odds API is replayable only when
     ``status`` is ``result``, the odds map is non-empty, and
-    ``official_datetime`` is not today or later. Other URLs are replayable
-    here; the live-list,
-    live-JRA, and track checks are separate.
+    ``official_datetime`` is not today or later. ``odds/index.html`` is
+    replayable only when a price was extracted. Other URLs are replayable
+    here; the live-list, live-JRA, and track checks are separate.
     """
     if _ODDS_API in url:
         return odds_api_is_replayable(body)
+    if "odds/index.html" in url:
+        return _has_price_text(body)
     if "result.html" not in url:
         return True
     if result_html_is_partial(body):
@@ -286,10 +290,11 @@ class CachingHTTPClient(HTTPClient):
         """A stored body. A non-final result page is not replayed.
 
         A non-result page this client stored is marked replayable, so a later
-        read does not parse it for a denial or for completeness. ``result.html``
-        and the odds API are judged from the body, once per path and mtime,
-        even when that mark is set. A result page must be confirmed and complete.
-        The odds API must have ``status`` ``result``.
+        read does not parse it for a denial or for completeness. ``result.html``,
+        the odds API, and ``odds/index.html`` are judged from the body, once per
+        path and mtime, even when that mark is set. A result page must be
+        confirmed and complete. The odds API must have ``status`` ``result``.
+        An odds index must contain a price.
         """
         path = self._path(key)
         payload = self._load(path)
@@ -308,10 +313,10 @@ class CachingHTTPClient(HTTPClient):
         """False when a result page is not confirmed and complete.
 
         A non-result page with a replayable mark is kept without parsing.
-        ``result.html`` and the odds API are always judged from the body,
-        mark or not.
+        ``result.html``, the odds API, and ``odds/index.html`` are always
+        judged from the body, mark or not.
         """
-        if "result.html" in url or _ODDS_API in url:
+        if "result.html" in url or _ODDS_API in url or "odds/index.html" in url:
             return self._body_is_complete(path, url, body)
         marked = payload.get("replayable")
         if isinstance(marked, bool):

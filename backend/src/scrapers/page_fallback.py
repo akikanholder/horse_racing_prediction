@@ -137,8 +137,23 @@ def looks_like_forbidden_page(html: str) -> bool:
     return len(text) <= 80 and _denial_label(text)
 
 
+def _open_shared_browser() -> object | None:
+    """The JRA Chromium when one is already open. Does not start Playwright."""
+    try:
+        from backend.scrapers.jra_headless import running_shared_session
+    except Exception:
+        return None
+    return running_shared_session()
+
+
 def headless_browser_installed() -> bool:
-    """True when Playwright can launch a Chromium that is already installed."""
+    """True when Chromium is already open, or Playwright can launch one.
+
+    A JRA fetch may already hold the process-wide browser. Starting a second
+    Playwright driver then fails, which is not the same as a missing install.
+    """
+    if _open_shared_browser() is not None:
+        return True
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -147,7 +162,7 @@ def headless_browser_installed() -> bool:
         with sync_playwright() as playwright:
             executable = playwright.chromium.executable_path
     except Exception:
-        return False
+        return _open_shared_browser() is not None
     if not executable:
         return False
     from pathlib import Path
@@ -229,8 +244,19 @@ def render_headless(url: str) -> str:
     Uses the browser's own user agent. A 401/403 response is not retried.
     A race result page waits for the full finishing table. A baba page waits
     for the measurement dropdown the page itself fills. A live track page
-    sends ``Cache-Control: no-cache``.
+    sends ``Cache-Control: no-cache``. When a JRA fetch already opened the
+    shared Chromium, that session renders the page. A second driver is not
+    started.
     """
+    session = _open_shared_browser()
+    if session is not None:
+        getter = getattr(session, "get", None)
+        if not callable(getter):
+            raise HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
+        body = getter(url)
+        if not isinstance(body, str):
+            raise HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
+        return body
     if not headless_browser_installed():
         raise HeadlessUnavailableError(HEADLESS_UNAVAILABLE)
     from playwright.sync_api import sync_playwright

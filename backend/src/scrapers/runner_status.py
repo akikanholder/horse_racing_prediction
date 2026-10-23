@@ -57,7 +57,9 @@ _JSON_URL = re.compile(r"""(?:url|URL|href)\s*[:=]\s*['"]([^'"]+)['"]""")
 _STATUS_PATH = re.compile(r"(shutuba|scratch|cancel|nonrunner|odds|access[do])", re.IGNORECASE)
 _LABEL_TEXT = re.compile(r"(?:\d{1,2}番)?(出走取消|競走除外|取消|除外)\Z")
 _HORSE_NUMBER = re.compile(r"^(?:[1-9]|1[0-8])$")
-_COMBINATION = re.compile(r"^(?:[1-9]|1[0-8])(?:-(?:[1-9]|1[0-8])){0,2}$")
+_COMBINATION = re.compile(
+    r"^(?:[1-9]|1[0-8])(?:-(?:[1-9]|1[0-8])){0,2}$"
+)
 
 
 def compact(text: str) -> str:
@@ -628,9 +630,7 @@ def _apply_combination_cells(
     if hit is not None and hit[0] in _NON_RUNNER:
         marks.withheld.add(combination)
         if "-" not in combination:
-            _add_runner(
-                marks, int(combination), hit[0], hit[1], source=source, fetched_at=fetched_at
-            )
+            _add_runner(marks, int(combination), hit[0], hit[1], source=source, fetched_at=fetched_at)
         return
     if any(is_withheld_token(text) for text in price_bits):
         marks.withheld.add(combination)
@@ -933,7 +933,11 @@ def flag_quotes(
     """
     if runners is None and not withheld and not prefer_runners:
         return quotes
-    scratched = {runner.horse_number for runner in runners or [] if runner.status in _NON_RUNNER}
+    scratched = {
+        runner.horse_number
+        for runner in runners or []
+        if runner.status in _NON_RUNNER
+    }
     updated: list[OddsQuote] = []
     for quote in quotes:
         horses = combination_horses(quote.combination)
@@ -973,9 +977,7 @@ def apply_scratch_page(snapshot: RaceOdds, page: ScratchPage) -> RaceOdds:
     """Prefer a read JRA list. A blocked page leaves the netkeiba list in place."""
     warning = join_warnings(snapshot.warning, page.warning)
     if page.blocked or page.runners is None:
-        quotes = flag_quotes(
-            snapshot.quotes, snapshot.non_runners, page.withheld, prefer_runners=False
-        )
+        quotes = flag_quotes(snapshot.quotes, snapshot.non_runners, page.withheld, prefer_runners=False)
         return snapshot.model_copy(update={"quotes": quotes, "warning": warning})
     quotes = flag_quotes(snapshot.quotes, page.runners, page.withheld, prefer_runners=True)
     return snapshot.model_copy(
