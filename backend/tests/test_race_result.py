@@ -37,6 +37,8 @@ from backend.scrapers.netkeiba_scraper import (
     NetkeibaScraper,
 )
 from backend.scrapers.page_fallback import (
+    BABA_READING_READY_JS,
+    BABA_READING_WAIT_MS,
     RESULT_TABLE_READY_JS,
     RESULT_TABLE_WAIT_MS,
     await_page_ready,
@@ -1456,13 +1458,18 @@ def test_result_headless_waits_for_the_full_table_and_swallows_timeout():
 
     await_page_ready(_Page(), "https://race.netkeiba.com/race/result.html?race_id=1")
     await_page_ready(_Page(), "https://www.jra.go.jp/keiba/baba/index.html")
-    assert waited == [(RESULT_TABLE_READY_JS, RESULT_TABLE_WAIT_MS)]
+    await_page_ready(_Page(), "https://example.test/other")
+    assert waited == [
+        (RESULT_TABLE_READY_JS, RESULT_TABLE_WAIT_MS),
+        (BABA_READING_READY_JS, BABA_READING_WAIT_MS),
+    ]
 
     class _Slow:
         def wait_for_function(self, script: str, timeout: int | None = None) -> None:
             raise TimeoutError("still the early rows")
 
     await_page_ready(_Slow(), "https://race.netkeiba.com/race/result.html?race_id=1")
+    await_page_ready(_Slow(), "https://www.jra.go.jp/keiba/baba/index.html")
 
 
 def test_pre_race_models_do_not_carry_result_fields():

@@ -7,8 +7,12 @@ A race list for today or a later day in Asia/Tokyo is not stored either.
 JRA payout (accessH), odds (accessO), and race-card (accessD) pages for
 today or later, and undated menus on those endpoints, are not stored.
 The netkeiba odds API is stored only when its status is ``result``.
-HTTP 403 and a login wall are not stored. This client does not change the
-User-Agent or send credentials.
+HTTP 403, a login wall, and a challenge page are not stored. A legacy file
+with no replayable mark is checked again on read, so an old denial is not
+replayed. A file this client marked replayable was checked at write time
+and is not parsed again for that denial. ``result.html`` and the odds API
+are still judged from the body. This client does not change the User-Agent
+or send credentials.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
-from backend.scrapers.page_fallback import looks_like_login_wall
+from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
 from backend.utils.date_utils import tokyo_now
 from backend.utils.http_client import HTTPClient
@@ -46,6 +50,24 @@ _DATED_CNAME = re.compile(
     r"|pw151ou\d{2}\d{2}\d{4}\d{2}\d{2}\d{2}(?P<ou>\d{8})"
     r")"
 )
+
+
+def _refused_cache_body(body: object) -> bool:
+    """True when a stored body is a login wall, a 403 page, or a challenge."""
+    if not isinstance(body, str) or not body:
+        return False
+    return looks_like_login_wall(body) or looks_like_forbidden_page(body)
+
+
+def _legacy_refused(payload: dict[str, object]) -> bool:
+    """Check a denial only when this file predates the replayable mark.
+
+    A marked file was accepted at write time. Parsing it again on every read
+    walks the whole document.
+    """
+    if isinstance(payload.get("replayable"), bool):
+        return False
+    return _refused_cache_body(payload.get("body"))
 
 
 def _result_replayable(url: str, body: str) -> bool:
@@ -177,7 +199,7 @@ class CachingHTTPClient(HTTPClient):
             return None
         path = self._path(self._cache_key(method, url, params, data))
         payload = self._load(path)
-        if payload is None:
+        if payload is None or _legacy_refused(payload):
             return None
         body = payload.get("body")
         if not isinstance(body, str) or not body:
@@ -264,9 +286,10 @@ class CachingHTTPClient(HTTPClient):
         """A stored body. A non-final result page is not replayed.
 
         A non-result page this client stored is marked replayable, so a later
-        read does not parse it. ``result.html`` is judged from the body, once
-        per path and mtime, even when that mark is set. The body must be
-        confirmed and complete.
+        read does not parse it for a denial or for completeness. ``result.html``
+        and the odds API are judged from the body, once per path and mtime,
+        even when that mark is set. A result page must be confirmed and complete.
+        The odds API must have ``status`` ``result``.
         """
         path = self._path(key)
         payload = self._load(path)
@@ -274,6 +297,8 @@ class CachingHTTPClient(HTTPClient):
             return None
         body = payload.get("body")
         if not isinstance(body, str) or not body:
+            return None
+        if _legacy_refused(payload):
             return None
         if not self._replayable(path, url, payload, body):
             return None
@@ -283,7 +308,8 @@ class CachingHTTPClient(HTTPClient):
         """False when a result page is not confirmed and complete.
 
         A non-result page with a replayable mark is kept without parsing.
-        ``result.html`` is always judged from the body, mark or not.
+        ``result.html`` and the odds API are always judged from the body,
+        mark or not.
         """
         if "result.html" in url or _ODDS_API in url:
             return self._body_is_complete(path, url, body)
@@ -296,9 +322,10 @@ class CachingHTTPClient(HTTPClient):
         """True when this file may be replayed.
 
         A result page must be confirmed and complete. That rejects a flash,
-        a short order, an unsettled page, and a provisional label. The
-        judgement is remembered for the path and mtime. A new write changes
-        the mtime, so the next read checks the new body.
+        a short order, an unsettled page, and a provisional label. The odds
+        API must report ``result``. The judgement is remembered for the path
+        and mtime. A new write changes the mtime, so the next read checks the
+        new body.
         """
         try:
             mtime = path.stat().st_mtime_ns
@@ -312,7 +339,12 @@ class CachingHTTPClient(HTTPClient):
         return ok
 
     def _store(self, key: str, url: str, body: str) -> None:
-        if not body or looks_like_login_wall(body) or not _result_replayable(url, body):
+        if (
+            not body
+            or looks_like_login_wall(body)
+            or looks_like_forbidden_page(body)
+            or not _result_replayable(url, body)
+        ):
             return
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -127,7 +127,7 @@ def test_page_without_a_year_qualified_clock_does_not_invent_one():
     assert info.measured_at is None
     assert info.is_today is None
     assert info.stale is None
-    assert info.warning is None
+    assert info.warning == JRATrackScraper.CUSHION_UNDATED
 
 
 def test_cached_copy_header_is_a_warning_and_the_number_stays():
@@ -447,7 +447,115 @@ def test_announcement_time_is_not_a_measurement():
     )
     info = _scrape(_Gets(gets={BABA_TOKYO: only_announcement, BABA_KYOTO: _baba("京都")}))
     assert info.measured_at is None
+    assert info.is_today is None
+    assert info.stale is None
+    assert info.warning == JRATrackScraper.CUSHION_UNDATED
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.value == 9.4
+    assert info.turf.cushion.measured_at is None
+
+
+def test_same_line_next_announcement_keeps_the_measurement():
+    seven = datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    assert page_measurement_time("10月18日 7時00分 測定（次回発表 12時）", 2026) == seven
+    assert (
+        page_measurement_time("10月18日 7時00分 測定（次回発表 12時30分）", 2026) == seven
+    )
+    assert page_measurement_time("10月18日 5時30分 測定 発走は15時40分", 2026) == datetime(
+        2026, 10, 18, 5, 30, tzinfo=TOKYO
+    )
+    assert page_measurement_time("10月18日 7時00分発表予定", 2026) is None
+    assert page_measurement_time(
+        "10月18日 15時40分 ブラジルC 発走 10月18日 16時00分 測定", 2026
+    ) == datetime(2026, 10, 18, 16, 0, tzinfo=TOKYO)
+    html = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>クッション値</h2>
+        <div class="content" id="cushion_num"><p><strong>9.1</strong></p></div>
+        <p>10月18日 7時00分 測定（次回発表 12時）</p>
+        """,
+    )
+    info = _scrape(_Gets(gets={BABA_TOKYO: html, BABA_KYOTO: _baba("京都")}))
+    assert info.measured_at == seven
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.value == 9.1
+    assert info.turf.cushion.measured_at == seven
+    assert info.turf.cushion.source == "jra_html"
+    assert info.turf.cushion.fetched_at == PINNED
     assert info.warning is None
+
+
+def test_unlisted_heading_does_not_leak_into_the_moisture_clock():
+    five_thirty = datetime(2026, 10, 18, 5, 30, tzinfo=TOKYO)
+    html = _baba(
+        "東京",
+        """
+        <p>2026年10月18日（日曜） 東京競馬場</p>
+        <h2>クッション値</h2>
+        <div class="content" id="cushion_num"><p><strong>9.1</strong></p></div>
+        <p>10月18日 5時30分</p>
+        <h2>含水率</h2>
+        <table>
+          <tr><th></th><th>ゴール前</th><th>4コーナー</th></tr>
+          <tr><td>芝</td><td>14.7</td><td>12.3</td></tr>
+          <tr><td>ダート</td><td>1.7</td><td>1.5</td></tr>
+          <tr><td>計測情報</td><td>参考</td><td></td></tr>
+        </table>
+        <h4>測定時刻</h4>
+        <select><option>10月18日 5時30分</option></select>
+        <h2>散水情報</h2>
+        <p>10月18日 8時</p>
+        <h2>開催概要 10月18日 9時</h2>
+        """,
+    )
+    info = _scrape(_Gets(gets={BABA_TOKYO: html, BABA_KYOTO: _baba("京都")}))
+    assert info.measured_at == five_thirty
+    assert info.turf is not None and info.turf.moisture is not None
+    assert info.turf.moisture.goal_front == 14.7
+    assert info.turf.moisture.fourth_corner == 12.3
+    assert info.turf.moisture.measured_at == five_thirty
+    assert info.turf.moisture.source == "jra_html"
+    assert info.turf.moisture.fetched_at == PINNED
+    assert info.dirt is not None and info.dirt.moisture is not None
+    assert info.dirt.moisture.goal_front == 1.7
+    assert info.dirt.moisture.fourth_corner == 1.5
+    assert info.dirt.moisture.measured_at == five_thirty
+    assert info.warning is None
+
+
+def test_rendered_baba_page_reads_the_dropdown_clock():
+    """Public index.html after the page's own script fills the measurement lists.
+
+    Saved from ``render_headless`` (browser UA, no-cache, stop on 401/403).
+    The h4 測定時刻 stays inside クッション値 and 含水率.
+    """
+    html = (FIXTURES / "jra_baba_rendered_index.html").read_text(encoding="utf-8")
+    assert 'id="cushion_list"' in html and 'id="moist_list"' in html
+    assert "測定時刻" in html
+    info = _scrape(_Gets(gets={BABA_TOKYO: html, BABA_KYOTO: _baba("京都")}))
+    seven = datetime(2026, 10, 18, 7, 0, tzinfo=TOKYO)
+    five_thirty = datetime(2026, 10, 18, 5, 30, tzinfo=TOKYO)
+    assert info.racecourse == "東京"
+    assert info.measured_at == seven
+    assert info.stale is False
+    assert info.warning is None
+    assert info.turf is not None and info.turf.cushion is not None
+    assert info.turf.cushion.value == 9.2
+    assert info.turf.cushion.measured_at == seven
+    assert info.turf.cushion.source == "jra_html"
+    assert info.turf.cushion.fetched_at == PINNED
+    assert info.turf.moisture is not None
+    assert info.turf.moisture.goal_front == 14.7
+    assert info.turf.moisture.fourth_corner == 12.3
+    assert info.turf.moisture.measured_at == five_thirty
+    assert info.turf.moisture.source == "jra_html"
+    assert info.turf.moisture.fetched_at == PINNED
+    assert info.dirt is not None and info.dirt.moisture is not None
+    assert info.dirt.moisture.goal_front == 1.7
+    assert info.dirt.moisture.fourth_corner == 1.5
+    assert info.dirt.moisture.measured_at == five_thirty
 
 
 def test_wait_fresh_rejects_non_finite_seconds():

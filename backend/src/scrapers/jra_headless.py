@@ -22,6 +22,8 @@ from backend.scrapers.page_fallback import (
     PAGE_LOGIN,
     AccessBlocked,
     HeadlessUnavailableError,
+    await_page_ready,
+    looks_like_forbidden_page,
     looks_like_login_wall,
 )
 from backend.scrapers.track_freshness import cached_copy_warning, fresh_track_headers
@@ -66,8 +68,7 @@ def _denied(status: int | None, body: str) -> AccessBlocked | None:
         return AccessBlocked(status, message)
     if looks_like_login_wall(body):
         return AccessBlocked(401, PAGE_LOGIN)
-    lowered = body.lower()
-    if "captcha" in lowered or "access denied" in lowered:
+    if looks_like_forbidden_page(body):
         return AccessBlocked(403, PAGE_FORBIDDEN)
     return None
 
@@ -194,6 +195,9 @@ class HeadlessSession:
             page.set_extra_http_headers(fresh)
         response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         page._last_response = response
+        status = response.status if response is not None else None
+        if status not in {401, 403}:
+            await_page_ready(page, url)
 
     @staticmethod
     def _submit(page: Any, url: str, fields: dict[str, str]) -> None:
