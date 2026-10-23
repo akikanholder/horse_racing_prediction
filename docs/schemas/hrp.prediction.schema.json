@@ -85,6 +85,7 @@
         "cli_commit": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
         "weights": {
           "type": "array",
+          "description": "Eight weights in this order: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. They sum to 100. Model parameters such as softmax_t belong in rules.",
           "minItems": 8,
           "maxItems": 8,
           "items": {"type": "number", "minimum": 0}
@@ -184,6 +185,7 @@
           "total_score": {"anyOf": [{"type": "null"}, {"type": "number"}]},
           "item_scores": {
             "type": "array",
+            "description": "Eight scores in the same order as run.weights: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. A missing item is null.",
             "minItems": 8,
             "maxItems": 8,
             "items": {"anyOf": [{"type": "null"}, {"type": "number"}]}

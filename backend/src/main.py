@@ -863,7 +863,7 @@ async def show_predictions(
 
 
 @app.post("/api/predictions/settle", tags=["Predictions"])
-async def settle_predictions(
+def settle_predictions(
     date_text: Annotated[str, Query(alias="date", description="YYYYMMDD または YYYY-MM-DD")],
     fetch_mode: JraFetchMode = "html",
 ):

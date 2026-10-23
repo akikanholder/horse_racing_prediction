@@ -22,12 +22,23 @@ from zoneinfo import ZoneInfo
 from backend.models.race import RacePayout, RaceRefund, SettledFinisher, SettledRaceResult
 from backend.services.prediction_validate import (
     DuplicateRecordError,
+    PredictionStoreError,
     PredictionValidationError,
     parse_meeting_date,
     parse_prediction_payload,
     resolve_predictions_dir,
     validate_prediction,
 )
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl. msvcrt.locking is the fallback.
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -94,17 +105,19 @@ class PredictionStore:
         for record in canonical:
             day = date.fromisoformat(record["race"]["date"])
             grouped.setdefault(day, []).append(record)
-        staged: dict[date, list[dict[str, Any]]] = {}
-        for day, incoming in grouped.items():
-            existing = self.read(day)
-            seen = [record["record_id"] for record in existing]
-            for record in incoming:
-                if record["record_id"] in seen:
-                    raise DuplicateRecordError(f"duplicate record_id: {record['record_id']}")
-                seen.append(record["record_id"])
-            staged[day] = existing + incoming
-        for day, lines in staged.items():
-            _atomic_write(self.path_for(day), lines)
+        paths = [self.path_for(day) for day in sorted(grouped)]
+        with _exclusive_locks(paths):
+            staged: dict[date, list[dict[str, Any]]] = {}
+            for day, incoming in grouped.items():
+                existing = self.read(day)
+                seen = [record["record_id"] for record in existing]
+                for record in incoming:
+                    if record["record_id"] in seen:
+                        raise DuplicateRecordError(f"duplicate record_id: {record['record_id']}")
+                    seen.append(record["record_id"])
+                staged[day] = existing + incoming
+            for day, lines in staged.items():
+                _atomic_write(self.path_for(day), lines)
         return canonical
 
     def add_text(self, text: str) -> list[dict[str, Any]]:
@@ -126,33 +139,56 @@ class PredictionStore:
     ) -> dict[str, Any]:
         """Fill pending rows whose race is confirmed and complete.
 
-        Each race is fetched once. A row that is not final is left as written
-        and listed under ``pending``. Already settled rows are not fetched again.
+        Each race is fetched once, outside the file lock. A row that is not
+        final is left as written and listed under ``pending``. Already settled
+        rows are not fetched again. After the fetches, the file is locked and
+        read again. Only ``result`` on the rows that were pending before the
+        fetch is written into that fresh content, so a record appended during
+        the fetch is kept.
         """
-        records = self.read(day)
+        snapshot = self.read(day)
         clock = now or datetime.now
         filled_at = _filled_at(clock())
         cache: dict[str, SettledRaceResult | None] = {}
-        changed = False
-        settled: list[dict[str, str]] = []
-        pending: list[dict[str, Any]] = []
-        updated_rows: list[dict[str, Any]] = []
-        for record in records:
-            outcome = _settle_record(record, fetch, cache, filled_at)
-            updated_rows.append(outcome.record)
-            if outcome.settled_id is not None:
-                changed = True
-                settled.append(outcome.settled_id)
-            if outcome.pending is not None:
-                pending.append(outcome.pending)
-        if changed:
-            _atomic_write(self.path_for(day), updated_rows)
-        return {
+        pending_ids: set[str] = set()
+        for record in snapshot:
+            identity = _identity(record)
+            result = record.get("result")
+            if not isinstance(result, dict) or result.get("status") != "pending":
+                continue
+            if identity.record_id is None:
+                continue
+            pending_ids.add(identity.record_id)
+            if identity.race_id is not None:
+                _cached_fetch(identity.race_id, fetch, cache)
+        report = {
             "date": day.isoformat(),
             "path": str(self.path_for(day)),
-            "settled": settled,
-            "pending": pending,
+            "settled": [],
+            "pending": [],
         }
+        if not pending_ids:
+            return report
+        path = self.path_for(day)
+        with _exclusive_locks([path]):
+            fresh = self.read(day)
+            changed = False
+            updated_rows: list[dict[str, Any]] = []
+            for record in fresh:
+                identity = _identity(record)
+                if identity.record_id not in pending_ids:
+                    updated_rows.append(record)
+                    continue
+                outcome = _settle_record(record, _cache_only(cache), cache, filled_at)
+                updated_rows.append(outcome.record)
+                if outcome.settled_id is not None:
+                    changed = True
+                    report["settled"].append(outcome.settled_id)
+                if outcome.pending is not None:
+                    report["pending"].append(outcome.pending)
+            if changed:
+                _atomic_write(path, updated_rows)
+        return report
 
 
 class _Outcome:
@@ -378,7 +414,7 @@ def _settle_bet(
         names = "、".join(str(number) for number in flagged)
         warnings.append(f"{REFUND_NOT_NON_RUNNER}: {names}")
     if refunded:
-        payout_yen, stake_warning = _refund_payout(bet.get("stake_yen"))
+        payout_yen, stake_warning = _refund_payout(bet.get("status"), bet.get("stake_yen"))
         if stake_warning:
             warnings.append(stake_warning)
         return _line(index, False, True, payout_yen), warnings
@@ -390,7 +426,9 @@ def _settle_bet(
         if len(unique) > 1:
             warnings.append(f"payout rows disagree for {bet['ticket_type']} {label}")
             return _line(index, True, False, None), warnings
-        payout_yen, scale_warning = _scale_payout(unique.pop(), bet.get("stake_yen"))
+        payout_yen, scale_warning = _scale_payout(
+            bet.get("status"), unique.pop(), bet.get("stake_yen")
+        )
         if scale_warning:
             warnings.append(scale_warning)
         return _line(index, True, False, payout_yen), warnings
@@ -441,16 +479,16 @@ def _refund_covers(block: RaceRefund, labels: frozenset[str]) -> bool:
     return any(label in block.bet_types for label in labels)
 
 
-def _refund_payout(stake: Any) -> tuple[int | None, str | None]:
+def _refund_payout(status: Any, stake: Any) -> tuple[int | None, str | None]:
     """返還 returns the stake. The result page does not print a refund price."""
     if isinstance(stake, int) and not isinstance(stake, bool) and stake >= 0:
         return stake, None
-    return None, "stake_yen was not on the record"
+    return None, _missing_stake_warning(status)
 
 
-def _scale_payout(yen_per_100: int, stake: Any) -> tuple[int | None, str | None]:
+def _scale_payout(status: Any, yen_per_100: int, stake: Any) -> tuple[int | None, str | None]:
     if not isinstance(stake, int) or isinstance(stake, bool) or stake < 0:
-        return None, "stake_yen was not on the record"
+        return None, _missing_stake_warning(status)
     product = yen_per_100 * stake
     if product % 100 != 0:
         return None, "payout is not an integer yen"
@@ -485,6 +523,13 @@ def _totals(
     return stake_total, payout_total, float(quantized), warnings
 
 
+def _missing_stake_warning(status: Any) -> str | None:
+    """A reference line may omit stake_yen. A bought line may not."""
+    if status == "reference":
+        return None
+    return "stake_yen was not on the record"
+
+
 def _combo_text(numbers: list[int]) -> str:
     return "-".join(str(number) for number in numbers)
 
@@ -516,6 +561,104 @@ def _assert_prediction_unchanged(before: dict[str, Any], after: dict[str, Any]) 
     right = {key: value for key, value in after.items() if key != "result"}
     if left != right:
         raise RuntimeError("prediction fields changed during settle")
+
+
+def _cache_only(cache: dict[str, SettledRaceResult | None]) -> FetchResult:
+    """Return the result already fetched. Do not open the network again."""
+
+    def fetch(race_id: str) -> SettledRaceResult:
+        if race_id not in cache or cache[race_id] is None:
+            raise PredictionStoreError("settle tried to fetch inside the file lock")
+        fetched = cache[race_id]
+        assert fetched is not None
+        return fetched
+
+    return fetch
+
+
+class _FileLock:
+    """Exclusive lock on a sibling ``*.jsonl.lock`` file.
+
+    Unix uses ``fcntl.flock``. Windows uses ``msvcrt.locking``. A platform
+    with neither refuses the write instead of racing.
+    """
+
+    def __init__(self, data_path: Path):
+        self.lock_path = data_path.with_name(data_path.name + ".lock")
+        self._handle: Any = None
+
+    def __enter__(self) -> _FileLock:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self.lock_path, "a+b")
+        try:
+            _lock_exclusive(self._handle)
+        except Exception:
+            self._handle.close()
+            self._handle = None
+            raise
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            _unlock(handle)
+        finally:
+            handle.close()
+
+
+class _exclusive_locks:
+    """Lock every path, in path order, and release them if one fails."""
+
+    def __init__(self, paths: list[Path]):
+        ordered = sorted({path.resolve() for path in paths}, key=lambda item: str(item))
+        self._locks = [_FileLock(path) for path in ordered]
+        self._held: list[_FileLock] = []
+
+    def __enter__(self) -> _exclusive_locks:
+        try:
+            for lock in self._locks:
+                lock.__enter__()
+                self._held.append(lock)
+        except Exception:
+            self._release()
+            raise
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._release()
+
+    def _release(self) -> None:
+        while self._held:
+            self._held.pop().__exit__(None, None, None)
+
+
+def _lock_exclusive(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        if handle.read(1) == b"":
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    raise PredictionStoreError(
+        "exclusive prediction lock needs fcntl.flock or msvcrt.locking"
+    )
+
+
+def _unlock(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _atomic_write(path: Path, records: list[dict[str, Any]]) -> None:

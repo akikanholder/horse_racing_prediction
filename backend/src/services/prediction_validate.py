@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 from functools import lru_cache
@@ -43,15 +44,74 @@ class DuplicateRecordError(PredictionStoreError):
     """A record_id is already stored for that meeting day."""
 
 
+_SCHEMA_NAME = "hrp.prediction.schema.json"
+
+
 def schema_path() -> Path:
-    """JSON Schema shipped with the repo docs."""
-    return Path(__file__).resolve().parents[3] / "docs" / "schemas" / "hrp.prediction.schema.json"
+    """Filesystem path of the prediction JSON Schema.
+
+    Package data is preferred. A source checkout that has no installed copy
+    falls back to ``docs/schemas``.
+    """
+    packaged = _packaged_schema_path()
+    if packaged is not None:
+        return packaged
+    repo = _repo_schema_path()
+    if repo is not None:
+        return repo
+    raise PredictionValidationError(
+        "hrp.prediction schema was not found in package data or docs/schemas"
+    )
+
+
+def _packaged_schema_path() -> Path | None:
+    """Real file from importlib.resources. Zip extracts are not a stable path."""
+    try:
+        from importlib.resources import as_file, files
+
+        resource = files("backend.services").joinpath(_SCHEMA_NAME)
+        if not resource.is_file():
+            return None
+        with as_file(resource) as extracted:
+            path = Path(extracted)
+            if not path.is_file():
+                return None
+            if path.is_relative_to(Path(tempfile.gettempdir())):
+                return None
+            return path
+    except (FileNotFoundError, ModuleNotFoundError, OSError, TypeError, ValueError):
+        return None
+
+
+def _repo_schema_path() -> Path | None:
+    """Walk ancestors so the docs copy is found from a checkout of any depth."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "docs" / "schemas" / _SCHEMA_NAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _schema_text() -> str:
+    try:
+        from importlib.resources import files
+
+        resource = files("backend.services").joinpath(_SCHEMA_NAME)
+        if resource.is_file():
+            return resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError, TypeError, ValueError):
+        pass
+    path = schema_path()
+    return path.read_text(encoding="utf-8")
 
 
 @lru_cache(maxsize=1)
 def prediction_schema() -> dict[str, Any]:
     """Load the prediction JSON Schema once."""
-    return json.loads(schema_path().read_text(encoding="utf-8"))
+    loaded = json.loads(_schema_text())
+    if not isinstance(loaded, dict):
+        raise PredictionValidationError("hrp.prediction schema must be an object")
+    return loaded
 
 
 def resolve_predictions_dir(explicit: str | Path | None = None) -> Path:

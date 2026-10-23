@@ -1,0 +1,385 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hrp.prediction.schema.json",
+  "title": "hrp.prediction",
+  "description": "One race and one prediction run. rules is free-form and is not interpreted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "record_id",
+    "race",
+    "run",
+    "sources",
+    "horses",
+    "decision",
+    "bets",
+    "result"
+  ],
+  "properties": {
+    "schema": {"const": "hrp.prediction"},
+    "schema_version": {"const": "1.0.0"},
+    "record_id": {
+      "type": "string",
+      "pattern": "^[0-9]{12}_(day_before|pre_post_45m)_[0-9]{8}T[0-9]{6}\\+0900$"
+    },
+    "_example": {"type": "boolean"},
+    "race": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "race_id",
+        "date",
+        "venue",
+        "race_number",
+        "race_name",
+        "surface",
+        "distance_m",
+        "post_time",
+        "field_size",
+        "going",
+        "weather"
+      ],
+      "properties": {
+        "race_id": {"type": "string", "pattern": "^[0-9]{12}$"},
+        "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "venue": {"type": "string", "minLength": 1},
+        "race_number": {"type": "integer", "minimum": 1, "maximum": 12},
+        "race_name": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "surface": {"enum": ["芝", "ダート", "障害"]},
+        "distance_m": {"type": "integer", "minimum": 1, "maximum": 9999},
+        "post_time": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "string",
+              "pattern": "^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T)?[0-9]{2}:[0-9]{2}(?::[0-9]{2})?\\+09:00$"
+            }
+          ]
+        },
+        "field_size": {"type": "integer", "minimum": 1, "maximum": 18},
+        "going": {"anyOf": [{"type": "null"}, {"enum": ["良", "稍重", "重", "不良"]}]},
+        "weather": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["edition", "run_at", "engine", "cli_commit", "weights", "rules"],
+      "properties": {
+        "edition": {"enum": ["day_before", "pre_post_45m"]},
+        "run_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+        },
+        "engine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1}
+          }
+        },
+        "cli_commit": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "weights": {
+          "type": "array",
+          "description": "Eight weights in this order: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. They sum to 100. Model parameters such as softmax_t belong in rules.",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "rules": {
+          "type": "object",
+          "description": "Free-form object recorded as given. This schema does not name its keys.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "provider",
+          "fetched_at",
+          "measured_at",
+          "market_updated_at",
+          "status",
+          "is_today",
+          "stale",
+          "note"
+        ],
+        "properties": {
+          "kind": {
+            "enum": ["odds_win", "odds_combo", "track", "training", "past9", "trends", "card"]
+          },
+          "provider": {"type": "string", "minLength": 1},
+          "fetched_at": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+          },
+          "measured_at": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+              }
+            ]
+          },
+          "market_updated_at": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+              }
+            ]
+          },
+          "status": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+          "is_today": {"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+          "stale": {"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+          "note": {"anyOf": [{"type": "null"}, {"type": "string"}]}
+        }
+      }
+    },
+    "horses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "horse_number",
+          "horse_name",
+          "scratch_status",
+          "total_score",
+          "item_scores",
+          "data_coverage",
+          "plus",
+          "risk",
+          "confidence",
+          "win_prob",
+          "win_prob_range",
+          "fair_odds",
+          "odds_win",
+          "odds_fetched_at",
+          "ev",
+          "ev_conservative",
+          "ability_mark",
+          "buy_mark",
+          "market_view"
+        ],
+        "properties": {
+          "horse_number": {"type": "integer", "minimum": 1, "maximum": 18},
+          "horse_name": {"type": "string", "minLength": 1},
+          "scratch_status": {
+            "anyOf": [
+              {"type": "null"},
+              {"enum": ["entered", "scratched", "excluded", "unknown"]}
+            ]
+          },
+          "total_score": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "item_scores": {
+            "type": "array",
+            "description": "Eight scores in the same order as run.weights: 近走, 血統, 脚質, 調教, 馬場, 枠, 騎手, 展開. A missing item is null.",
+            "minItems": 8,
+            "maxItems": 8,
+            "items": {"anyOf": [{"type": "null"}, {"type": "number"}]}
+          },
+          "data_coverage": {"anyOf": [{"type": "null"}, {"type": "number", "minimum": 0, "maximum": 1}]},
+          "plus": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "risk": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "confidence": {"anyOf": [{"type": "null"}, {"enum": ["高", "中", "低"]}]},
+          "win_prob": {"anyOf": [{"type": "null"}, {"type": "number", "minimum": 0, "maximum": 1}]},
+          "win_prob_range": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "number", "minimum": 0, "maximum": 1}
+              }
+            ]
+          },
+          "fair_odds": {"anyOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+          "odds_win": {"anyOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+          "odds_fetched_at": {
+            "anyOf": [
+              {"type": "null"},
+              {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+              }
+            ]
+          },
+          "ev": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "ev_conservative": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "ability_mark": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+          "buy_mark": {"anyOf": [{"type": "null"}, {"enum": ["◎", "○", "▲", "△", "☆"]}]},
+          "market_view": {
+            "anyOf": [{"type": "null"}, {"enum": ["過小評価", "妥当", "過剰人気"]}]
+          }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pass_race", "ability_top", "reason"],
+      "properties": {
+        "pass_race": {"type": "boolean"},
+        "ability_top": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1, "maximum": 18}]},
+        "reason": {"anyOf": [{"type": "null"}, {"type": "string"}]}
+      }
+    },
+    "bets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ticket_type",
+          "combination",
+          "prob",
+          "odds",
+          "odds_min",
+          "odds_max",
+          "ev",
+          "ev_conservative",
+          "stake_yen",
+          "status",
+          "reason"
+        ],
+        "properties": {
+          "ticket_type": {"enum": ["win", "wide", "quinella", "trio"]},
+          "combination": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {"type": "integer", "minimum": 1, "maximum": 18}
+          },
+          "prob": {"anyOf": [{"type": "null"}, {"type": "number", "minimum": 0, "maximum": 1}]},
+          "odds": {"anyOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+          "odds_min": {"anyOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+          "odds_max": {"anyOf": [{"type": "null"}, {"type": "number", "exclusiveMinimum": 0}]},
+          "ev": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "ev_conservative": {"anyOf": [{"type": "null"}, {"type": "number"}]},
+          "stake_yen": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+          "status": {"enum": ["bought", "reference"]},
+          "reason": {"anyOf": [{"type": "null"}, {"type": "string"}]}
+        }
+      }
+    },
+    "result": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {"status": {"const": "pending"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "result_phase",
+            "complete",
+            "filled_at",
+            "finishes",
+            "payouts",
+            "settlement",
+            "warning"
+          ],
+          "properties": {
+            "status": {"const": "settled"},
+            "result_phase": {"const": "confirmed"},
+            "complete": {"const": true},
+            "filled_at": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\+09:00$"
+            },
+            "finishes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["horse_number", "rank", "status", "dead_heat"],
+                "properties": {
+                  "horse_number": {
+                    "anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1, "maximum": 18}]
+                  },
+                  "rank": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+                  "status": {
+                    "anyOf": [
+                      {"type": "null"},
+                      {
+                        "enum": [
+                          "finished",
+                          "scratched",
+                          "excluded",
+                          "did_not_finish",
+                          "disqualified",
+                          "unknown"
+                        ]
+                      }
+                    ]
+                  },
+                  "dead_heat": {"type": "boolean"}
+                }
+              }
+            },
+            "payouts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["ticket_type", "combination", "yen_per_100"],
+                "properties": {
+                  "ticket_type": {"enum": ["win", "wide", "quinella", "trio"]},
+                  "combination": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "items": {"type": "integer", "minimum": 1, "maximum": 18}
+                  },
+                  "yen_per_100": {"type": "integer", "minimum": 1}
+                }
+              }
+            },
+            "settlement": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["bets", "stake_total_yen", "payout_total_yen", "roi"],
+              "properties": {
+                "bets": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["index", "hit", "refunded", "payout_yen"],
+                    "properties": {
+                      "index": {"type": "integer", "minimum": 0},
+                      "hit": {"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+                      "refunded": {"type": "boolean"},
+                      "payout_yen": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]}
+                    }
+                  }
+                },
+                "stake_total_yen": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+                "payout_total_yen": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+                "roi": {"anyOf": [{"type": "null"}, {"type": "number"}]}
+              }
+            },
+            "warning": {"anyOf": [{"type": "null"}, {"type": "string"}]}
+          }
+        }
+      ]
+    }
+  }
+}

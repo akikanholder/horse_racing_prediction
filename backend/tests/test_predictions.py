@@ -1,6 +1,7 @@
 """Prediction JSONL store: validate, append, and settle from confirmed results."""
 
 import json
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from backend.models.race import RacePayout, RaceRefund, SettledFinisher, Settled
 from backend.services.prediction_store import (
     DuplicateRecordError,
     PredictionStore,
+    PredictionStoreError,
     PredictionValidationError,
 )
 from backend.services.prediction_validate import (
@@ -149,6 +151,42 @@ def _winner_card() -> SettledRaceResult:
     return _settled(
         results=[_finish(7, 1), _finish(3, 2), _finish(1, 3)],
         payouts=[_payout("単勝", "7", 360)],
+    )
+
+
+def _mp_add(directory: str, record: dict) -> str:
+    """Child process: append one record and report ok or duplicate."""
+    try:
+        PredictionStore(directory).add([record])
+    except DuplicateRecordError:
+        return "duplicate"
+    except Exception as exc:
+        return f"error:{type(exc).__name__}:{exc}"
+    return "ok"
+
+
+def _mp_settle(directory: str, started: str, release: str, report_path: str) -> None:
+    """Child process: block inside the result fetch until ``release`` exists."""
+    seen: list[str] = []
+
+    def fetch(race_id: str) -> SettledRaceResult:
+        seen.append(race_id)
+        Path(started).write_text(race_id, encoding="utf-8")
+        deadline = time.time() + 20
+        while not Path(release).exists():
+            if time.time() > deadline:
+                raise TimeoutError("settle fetch was not released")
+            time.sleep(0.02)
+        return _winner_card()
+
+    report = PredictionStore(directory).settle(
+        datetime.strptime(DAY, "%Y-%m-%d").date(),
+        fetch,
+        now=lambda: CLOCK,
+    )
+    Path(report_path).write_text(
+        json.dumps({"report": report, "fetched": seen}, ensure_ascii=False),
+        encoding="utf-8",
     )
 
 
@@ -548,3 +586,154 @@ def test_api_add_show_settle_and_duplicate(tmp_path: Path, monkeypatch: pytest.M
         assert client.get("/api/predictions", params={"date": "20261018"}).json()["records"][0]["result"][
             "status"
         ] == "settled"
+
+
+def test_reference_without_stake_does_not_warn(tmp_path: Path):
+    bets = [
+        _bet("win", [7], stake=100),
+        _bet("win", [7], status="reference", stake=None),
+        _bet("win", [4], status="reference", stake=None),
+    ]
+    store = _store(tmp_path)
+    store.add([_with_bets(bets)])
+    fetched = _settled(
+        results=[_finish(7, 1), _finish(4, None, "scratched")],
+        payouts=[_payout("単勝", "7", 360)],
+    )
+    _settle(store, lambda _race_id: fetched)
+    result = store.read(datetime.strptime(DAY, "%Y-%m-%d").date())[0]["result"]
+    lines = result["settlement"]["bets"]
+    assert lines[1]["hit"] is True
+    assert lines[1]["payout_yen"] is None
+    assert lines[2]["refunded"] is True
+    assert lines[2]["payout_yen"] is None
+    assert result["warning"] is None
+    assert result["settlement"]["stake_total_yen"] == 100
+    assert result["settlement"]["payout_total_yen"] == 360
+    assert result["settlement"]["roi"] == 2.6
+
+
+def test_concurrent_adds_of_distinct_records_all_persist(tmp_path: Path):
+    import multiprocessing
+
+    records = []
+    for number in range(1, 13):
+        record = _with_bets([_bet("win", [7])], race_id=f"2026101808{number:02d}")
+        record["race"]["race_number"] = number
+        records.append(record)
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(len(records)) as pool:
+        jobs = [pool.apply_async(_mp_add, (str(tmp_path), record)) for record in records]
+        results = [job.get(timeout=60) for job in jobs]
+    assert results == ["ok"] * 12
+    stored = PredictionStore(tmp_path).read(datetime.strptime(DAY, "%Y-%m-%d").date())
+    assert len(stored) == 12
+    assert {row["record_id"] for row in stored} == {row["record_id"] for row in records}
+
+
+def test_concurrent_adds_of_the_same_record_id_keep_one(tmp_path: Path):
+    import multiprocessing
+
+    record = _example()
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(6) as pool:
+        jobs = [pool.apply_async(_mp_add, (str(tmp_path), record)) for _ in range(6)]
+        results = [job.get(timeout=60) for job in jobs]
+    assert sorted(results) == ["duplicate"] * 5 + ["ok"]
+    stored = PredictionStore(tmp_path).read(datetime.strptime(DAY, "%Y-%m-%d").date())
+    assert [row["record_id"] for row in stored] == [record["record_id"]]
+
+
+def test_add_during_settle_keeps_the_added_record(tmp_path: Path):
+    import multiprocessing
+
+    store = _store(tmp_path)
+    original = store.add([_example()])[0]
+    started = tmp_path / "fetch-started"
+    release = tmp_path / "fetch-release"
+    report_path = tmp_path / "settle-report.json"
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=_mp_settle,
+        args=(str(tmp_path), str(started), str(release), str(report_path)),
+    )
+    proc.start()
+    try:
+        deadline = time.time() + 20
+        while not started.exists():
+            if proc.exitcode is not None:
+                raise AssertionError(f"settle exited early: {proc.exitcode}")
+            if time.time() > deadline:
+                raise AssertionError("settle did not reach the fetch")
+            time.sleep(0.02)
+        extra = _with_bets([_bet("win", [1])], race_id="202610180812")
+        extra["race"]["race_number"] = 12
+        store.add([extra])
+        release.write_text("go", encoding="utf-8")
+        proc.join(30)
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+    assert proc.exitcode == 0
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["fetched"] == [RACE_ID]
+    rows = store.read(datetime.strptime(DAY, "%Y-%m-%d").date())
+    by_id = {row["record_id"]: row for row in rows}
+    assert set(by_id) == {original["record_id"], extra["record_id"]}
+    assert by_id[original["record_id"]]["result"]["status"] == "settled"
+    assert by_id[extra["record_id"]]["result"] == {"status": "pending"}
+
+
+def test_windows_lock_uses_msvcrt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import backend.services.prediction_store as store_mod
+
+    calls: list[int] = []
+
+    class _Msvcrt:
+        LK_LOCK = 0
+        LK_UNLCK = 1
+
+        def locking(self, fd: int, mode: int, length: int) -> None:
+            assert length == 1
+            calls.append(mode)
+
+    monkeypatch.setattr(store_mod, "fcntl", None)
+    monkeypatch.setattr(store_mod, "msvcrt", _Msvcrt())
+    PredictionStore(tmp_path).add([_example()])
+    assert calls[0] == _Msvcrt.LK_LOCK
+    assert _Msvcrt.LK_UNLCK in calls
+    assert PredictionStore(tmp_path).read(datetime.strptime(DAY, "%Y-%m-%d").date())
+
+
+def test_missing_file_lock_is_a_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import backend.services.prediction_store as store_mod
+
+    monkeypatch.setattr(store_mod, "fcntl", None)
+    monkeypatch.setattr(store_mod, "msvcrt", None)
+    with pytest.raises(PredictionStoreError, match="fcntl.flock or msvcrt.locking"):
+        PredictionStore(tmp_path).add([_example()])
+    assert list(tmp_path.glob("*.jsonl")) == []
+
+
+def test_schema_path_uses_package_data_and_repo_fallback(monkeypatch: pytest.MonkeyPatch):
+    import backend.services.prediction_validate as validate
+
+    path = schema_path()
+    assert path.is_file()
+    assert path.name == "hrp.prediction.schema.json"
+    assert prediction_schema()["properties"]["run"]["properties"]["weights"]["maxItems"] == 8
+    docs = Path(__file__).resolve().parents[2] / "docs" / "schemas" / "hrp.prediction.schema.json"
+    packaged = Path(__file__).resolve().parents[1] / "src" / "services" / "hrp.prediction.schema.json"
+    assert packaged.read_bytes() == docs.read_bytes()
+    monkeypatch.setattr(validate, "_packaged_schema_path", lambda: None)
+    assert validate.schema_path() == docs
+
+
+def test_contract_states_weight_order_and_softmax_in_rules():
+    text = (Path(__file__).resolve().parents[2] / "docs" / "ev-contract.md").read_text(encoding="utf-8")
+    section = text.split("`run.weights` の並びは次のとおり。", 1)[1].split("###", 1)[0]
+    order = ["近走", "血統", "脚質", "調教", "馬場", "枠", "騎手", "展開"]
+    positions = [section.index(name) for name in order]
+    assert positions == sorted(positions)
+    assert "softmax_t" in section

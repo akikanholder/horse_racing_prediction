@@ -935,7 +935,9 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 ディレクトリは `--dir`、無ければ環境変数 `HRP_PREDICTIONS_DIR`、それも無ければカレントの `predictions`。API は `--dir` を受けず、環境変数か既定の `predictions`。
 
-書き込みは同じディレクトリの一時ファイルへ出してから置き換える。行の順は保つ。変わった行が無いときはファイルを書き換えない。
+書き込みは開催日ごとに、隣の `{日付}.jsonl.lock` を排他ロックしてからファイルを読み直す。重複の `record_id` はそのロックの中で見て、どのファイルも変えない。同じ `record_id` を複数プロセスが同時に足したときは、一つだけ成功する。ロックは Unix では `fcntl.flock`、Windows では `msvcrt.locking`。どちらも無い環境では書き込まず、`exclusive prediction lock needs fcntl.flock or msvcrt.locking` を返す。読み直したあと、同じディレクトリの一時ファイルへ出してから置き換える。行の順は保つ。変わった行が無いときはファイルを書き換えない。
+
+`settle` は確定結果の取得をロックの外で、レースごとに一度だけ行う。取得が終わってから同じロックを取り、ファイルを読み直し、取得を始める前に pending だった行の `result` だけを、読み直した内容へ書く。取得のあいだに足された行は残し、その取得では精算しない。401 / 403 とログインは取り直さない。
 
 ### 識別と単位
 
@@ -943,7 +945,22 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 時刻は ISO 8601 でオフセット `+09:00`。ナイーブ時刻と他のオフセットは拒否する。`race.post_time` は `15:40+09:00` のように時刻だけでも、日付付きでもよい。
 
-確率と EV は小数。`0.36` は +36%。オッズは倍率。金額は整数の円。距離はメートル。`weights` は 8 個で合計 100。`item_scores` も 8 個。欠測は null。金額も着順も払戻も作らない。
+確率と EV は小数。`0.36` は +36%。オッズは倍率。金額は整数の円。距離はメートル。`weights` は 8 個で合計 100。`item_scores` も 8 個で、同じ順。欠測は null。金額も着順も払戻も作らない。
+
+`run.weights` の並びは次のとおり。添字 0 から 7。このツールは重みで点数を計算しない。
+
+| 添字 | 項目 |
+|---|---|
+| 0 | 近走 |
+| 1 | 血統 |
+| 2 | 脚質 |
+| 3 | 調教 |
+| 4 | 馬場 |
+| 5 | 枠 |
+| 6 | 騎手 |
+| 7 | 展開 |
+
+`softmax_t` のようなモデルのパラメータは `weights` に入れない。`rules` に書く。
 
 `schema` は `hrp.prediction`。`schema_version` は `1.0.0`。
 
@@ -953,7 +970,7 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 `race`: `race_id`（netkeiba の12桁）、`date`、`venue`、`race_number`、`race_name`、`surface`（芝/ダート/障害）、`distance_m`、`post_time`、`field_size`、`going`（良/稍重/重/不良）、`weather`。レース名、発走、馬場、天候は無いとき null。
 
-`run`: `edition`（`day_before` または `pre_post_45m`）、`run_at`、`engine`（`name` と `version`）、`cli_commit`、`weights`、`rules`。`rules` はオブジェクトなら何でも残す。中のキーはこのツールでは定めない。
+`run`: `edition`（`day_before` または `pre_post_45m`）、`run_at`、`engine`（`name` と `version`）、`cli_commit`、`weights`、`rules`。`weights` の順は上の8項目。`rules` はオブジェクトなら何でも残す。中のキーはこのツールでは定めない。`softmax_t` もここ。
 
 `sources[]`: `kind`（`odds_win` / `odds_combo` / `track` / `training` / `past9` / `trends` / `card`）、`provider`、`fetched_at`、`measured_at`、`market_updated_at`、`status`、`is_today`、`stale`、`note`。測定時刻と市場の更新時刻、状態、当日、鮮度、注記は無いとき null。
 
@@ -998,7 +1015,7 @@ EV が決めた予想を、開催日ごとの JSONL に残し、レース後に�
 
 的中は払戻表にその組があるとき。組の並びがページと逆でも、馬番の集合が同じならその行を使う。その馬券種の行が一つでもあり、組が無いときは外れで `payout_yen` は 0。その馬券種の行がページに無いときは `hit` も `payout_yen` も null。同じ組の金額が食い違うときは `hit` は true、`payout_yen` は null。`payout rows disagree for {ticket_type} {combination}`。
 
-当たったときの `payout_yen` は `yen_per_100 * stake_yen / 100`。整数の円にならないときは null。`payout is not an integer yen`。`stake_yen` が null のときは null。`stake_yen was not on the record`。
+当たったときの `payout_yen` は `yen_per_100 * stake_yen / 100`。整数の円にならないときは null。`payout is not an integer yen`。`bought` で `stake_yen` が null のときは null。`stake_yen was not on the record`。`reference` で `stake_yen` が null のときは `payout_yen` を null にし、その警告は出さない。
 
 返還は、組のどれかが着順の `scratched` または `excluded` のとき、その券を全部返還にする。取得の `refunds` がその馬番を含み、`bet_types` が null かその券種を名指ししているときも返還にする。`bet_types` が空の配列のときは、その印字だけでは返還にしない。印字された券種の外へは広げない。`hit` は false、`refunded` は true。ページは返還の金額を出さない。`payout_yen` は記録にある `stake_yen`（賭け金が戻る）。`stake_yen` が null のときだけ `payout_yen` も null。入着馬が返還に出ているときは `refund horses are not scratched or excluded: 5`。中止と失格は返還にしない。
 

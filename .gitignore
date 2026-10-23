@@ -222,5 +222,8 @@ __marimo__/
 *.jsonl
 backend/csv_output/
 
+# Default directory for prediction JSONL (`predictions add`)
+predictions/
+
 # Cached public pages for historical date ranges
 backend/.cache/
