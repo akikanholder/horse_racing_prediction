@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 import backend.scrapers.page_cache as page_cache
 from backend.scrapers.jra_scraper import JRAScraper
@@ -571,7 +571,10 @@ for (const item of cases) {
   global.document = {
     querySelectorAll(sel) {
       const texts = sel.startsWith("span[id") ? item.cells : item.headings;
-      return texts.map((text) => ({ textContent: text }));
+      return texts.map((text) => ({
+        textContent: text,
+        getClientRects: () => [{ width: 1, height: 1 }],
+      }));
     },
   };
   if (Boolean(ready()) !== item.expect) {
@@ -598,6 +601,141 @@ for (const item of cases) {
     assert completed.returncode == 0, completed.stderr
 
 
+def _dom_json(html: str) -> str:
+    """Element tree the odds-ready script can query, including layout boxes."""
+
+    def node(el) -> dict:
+        children = []
+        own: list[str] = []
+        for child in el.children:
+            if isinstance(child, NavigableString):
+                own.append(str(child))
+            elif getattr(child, "name", None):
+                children.append(node(child))
+        classes = el.get("class") or []
+        return {
+            "tag": el.name,
+            "id": el.get("id") or "",
+            "className": " ".join(classes) if isinstance(classes, list) else str(classes),
+            "style": el.get("style") or "",
+            "own": "".join(own),
+            "children": children,
+        }
+
+    soup = BeautifulSoup(html, "lxml")
+    root = soup.body if soup.body is not None else soup
+    return json.dumps(node(root))
+
+
+def _odds_cells_ready(html: str) -> bool:
+    node = shutil.which("node")
+    assert node
+    probe = """
+const ready = eval(process.argv[1]);
+const root = JSON.parse(process.argv[2]);
+function link(el, parent) {
+  el.parent = parent;
+  el.children.forEach((child) => link(child, el));
+}
+link(root, null);
+function textContent(el) {
+  return el.own + el.children.map(textContent).join("");
+}
+function styleHides(style) {
+  const compact = String(style || "").replace(/\\s+/g, "").toLowerCase();
+  return compact.includes("display:none") || compact.includes("visibility:hidden");
+}
+function hidden(el) {
+  for (let cur = el; cur; cur = cur.parent) {
+    if (styleHides(cur.style)) return true;
+  }
+  return false;
+}
+function hasBox(el) {
+  if (hidden(el)) return false;
+  if (el.own.replace(/\\s+/g, "")) return true;
+  if (el.children.some(hasBox)) return true;
+  // A wrapper whose children are all hidden collapses. A visible leaf,
+  // including an empty odds cell, still has a box.
+  return el.children.length === 0;
+}
+function matches(el, sel) {
+  const attr = sel.match(/^(\\w+)\\[id\\^="([^"]+)"\\]$/);
+  if (attr) return el.tag === attr[1] && el.id.startsWith(attr[2]);
+  const cls = sel.match(/^(\\w+)\\.([\\w-]+)$/);
+  if (cls) {
+    return el.tag === cls[1] && el.className.split(/\\s+/).includes(cls[2]);
+  }
+  return false;
+}
+function walk(el, visit) {
+  visit(el);
+  el.children.forEach((child) => walk(child, visit));
+}
+function element(el) {
+  return {
+    textContent: textContent(el),
+    getClientRects: () => (hasBox(el) ? [{ width: 1, height: 1 }] : []),
+  };
+}
+global.document = {
+  querySelectorAll(selector) {
+    const parts = selector.split(",").map((part) => part.trim());
+    const found = [];
+    walk(root, (el) => {
+      if (parts.some((part) => matches(el, part))) found.push(element(el));
+    });
+    return found;
+  },
+};
+process.stdout.write(ready() ? "true" : "false");
+"""
+    completed = subprocess.run(
+        [node, "-e", probe, ODDS_CELL_READY_JS, _dom_json(html)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip() == "true"
+
+
+def test_hidden_oddsmin_spans_do_not_block_readiness():
+    html = (FIXTURES / "odds_hidden_oddsmin.html").read_text(encoding="utf-8")
+    assert 'id="oddsmin-4-0102" style="display: none;"' in html
+    assert html.count('id="oddsmin-') >= 8
+    assert _odds_cells_ready(html) is True
+    still_loading = html.replace(">12.4<", ">---.-<", 1)
+    assert _odds_cells_ready(still_loading) is False
+    visible_empty = html.replace(
+        '<span id="odds-4-0103">8.1</span>',
+        '<span id="odds-4-0103"></span>',
+        1,
+    )
+    assert _odds_cells_ready(visible_empty) is False
+
+
+def test_my_challenge_form_is_not_a_challenge_token():
+    story = "story " * 40
+    aliased = (
+        "<html><head><title>出馬表</title></head><body>"
+        f'<form id="my-challenge-form"></form><div class="my-challenge-form"></div>{story}'
+        "</body></html>"
+    )
+    assert page_block_reason(aliased) is None
+    assert looks_like_forbidden_page(aliased) is False
+    exact = (
+        "<html><head><title>出馬表</title></head><body>"
+        f'<form name="challenge-form"></form>{story}</body></html>'
+    )
+    assert page_block_reason(exact) == "challenge"
+    classes = (
+        "<html><head><title>出馬表</title></head><body>"
+        f'<div class="panel cf-browser-verification"></div>{story}</body></html>'
+    )
+    assert page_block_reason(classes) == "challenge"
+
+
 def test_prediction_fixtures_stay_tracked():
     root = Path(__file__).resolve().parents[2]
     fixture = Path("backend/tests/fixtures/predictions/example_record.json")
@@ -616,6 +754,7 @@ def test_prediction_fixtures_stay_tracked():
 
     assert ignored(fixture.as_posix()) is False
     assert ignored("backend/tests/fixtures/predictions/another_record.json") is False
+    assert ignored("backend/tests/fixtures/predictions/20261018.jsonl.lock") is True
     assert ignored("backend/predictions/out.json") is True
     assert ignored("predictions/out.json") is True
 

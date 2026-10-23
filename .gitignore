@@ -229,6 +229,8 @@ predictions/
 # re-included unless the directory itself is un-ignored first.
 !backend/tests/fixtures/predictions/
 !backend/tests/fixtures/predictions/**
+# The exception above re-includes lock files. Keep those ignored.
+backend/tests/fixtures/predictions/*.jsonl.lock
 
 # Cached public pages for historical date ranges
 backend/.cache/

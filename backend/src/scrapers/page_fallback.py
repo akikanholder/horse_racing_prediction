@@ -127,12 +127,13 @@ _CAPTCHA_LABEL = re.compile(r"captcha|キャプチャ|画像認証", re.IGNORECA
 _FORBIDDEN_LABEL = re.compile(r"\baccess\s+denied\b|\b403\s*forbidden\b", re.IGNORECASE)
 _SHORT_FORBIDDEN = re.compile(r"^(?:403|forbidden|403\s*forbidden)$", re.IGNORECASE)
 _CLOUDFLARE_TITLE = re.compile(r"just a moment(?:\.\.\.|…)", re.IGNORECASE)
-# A challenge form, id, or class. ``cf-challenge`` is a prefix, so
-# ``cf-challenge-running`` counts. ``class="cf-browser-verification"`` counts.
+# A challenge form, id, or class. The token starts the attribute value or
+# follows whitespace, so ``cf-challenge-running`` counts and
+# ``my-challenge-form`` does not. ``class="cf-browser-verification"`` counts.
 # Cloudflare also injects ``/cdn-cgi/challenge-platform/scripts/jsd/main.js``
 # into ordinary pages. That script tag is not a challenge page.
 _CHALLENGE_FORM = re.compile(
-    r"""\b(?:id|name|class)\s*=\s*['"][^'"]*\b"""
+    r"""\b(?:id|name|class)\s*=\s*['"](?:[^'"]*\s)?"""
     r"""(?:cf-challenge[\w-]*|challenge-form|cf-browser-verification)(?![\w-])""",
     re.IGNORECASE,
 )
@@ -200,10 +201,11 @@ def _page_labels(html: str) -> tuple[BeautifulSoup, str, str, str]:
 def page_block_reason(html: str) -> BlockedReason | None:
     """Why this document is a refusal, or None when it is a normal page.
 
-    A captcha title is ``captcha``. A challenge form, id, or class
+    A captcha title is ``captcha``. A challenge form, id, or class token
     (``cf-challenge`` as a prefix, including ``cf-challenge-running``,
-    ``challenge-form``, ``cf-browser-verification``), the exact title
-    「Just a moment...」, or the exact title 「Attention Required! | Cloudflare」
+    ``challenge-form``, ``cf-browser-verification``) is ``challenge``.
+    ``my-challenge-form`` is a different name and is not. The exact title
+    「Just a moment...」 or the exact title 「Attention Required! | Cloudflare」
     is ``challenge``. ``window._cf_chl_opt`` and ``__cf_chl_opt`` are a
     challenge only when the page has no real content. The script
     ``/cdn-cgi/challenge-platform/scripts/jsd/main.js`` is not a challenge.
@@ -323,15 +325,17 @@ RESULT_TABLE_READY_JS = """() => {
 
 # Odds pages paint ``---.-`` and fill the cells from the page's own script.
 # One filled cell, or a final heading while other cells are still ``---.-``,
-# is not ready. ``----`` is a printed withheld mark. A timeout is the shell.
-# The caller parses it and does not invent a price.
+# is not ready. Hidden nodes do not count: umaren and sanrenpuku pages leave
+# empty ``oddsmin-`` spans (``display: none``) inside ``span.Odds``. ``----``
+# is a printed withheld mark. A timeout is the shell. The caller parses it
+# and does not invent a price.
 ODDS_CELL_WAIT_MS = 12_000
 ODDS_CELL_READY_JS = """() => {
   const compact = (el) => (el.textContent || '').replace(/\\s+/g, '');
   const loading = new Set(['---.-', '']);
   const nodes = Array.from(document.querySelectorAll(
     'span[id^="odds-"], span[id^="oddsmin-"], span[id^="oddsmax-"], td.Odds, span.Odds'
-  ));
+  )).filter((el) => el.getClientRects().length > 0);
   if (!nodes.length) return false;
   return nodes.every((el) => !loading.has(compact(el)));
 }"""
@@ -355,8 +359,9 @@ def await_page_ready(page: object, url: str) -> None:
 
     A result URL waits for the full finishing table. An odds URL waits until
     every visible odds cell is filled. One number, or a final heading while
-    other cells are still ``---.-`` or empty, does not end the wait. ``----``
-    is a withheld mark and counts as filled. No odds cells means keep waiting.
+    other cells are still ``---.-`` or empty, does not end the wait. A hidden
+    empty ``oddsmin-`` span does not count. ``----`` is a withheld mark and
+    counts as filled. No visible odds cells means keep waiting.
     A baba URL waits for the measurement dropdown. Anything else returns
     immediately. A timeout is the page still short. The caller parses that
     document and does not fetch again.
