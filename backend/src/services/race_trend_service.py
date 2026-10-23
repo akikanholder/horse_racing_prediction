@@ -114,7 +114,7 @@ class RaceTrendService:
         Production leaves it empty so each horse id is read once from the
         existing pedigree code.
         """
-        computed_at = datetime.now()
+        computed_at = tokyo_now()
         selected: list[str] = []
         for venue in venues or []:
             text = _text(venue)
