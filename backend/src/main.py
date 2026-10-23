@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator
 
@@ -20,6 +20,13 @@ from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
 from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
+from backend.services.prediction_store import (
+    DuplicateRecordError,
+    PredictionStore,
+    PredictionValidationError,
+    parse_meeting_date,
+    resolve_predictions_dir,
+)
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -127,6 +134,8 @@ async def root():
             "venues": "/api/venues",
             "tracks": "/api/tracks",
             "race_csv_export": "/api/races/export?date=YYYY-MM-DD",
+            "predictions": "/api/predictions?date=YYYYMMDD",
+            "predictions_settle": "/api/predictions/settle?date=YYYYMMDD",
         },
     }
 
@@ -791,6 +800,97 @@ async def get_venue_schedules():
     except Exception as e:
         logger.error(f"Failed to get venue schedules: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _prediction_store() -> PredictionStore:
+    return PredictionStore(resolve_predictions_dir())
+
+
+def _prediction_error(exc: PredictionValidationError, *, status_code: int = 422) -> HTTPException:
+    return HTTPException(status_code=status_code, detail=str(exc))
+
+
+@app.post("/api/predictions", tags=["Predictions"])
+async def add_prediction(request: Request):
+    """予想記録を検証して開催日の JSONL へ追記する。
+
+    本体は1件のオブジェクト、またはその配列。``result`` は pending。
+    同じ ``record_id`` は 409。検証失敗は 422。ファイルは変えない。
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="prediction body must be JSON") from exc
+    if isinstance(body, dict):
+        records = [body]
+    elif isinstance(body, list):
+        records = body
+    else:
+        raise HTTPException(status_code=422, detail="prediction body must be an object or a list")
+    try:
+        stored = _prediction_store().add(records)
+    except DuplicateRecordError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc) from exc
+    except Exception as exc:
+        logger.error("Failed to add prediction: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    days = sorted({record["race"]["date"] for record in stored})
+    store = _prediction_store()
+    return {
+        "records": stored,
+        "paths": [str(store.path_for(date.fromisoformat(day))) for day in days],
+    }
+
+
+@app.get("/api/predictions", tags=["Predictions"])
+async def show_predictions(
+    date_text: Annotated[str, Query(alias="date", description="YYYYMMDD または YYYY-MM-DD")],
+):
+    """開催日の予想記録。ファイルが無い日は空の配列。"""
+    try:
+        day = parse_meeting_date(date_text)
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    try:
+        return _prediction_store().show(day)
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc) from exc
+    except Exception as exc:
+        logger.error("Failed to show predictions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/predictions/settle", tags=["Predictions"])
+def settle_predictions(
+    date_text: Annotated[str, Query(alias="date", description="YYYYMMDD または YYYY-MM-DD")],
+    fetch_mode: JraFetchMode = "html",
+):
+    """pending のうち、確定かつ complete のレースだけ result を埋める。
+
+    取得は ``GET /api/races/{race_id}/result`` と同じ。1レース1回。
+    未確定は pending のまま報告する。401 / 403 とログインは取り直さない。
+    """
+    if not race_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        day = parse_meeting_date(date_text)
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    try:
+        return _prediction_store().settle(
+            day,
+            lambda race_id: race_service.get_settled_race_result(  # type: ignore[union-attr]
+                race_id,
+                **_mode_arg(fetch_mode),
+            ),
+        )
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc) from exc
+    except Exception as exc:
+        logger.error("Failed to settle predictions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":

@@ -18,6 +18,12 @@ from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
 from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
+from backend.services.prediction_store import (
+    PredictionStore,
+    PredictionValidationError,
+    parse_meeting_date,
+    resolve_predictions_dir,
+)
 from backend.services.race_service import RaceService
 from backend.services.track_info_service import TrackInfoService
 
@@ -878,6 +884,72 @@ def _rate_text(row: TrendBucket) -> str:
     )
 
 
+def _prediction_store(args) -> PredictionStore:
+    return PredictionStore(resolve_predictions_dir(getattr(args, "dir", None)))
+
+
+def _read_prediction_text(file_name: str) -> str:
+    if file_name == "-":
+        return sys.stdin.read()
+    path = Path(file_name)
+    if not path.is_file():
+        raise PredictionValidationError(f"prediction file not found: {file_name}")
+    return path.read_text(encoding="utf-8")
+
+
+def cmd_predictions_add(args):
+    """Validate prediction records and append them. Duplicates are rejected."""
+    store = _prediction_store(args)
+    stored = store.add_text(_read_prediction_text(args.file))
+    if args.json:
+        print_json(stored)
+        return
+    for record in stored:
+        day = date.fromisoformat(record["race"]["date"])
+        print(f"追記 {record['record_id']} -> {store.path_for(day)}")
+
+
+def cmd_predictions_show(args):
+    """Print one meeting day's prediction records."""
+    store = _prediction_store(args)
+    shown = store.show(parse_meeting_date(args.date))
+    if args.json:
+        print_json(shown)
+        return
+    print(f"\n=== 予想記録 {shown['date']} ({len(shown['records'])}件) ===")
+    if not shown["records"]:
+        print("なし")
+        return
+    for record in shown["records"]:
+        race = record["race"]
+        result = record.get("result") or {}
+        print(
+            f"{record['record_id']} {race.get('venue') or ''} "
+            f"{race.get('race_number')}R {record['run']['edition']} "
+            f"result={result.get('status')}"
+        )
+
+
+def cmd_predictions_settle(args):
+    """Fill pending results from the existing settled-race fetch. One fetch per race."""
+    store = _prediction_store(args)
+    day = parse_meeting_date(args.date)
+    with _open_service(RaceService, args) as service:
+        report = store.settle(day, lambda race_id: service.get_settled_race_result(race_id))
+    if args.json:
+        print_json(report)
+        return
+    print(f"\n=== 予想の精算 {report['date']} ===")
+    print(f"確定にした記録: {len(report['settled'])}")
+    for item in report["settled"]:
+        print(f"  {item['record_id']}")
+    print(f"未確定のまま: {len(report['pending'])}")
+    for item in report["pending"]:
+        phase = item["result_phase"] or "不明"
+        warning = item["warning"] or ""
+        print(f"  {item['record_id']} {phase} complete={item['complete']} {warning}".rstrip())
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with _open_service(RaceService, args) as service:
@@ -1180,6 +1252,47 @@ def main():
     )
     trends_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     trends_parser.set_defaults(func=cmd_trends)
+
+    predictions_parser = subparsers.add_parser(
+        "predictions",
+        help="予想記録の保存と、確定結果への精算",
+        description=(
+            "EV が書いた予想を開催日ごとの JSONL に残す。"
+            "確率、期待値、買うかどうか、金額、rules の中身はこのコマンドでは計算しない。"
+            "settle は既存の確定結果の取得が confirmed かつ complete のときだけ result を埋める。"
+            "それ以外は行を変えず、報告する。401 / 403 とログインは取り直さない。"
+        ),
+    )
+    pred_sub = predictions_parser.add_subparsers(dest="predictions_command", required=True)
+
+    def _prediction_flags(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--dir",
+            help="JSONL のディレクトリ。無ければ HRP_PREDICTIONS_DIR、それも無ければ ./predictions",
+        )
+        target.add_argument("--json", action="store_true", help="JSON形式で出力")
+
+    add_parser = pred_sub.add_parser(
+        "add",
+        help="検証して追記する。同じ record_id は拒否する",
+    )
+    add_parser.add_argument("file", help="JSON、JSON配列、または JSONL。- は標準入力")
+    _prediction_flags(add_parser)
+    add_parser.set_defaults(func=cmd_predictions_add)
+
+    show_parser = pred_sub.add_parser("show", help="開催日の予想記録を表示する")
+    show_parser.add_argument("--date", required=True, help="YYYYMMDD または YYYY-MM-DD")
+    _prediction_flags(show_parser)
+    show_parser.set_defaults(func=cmd_predictions_show)
+
+    settle_parser = pred_sub.add_parser(
+        "settle",
+        parents=[jra_flags],
+        help="確定かつ complete のレースだけ result を埋める",
+    )
+    settle_parser.add_argument("--date", required=True, help="YYYYMMDD または YYYY-MM-DD")
+    _prediction_flags(settle_parser)
+    settle_parser.set_defaults(func=cmd_predictions_settle)
 
     args = parser.parse_args()
 
