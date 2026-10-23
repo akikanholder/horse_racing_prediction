@@ -374,12 +374,15 @@ class RaceService:
         date_to: date | None = None,
         recent_meeting: bool = False,
         as_of: date | None = None,
+        today: bool = False,
         fetch_mode: str | None = None,
     ) -> RaceTrendReport:
         """Win, top-2, top-3, and ROI tables over settled history.
 
-        The rows come from ``history`` and the local page cache. A missing
-        price or sire stays null. A 403 or a login wall is not retried.
+        The rows come from ``history`` and the local page cache. ``today`` is
+        one meeting day in Asia/Tokyo. Only a confirmed and complete result
+        is counted. A missing price or sire stays null. A 403 or a login wall
+        is not retried. A non-final result page is fetched again on the next run.
         """
         mode = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
         with RaceTrendService(fetch_mode=mode) as service:
@@ -394,6 +397,7 @@ class RaceService:
                 date_to=date_to,
                 recent_meeting=recent_meeting,
                 as_of=as_of,
+                today=today,
             )
 
     def get_race_odds(

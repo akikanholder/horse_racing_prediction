@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -534,13 +535,12 @@ def test_page_cache_skips_a_second_fetch_and_keeps_fetched_at(tmp_path: Path):
             return "<html><body>確定オッズ</body></html>"
 
     client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
-    first = client.get("https://race.netkeiba.com/race/result.html", params={"race_id": RACE_ID})
-    second = client.get("https://race.netkeiba.com/race/result.html", params={"race_id": RACE_ID})
+    url = "https://race.netkeiba.com/race/shutuba.html"
+    first = client.get(url, params={"race_id": RACE_ID})
+    second = client.get(url, params={"race_id": RACE_ID})
     assert first == second
-    assert calls == ["https://race.netkeiba.com/race/result.html"]
-    stamped = client.cached_fetched_at(
-        "GET", "https://race.netkeiba.com/race/result.html", {"race_id": RACE_ID}
-    )
+    assert calls == [url]
+    stamped = client.cached_fetched_at("GET", url, {"race_id": RACE_ID})
     assert stamped is not None
 
 
@@ -673,6 +673,107 @@ def test_partial_result_html_is_not_cached(tmp_path: Path):
     cached.get(url, params={"race_id": RACE_ID})
     assert calls == [url]
 
+    calls.clear()
+    unsettled = _load("netkeiba_race_result_unsettled.html")
+    open_page = CachingHTTPClient(
+        tmp_path / "unsettled", transport=_Transport(unsettled), min_request_interval=0
+    )
+    open_page.get(url, params={"race_id": RACE_ID})
+    open_page.get(url, params={"race_id": RACE_ID})
+    assert calls == [url, url]
+    assert open_page.cached_fetched_at("GET", url, {"race_id": RACE_ID}) is None
+
+    calls.clear()
+    stale = CachingHTTPClient(
+        tmp_path / "stale", transport=_Transport(full), min_request_interval=0
+    )
+    key = stale._cache_key("GET", url, {"race_id": RACE_ID}, None)
+    path = stale._path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"url": url, "fetched_at": "2026-10-18T10:00:00", "body": unsettled},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert stale.get(url, params={"race_id": RACE_ID}) == full
+    assert calls == [url]
+    assert stale.cached_fetched_at("GET", url, {"race_id": RACE_ID}) is not None
+
+
+def test_todays_race_list_is_not_replayed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.scrapers.page_cache.tokyo_now",
+        lambda: datetime(2026, 10, 18, 16, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+    calls: list[str] = []
+
+    class _Transport:
+        def get(self, url, params=None, headers=None, encoding=None):
+            day = None if params is None else params.get("kaisai_date")
+            calls.append(day or url)
+            return "<html></html>"
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            raise AssertionError("post")
+
+    client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    url = "https://race.netkeiba.com/top/race_list.html"
+    client.get(url, params={"kaisai_date": "20261018"})
+    client.get(url, params={"kaisai_date": "20261018"})
+    assert calls == ["20261018", "20261018"]
+    calls.clear()
+    client.get(url, params={"kaisai_date": "20261017"})
+    client.get(url, params={"kaisai_date": "20261017"})
+    assert calls == ["20261017"]
+    calls.clear()
+    sub = "https://race.netkeiba.com/top/race_list_sub.html?kaisai_date=20261018&current_group=1"
+    client.get(sub)
+    client.get(sub)
+    assert calls == [sub, sub]
+
+
+def test_today_jra_pages_and_prerace_odds_are_not_replayed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "backend.scrapers.page_cache.tokyo_now",
+        lambda: datetime(2026, 10, 18, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+    calls: list[str] = []
+
+    class _Transport:
+        def get(self, url, params=None, headers=None, encoding=None):
+            calls.append(url)
+            return '{"status":"middle","data":""}'
+
+        def post(self, url, data=None, headers=None, encoding=None):
+            calls.append(str((data or {}).get("cname") or url))
+            return "<html></html>"
+
+    client = CachingHTTPClient(tmp_path, transport=_Transport(), min_request_interval=0)
+    payout = "https://www.jra.go.jp/JRADB/accessH.html"
+    today = {"cname": "pw01hde10052026040820261018/A4"}
+    past = {"cname": "pw01hde10052026040820261017/A4"}
+    client.post(payout, data=today)
+    client.post(payout, data=today)
+    client.post(payout, data=past)
+    client.post(payout, data=past)
+    odds = "https://race.netkeiba.com/api/api_get_jra_odds.html"
+    client.get(odds, params={"race_id": "202605040801", "type": "1"})
+    client.get(odds, params={"race_id": "202605040801", "type": "1"})
+    card = "https://www.jra.go.jp/JRADB/accessD.html"
+    client.post(card, data={"cname": "pw01dli00/F3"})
+    client.post(card, data={"cname": "pw01dli00/F3"})
+    assert calls == [
+        "pw01hde10052026040820261018/A4",
+        "pw01hde10052026040820261018/A4",
+        "pw01hde10052026040820261017/A4",
+        odds,
+        odds,
+        "pw01dli00/F3",
+        "pw01dli00/F3",
+    ]
+
 
 def test_login_wall_is_not_cached(tmp_path: Path):
     calls: list[int] = []
@@ -694,8 +795,7 @@ def test_cached_login_wall_and_forbidden_page_are_not_replayed(tmp_path: Path):
         "<form><input type='password'></form></body></html>"
     )
     forbidden = (
-        "<html><head><title>403 Forbidden</title></head>"
-        "<body><h1>Access Denied</h1></body></html>"
+        "<html><head><title>403 Forbidden</title></head><body><h1>Access Denied</h1></body></html>"
     )
     ok = "<html><head><title>結果</title></head><body>確定オッズ 403円</body></html>"
 
@@ -758,6 +858,9 @@ def test_cached_login_wall_and_forbidden_page_are_not_replayed(tmp_path: Path):
         assert client.cached_fetched_at("GET", url) == datetime.fromisoformat("2026-10-18T07:00:00")
     finally:
         monkeypatch.undo()
+
+
+def test_jra_odds_chain_reads_same_site_json_and_stops_on_403():
     shutuba = (
         "<html><body><a onclick=\"doAction('/JRADB/accessO.html','pw01ode0105202501010120250105/AB');\">"
         "オッズ</a></body></html>"
@@ -818,8 +921,7 @@ def test_round_title_is_not_a_denial_and_a_challenge_stops():
     )
     assert looks_like_forbidden_page(derby) is False
     forbidden = (
-        "<html><head><title>403 Forbidden</title></head>"
-        "<body><h1>Access Denied</h1></body></html>"
+        "<html><head><title>403 Forbidden</title></head><body><h1>Access Denied</h1></body></html>"
     )
     assert looks_like_forbidden_page(forbidden) is True
     challenge = (
@@ -1265,11 +1367,96 @@ def test_race_list_follows_the_date_script_and_not_a_made_up_group():
     assert http.calls[2]["encoding"] == "utf-8"
 
 
-def test_race_list_with_links_does_not_open_the_date_script():
+def test_race_list_shell_falls_back_to_inline_links_when_the_date_list_has_no_sub():
     html = """
     <div class="RaceList_DataList">
       <a href="/race/shutuba.html?race_id=202605030811">11R 芝1600m</a>
     </div>
+    <script>getDateList("race_list_get_date_list.html", selectDate, function(){});</script>
+    """
+
+    class _HTTP:
+        def __init__(self):
+            self.urls: list[str] = []
+            self.encodings: list[str | None] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.urls.append(url)
+            self.encodings.append(encoding)
+            return html
+
+    http = _HTTP()
+    scraper = NetkeibaScraper(http_client=http, headless_render="off")  # type: ignore[arg-type]
+    races = scraper.get_races_by_date(date(2026, 10, 17))
+    assert [race.race_id for race in races] == ["202605030811"]
+    assert http.urls == [
+        "https://race.netkeiba.com/top/race_list.html",
+        "https://race.netkeiba.com/top/race_list_get_date_list.html",
+    ]
+    assert http.encodings[0] == "utf-8"
+
+
+def test_race_list_shell_uses_the_sub_list_and_not_a_stray_race_id():
+    shell = """
+    <html><body>
+    <a href="/race/result.html?race_id=202605030899">注目</a>
+    <script>getDateList("race_list_get_date_list.html", selectDate, function(){});</script>
+    </body></html>
+    """
+    dates = """
+    <ul><li class="Active">
+      <a href="race_list_sub.html?kaisai_date=20261018&current_group=1020261018">10/18</a>
+    </li></ul>
+    """
+    sub = """
+    <dl>
+      <dt><p class="RaceList_DataTitle"><small>4回</small> 東京 <small>8日目</small></p></dt>
+      <dd><ul>
+        <li class="RaceList_DataItem">
+          <a href="../race/shutuba.html?race_id=202605040801&rf=race_list">
+            <span class="ItemTitle">2歳未勝利</span>
+            <div class="RaceData"><span>芝1600m</span><span class="RaceList_Itemnumber">16頭</span></div>
+          </a>
+        </li>
+      </ul></dd>
+    </dl>
+    """
+
+    class _HTTP:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.urls.append(url)
+            if url.endswith("/top/race_list.html"):
+                return shell
+            if url.endswith("race_list_get_date_list.html"):
+                return dates
+            if "race_list_sub.html" in url:
+                assert "kaisai_date=20261018" in url
+                return sub
+            raise AssertionError(url)
+
+    scraper = NetkeibaScraper(http_client=_HTTP(), headless_render="off")  # type: ignore[arg-type]
+    races = scraper.get_races_by_date(date(2026, 10, 18))
+    assert [race.race_id for race in races] == ["202605040801"]
+    assert races[0].venue == "東京"
+    assert races[0].race_date == date(2026, 10, 18)
+
+
+def test_rendered_race_list_items_do_not_open_the_date_script():
+    html = """
+    <dl>
+      <dt><p class="RaceList_DataTitle"><small>4回</small> 東京 <small>8日目</small></p></dt>
+      <dd><ul>
+        <li class="RaceList_DataItem">
+          <a href="../race/shutuba.html?race_id=202605040801">
+            <span class="ItemTitle">未勝利</span>
+            <div class="RaceData"><span>芝1600m</span></div>
+          </a>
+        </li>
+      </ul></dd>
+    </dl>
     <script>getDateList("race_list_get_date_list.html", selectDate, function(){});</script>
     """
 
@@ -1283,9 +1470,53 @@ def test_race_list_with_links_does_not_open_the_date_script():
 
     http = _HTTP()
     scraper = NetkeibaScraper(http_client=http, headless_render="off")  # type: ignore[arg-type]
-    races = scraper.get_races_by_date(date(2026, 10, 17))
-    assert [race.race_id for race in races] == ["202605030811"]
+    races = scraper.get_races_by_date(date(2026, 10, 18))
+    assert [race.race_id for race in races] == ["202605040801"]
     assert http.urls == ["https://race.netkeiba.com/top/race_list.html"]
+
+
+def test_date_range_includes_the_end_day():
+    seen: list[date] = []
+
+    class _List:
+        def get_races_by_date(self, target):
+            seen.append(target)
+            return []
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(),
+        delay_seconds=0,
+    )
+    batch = service.get(date_from=date(2026, 10, 17), date_to=date(2026, 10, 18))
+    assert seen == [date(2026, 10, 17), date(2026, 10, 18)]
+    assert batch.date_from == date(2026, 10, 17)
+    assert batch.date_to == date(2026, 10, 18)
+    assert batch.races == []
+    assert batch.warning == "no meeting on 2026-10-17; no meeting on 2026-10-18"
+
+
+def test_race_list_failure_is_not_reported_as_an_empty_meeting():
+    class _List:
+        def get_races_by_date(self, target):
+            raise RuntimeError("down")
+
+        def close(self):
+            return None
+
+    service = HistoricalService(
+        netkeiba=_List(),  # type: ignore[arg-type]
+        jra=_JraPages(None),  # type: ignore[arg-type]
+        odds=_Odds(),
+        delay_seconds=0,
+    )
+    batch = service.get(on_date=date(2026, 10, 18))
+    assert batch.warning == "race list failed for 2026-10-18"
+    assert batch.races == []
 
 
 def test_race_list_sub_403_is_not_swallowed():

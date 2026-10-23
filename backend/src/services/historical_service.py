@@ -46,6 +46,7 @@ from backend.scrapers.netkeiba_scraper import (
 from backend.scrapers.page_cache import CachingHTTPClient, default_page_cache_dir
 from backend.scrapers.page_fallback import AccessBlocked
 from backend.scrapers.runner_status import flag_quotes, join_warnings, merge_non_runners
+from backend.utils.date_utils import tokyo_now
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +159,13 @@ class HistoricalService:
 
         A 403 or a login wall on the race list or the result page stops the
         range. That request is not retried, and later races are not opened.
-        Pages already stored in the cache are not requested again. ``resume_from``
-        loads earlier races from the cache only.
+        A confirmed and complete result page already stored in the cache is
+        not requested again. A result page that is not final is not a cache
+        hit, so a later run can read the settled page. ``resume_from`` loads
+        earlier races from the cache only. ``progress.json`` is written on
+        export and is not a cursor this method reads.
         """
-        fetched_at = datetime.now()
+        fetched_at = tokyo_now()
         selected = _venue_filter(venues, priority_venues)
         if race_id:
             record, blocked = self._one(race_id, fetched_at)
@@ -194,6 +198,8 @@ class HistoricalService:
                 warning=None if record.in_scope else record.warning,
             )
 
+        # The span is inclusive. ``date_to`` is the last meeting day, including
+        # today in Asia/Tokyo. There is no past-only cut.
         start, end, range_warning = _resolve_span(on_date, date_from, date_to)
         if start is None or end is None:
             return HistoricalBatch(
@@ -226,6 +232,9 @@ class HistoricalService:
                 logger.warning("Race list failed for %s: %s", day, exc)
                 notes.append(f"race list failed for {day.isoformat()}")
                 listed = []
+            else:
+                if not listed:
+                    notes.append(f"no meeting on {day.isoformat()}")
             for race in listed:
                 if not _list_row_in_play(race, selected, flat_only):
                     skipped += 1
@@ -270,7 +279,7 @@ class HistoricalService:
                 if network_started and self.delay_seconds > 0:
                     self._sleeper(self.delay_seconds)
                 network_started = True
-            record, blocked = self._one(planned_id, datetime.now())
+            record, blocked = self._one(planned_id, tokyo_now())
             record = _apply_scope(record, venues=selected, flat_only=flat_only)
             if blocked:
                 notes.append(_stop_line(planned_id, record.result.warning))
@@ -443,7 +452,11 @@ class HistoricalService:
         ), blocked
 
     def _result_cached(self, race_id: str) -> bool:
-        """True when the result page is already on disk. A 403 is not cached."""
+        """True when a final result page is already on disk.
+
+        A 403 is not cached. An unsettled, provisional, or incomplete
+        ``result.html`` is not a hit, so the next run fetches it again.
+        """
         client = self.http
         if client is None:
             candidate = getattr(self.netkeiba, "http_client", None)
@@ -521,7 +534,7 @@ class HistoricalService:
         return quotes, runners, "netkeiba_live", None
 
     def _fetch_bet(self, race_id: str, bet_type: BetType) -> RaceOdds:
-        fetched_at = datetime.now()
+        fetched_at = tokyo_now()
         fetch = {
             "win": self.odds.get_win_odds,
             "place": self.odds.get_place_odds,

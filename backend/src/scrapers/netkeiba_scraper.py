@@ -1250,8 +1250,9 @@ def result_html_is_partial(html: str) -> bool:
 
     The early flash is partial. So is a table whose rows that ran are short
     of the printed ``N頭`` after 取消 and 除外. A page with no finish table
-    is unsettled and is not partial, so it may stay cached. A five-horse
-    ``HorseList`` table that matches ``N頭`` is complete.
+    is unsettled. A five-horse ``HorseList`` table that matches ``N頭`` is
+    not partial. Neither an unsettled page nor a partial page is a final
+    result; ``result_html_is_final`` is what the cache may replay.
     """
     soup = BeautifulSoup(html, "lxml")
     if _is_flash_table(soup):
@@ -1274,6 +1275,49 @@ def result_html_is_partial(html: str) -> bool:
         if "取消" in label or "除外" in label:
             non_runners += 1
     return len(rows) - non_runners < starters - non_runners
+
+
+class _NoFetch:
+    """Stand-in client so a finality check cannot open a URL."""
+
+    def get(
+        self,
+        url: str,
+        params: dict | None = None,
+        headers: dict | None = None,
+        encoding: str | None = None,
+    ) -> str:
+        raise RuntimeError("result finality does not fetch")
+
+    def post(
+        self,
+        url: str,
+        data: dict | None = None,
+        headers: dict | None = None,
+        encoding: str | None = None,
+    ) -> str:
+        raise RuntimeError("result finality does not fetch")
+
+    def close(self) -> None:
+        return None
+
+
+def result_html_is_final(html: str) -> bool:
+    """True only when this result document is confirmed and complete.
+
+    A flash table, a short order, an unsettled page, and a provisional label
+    are not final. The check parses the HTML already in hand. It does not
+    fetch, and it does not read a cached copy.
+    """
+    if result_html_is_partial(html):
+        return False
+    scraper = NetkeibaScraper(http_client=cast(HTTPClient, _NoFetch()), headless_render="off")
+    settled = scraper._parse_settled_race_result(
+        BeautifulSoup(html, "lxml"),
+        race_id="",
+        fetched_at=datetime.min,
+    )
+    return settled.complete is True and settled.result_phase == "confirmed"
 
 
 def _non_runner_count(results: list[SettledFinisher]) -> int:
@@ -1855,14 +1899,18 @@ class NetkeibaScraper(BaseScraper):
 
         try:
             list_url = f"{self.BASE_URL}/top/race_list.html"
-            soup = self.fetch_page(list_url, params={"kaisai_date": date_str})
-            if looks_like_login_wall(str(soup)):
+            headers = {**self.BROWSER_HEADERS, "Referer": f"{self.BASE_URL}/top/"}
+            html = self.http_client.get(
+                list_url,
+                params={"kaisai_date": date_str},
+                headers=headers,
+                encoding="utf-8",
+            )
+            if looks_like_login_wall(html):
                 raise AccessBlocked(401, "requires login")
-            races = self._races_from_list_soup(soup, target_date)
-            if not races and self._shell_calls_date_list(soup):
-                sub = self._fetch_race_list_sub(date_str, list_url)
-                if sub is not None:
-                    races = self._races_from_list_soup(sub, target_date)
+            races = self._races_on_date(
+                BeautifulSoup(html, "lxml"), target_date, date_str, list_url
+            )
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if isinstance(e, AccessBlocked) or status in {401, 403}:
@@ -1874,6 +1922,28 @@ class NetkeibaScraper(BaseScraper):
             unique_races.values(),
             key=lambda race: (race.venue, race.race_number, race.race_id),
         )
+
+    def _races_on_date(
+        self, soup: BeautifulSoup, target_date: date, date_str: str, list_url: str
+    ) -> list[Race]:
+        """The card for ``target_date``.
+
+        ``li.RaceList_DataItem`` rows are the card. A shell that calls the
+        date list is not, even when a pickup link carries a race id. Follow
+        that URL, and use the sub-list when it has races. A 403 or a login
+        wall propagates. If the date list has no sub-list, the inline links
+        are the card.
+        """
+        items = [node for node in soup.select("li.RaceList_DataItem") if isinstance(node, Tag)]
+        if items:
+            return self._races_from_data_items(items, target_date)
+        if self._shell_calls_date_list(soup):
+            sub = self._fetch_race_list_sub(date_str, list_url)
+            if sub is not None:
+                listed = self._races_from_list_soup(sub, target_date)
+                if listed:
+                    return listed
+        return self._races_from_links(soup, target_date)
 
     def _shell_calls_date_list(self, soup: BeautifulSoup) -> bool:
         """True when the shell's own script asks for the date list."""
@@ -1973,7 +2043,9 @@ class NetkeibaScraper(BaseScraper):
             if not race_name:
                 race_name = f"{race_number}R"
             distance, track_type = self._extract_distance_info(self._distance_text(item))
-            venue_code, venue, round_number, day_number = self._meeting_from_item(item, link, race_id)
+            venue_code, venue, round_number, day_number = self._meeting_from_item(
+                item, link, race_id
+            )
             heads = item.select_one(".RaceList_Itemnumber")
             entry_count = None
             if isinstance(heads, Tag):

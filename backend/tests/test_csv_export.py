@@ -254,17 +254,29 @@ def test_get_races_for_date_filters_and_merges():
     assert by_id["202609270501"].post_time == "15:40+09:00"
 
 
-def test_netkeiba_races_by_date_uses_requested_date(monkeypatch):
+def test_netkeiba_races_by_date_uses_requested_date():
     html = """
     <div class="RaceList_DataList">
       <a href="/race/shutuba.html?race_id=202605030811">11R 芝1600m</a>
       <a href="/race/result.html?race_id=202609020611">阪神 6R ダート1800m</a>
     </div>
     """
-    scraper = NetkeibaScraper()
-    monkeypatch.setattr(scraper, "fetch_page", lambda url, params=None: __import__("bs4").BeautifulSoup(html, "lxml"))
+
+    class _HTTP:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        def get(self, url, params=None, headers=None, encoding=None):
+            self.urls.append(url)
+            assert params == {"kaisai_date": "20260927"}
+            assert encoding == "utf-8"
+            return html
+
+    http = _HTTP()
+    scraper = NetkeibaScraper(http_client=http, headless_render="off")  # type: ignore[arg-type]
 
     races = scraper.get_races_by_date(TARGET)
+    assert http.urls == ["https://race.netkeiba.com/top/race_list.html"]
     by_id = {race.race_id: race for race in races}
     assert set(by_id) == {"202605030811", "202609020611"}
     assert all(race.race_date == TARGET for race in races)
@@ -283,9 +295,7 @@ def test_export_api_writes_csv_and_returns_summary(tmp_path: Path, monkeypatch):
     with TestClient(app) as client:
         import backend.main as main_module
 
-        main_module.race_service = FakeRaceService(
-            [_race("202609270501", "東京", 1, "API杯")]
-        )
+        main_module.race_service = FakeRaceService([_race("202609270501", "東京", 1, "API杯")])
         main_module.track_info_service = FakeTrackService()
         response = client.post("/api/races/export", params={"date": "2026-09-27"})
 
