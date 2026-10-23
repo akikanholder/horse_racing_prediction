@@ -5,6 +5,7 @@ The winning ticket is checked against the payout. A missing market stays null.
 """
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,6 +38,12 @@ FIXTURES = Path(__file__).parent / "fixtures"
 RACE_ID = "202502020101"
 TOKYO = ZoneInfo("Asia/Tokyo")
 FETCHED = datetime(2026, 10, 12, 9, 0, tzinfo=TOKYO)
+_CLOCK = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _prices(snapshot: FinalRaceOdds) -> str:
+    """JSON with clocks removed, so a timestamp like 41.140 cannot look like odds 1.1."""
+    return _CLOCK.sub("", snapshot.model_dump_json())
 
 
 def _load(name: str) -> str:
@@ -345,7 +352,7 @@ def test_confirmed_race_returns_final_combination_odds():
     assert by_key[("sanrenpuku", "1-3-5")].odds == 40.6
     assert all(quote.source == "jra_html" for quote in snapshot.quotes)
     assert all(quote.bet_type != "win" for quote in snapshot.quotes)
-    assert "1.1" not in snapshot.model_dump_json()
+    assert "1.1" not in _prices(snapshot)
 
 
 def test_payout_disagreement_keeps_the_printed_odds():
@@ -426,7 +433,7 @@ def test_live_board_is_not_copied_onto_a_confirmed_race():
     assert snapshot.result_phase == "confirmed"
     assert snapshot.complete is True
     assert snapshot.warning == ("combination odds were not on the page: wide, umaren, sanrenpuku")
-    dumped = snapshot.model_dump_json()
+    dumped = _prices(snapshot)
     assert "1.1" not in dumped
     assert "99.9" not in dumped
 
