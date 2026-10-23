@@ -64,7 +64,8 @@ logger = logging.getLogger(__name__)
 
 _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
 _MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
-_SECTION_STOPS = ("使用コース", "芝コースの様子", "芝の状態")
+# These names end the open section at any heading level, and also as a row label.
+_SECTION_STOPS = ("使用コース", "芝コースの様子", "芝の状態", "散水情報")
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _HEADING_LEVEL = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 # A plain-text section name is the same level as the live page's h2 header.
@@ -78,11 +79,15 @@ def measurement_sections(text: str) -> dict[str, str]:
     """Text of the 馬場状態, cushion, and moisture sections.
 
     週間情報 is a weather note. Its clock, including ``8時現在``, is not a
-    track measurement. A heading element ends the section only when it is the
-    same level or higher than the heading that opened it. An ``h4`` such as
-    測定時刻 inside an ``h2`` stays in the section, and so does the dropdown
-    under it. A data cell that merely contains 計測情報 is not a heading.
-    Clocks are collected only from 馬場状態, クッション値, and 含水率.
+    track measurement. A known section name ends the open section at any
+    heading level, and also when that name is a row or a label rather than a
+    heading tag. Those names are 週間情報, 使用コース, 芝の状態, and 散水情報.
+    An ``h3`` 週間情報 under an ``h2`` therefore leaves 含水率. An unknown
+    heading ends the section only when it is the same level or higher. An
+    ``h4`` 測定時刻 inside クッション値 or 含水率 stays in the section, and so
+    does the dropdown under it. A data cell that merely contains 計測情報 is
+    not a heading. Clocks are collected only from 馬場状態, クッション値, and
+    含水率.
     """
     buckets: dict[str, list[str]] = {}
     current: str | None = None
@@ -91,7 +96,8 @@ def measurement_sections(text: str) -> dict[str, str]:
         opened = _section_heading(line)
         if opened is not None:
             name, level = opened
-            if current in _MEASUREMENT_SECTIONS and level > current_level:
+            nested = current in _MEASUREMENT_SECTIONS and name == "other" and level > current_level
+            if nested:
                 buckets.setdefault(current, []).append(_section_visible(line))
                 continue
             current = name
@@ -150,9 +156,11 @@ def _section_visible(line: str) -> str:
 def _section_heading(line: str) -> tuple[str, int] | None:
     """Section a line opens, and the heading level that opened it.
 
-    A ``§`` prefix marks an HTML heading element. An unlisted title at the
-    same level or higher still ends the previous section. A word in a data
-    row does not. Clocks are kept only for the three measurement sections.
+    A ``§`` prefix marks an HTML heading element. A known section name ends
+    the previous section even when the heading is deeper, and even when the
+    name is only a row label. An unlisted title at the same level or higher
+    still ends the previous section. A word in a data row, such as 計測情報,
+    does not. Clocks are kept only for the three measurement sections.
     """
     raw = line.strip()
     if raw.startswith("§"):
@@ -177,7 +185,12 @@ def _section_heading(line: str) -> tuple[str, int] | None:
 
 
 def _named_section(compact: str) -> str | None:
-    """Known section name, or None when this line is not one of them."""
+    """Known section name, or None when this line is not one of them.
+
+    A stop such as 散水情報 matches a heading and a row label. It does not
+    match a sentence that merely mentions 散水 later in the line. 週間情報
+    matches anywhere in the line, including an ``h3`` under an ``h2``.
+    """
     if "週間情報" in compact:
         return "週間情報"
     if "クッション値" in compact:
@@ -187,7 +200,7 @@ def _named_section(compact: str) -> str | None:
     if compact.startswith("馬場状態"):
         return "馬場状態"
     for name in _SECTION_STOPS:
-        if compact == name or (compact.startswith(name) and len(compact) <= len(name) + 8):
+        if compact == name or compact.startswith(name):
             return name
     return None
 
@@ -624,9 +637,7 @@ class JRATrackScraper(BaseScraper):
 
     def _moisture_needs_source(self, html: str, soup: BeautifulSoup, year: int | None) -> bool:
         """True when moisture numbers have no time, or the empty slot still needs them."""
-        turf_m, dirt_m = self._extract_moisture_content(
-            soup, "jra_html", _UNUSED_FETCHED_AT, year
-        )
+        turf_m, dirt_m = self._extract_moisture_content(soup, "jra_html", _UNUSED_FETCHED_AT, year)
         if _moisture_undated(turf_m) or _moisture_undated(dirt_m):
             return True
         if _moisture_value_missing(turf_m) and _moisture_value_missing(dirt_m):
@@ -702,12 +713,8 @@ class JRATrackScraper(BaseScraper):
         fetched_at: datetime,
     ) -> tuple[MoistureContent | None, MoistureContent | None]:
         """Table cells, then a venue unit. A unit with its own clock wins."""
-        table_turf, table_dirt = self._extract_moisture_content(
-            soup, source, fetched_at, year
-        )
-        frag_turf, frag_dirt = self._moisture_from_fragment(
-            soup, venue, year, source, fetched_at
-        )
+        table_turf, table_dirt = self._extract_moisture_content(soup, source, fetched_at, year)
+        frag_turf, frag_dirt = self._moisture_from_fragment(soup, venue, year, source, fetched_at)
         return _prefer_moisture(table_turf, frag_turf), _prefer_moisture(table_dirt, frag_dirt)
 
     def _fill_from_json(
@@ -1179,11 +1186,7 @@ def _span_moisture(
 
 def _references_baba_data(html: str) -> bool:
     """True when the page itself points at the cushion or moisture fragment."""
-    return (
-        "_data_cushion.html" in html
-        or "_data_moist.html" in html
-        or "/keiba/baba/_js/" in html
-    )
+    return "_data_cushion.html" in html or "_data_moist.html" in html or "/keiba/baba/_js/" in html
 
 
 def _select_baba_urls(html: str, urls: list[str], scraper: JRATrackScraper) -> list[str]:
