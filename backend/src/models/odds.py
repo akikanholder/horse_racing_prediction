@@ -90,6 +90,11 @@ class OddsQuote(BaseModel):
     odds_max: float | None = Field(
         None, description="ワイド、または複勝の範囲の上限。馬連・三連複では空", gt=0
     )
+    popularity: int | None = Field(
+        None,
+        description="人気。ページまたはオッズAPIに数字があるときだけ。無いときは null。順位は作らない",
+        ge=1,
+    )
     source: OddsSource = Field(
         ...,
         description=(
@@ -266,7 +271,32 @@ class RaceOdds(BaseModel):
         None,
         description=(
             "取消・除外がページから読めない理由。価格の失敗は reason。"
-            "JRA odds returned 403 / netkeiba odds returned 403 など"
+            "JRA odds returned 403 / netkeiba odds returned 403 など。"
+            "過去の確定オッズでは、確定かつ complete でないときと、ページに無い市場もここ"
         ),
     )
     fetched_at: datetime = Field(..., description="取得日時")
+
+
+class FinalRaceOdds(RaceOdds):
+    """Past combination odds for one race.
+
+    ``odds_final`` is true only when the settled result is confirmed and
+    complete and at least one final price was on the page. Otherwise ``quotes``
+    stay empty. Prices are not copied from a live board or from a payout.
+    """
+
+    result_phase: Literal["provisional", "confirmed"] | None = Field(
+        None,
+        description=(
+            "着順の result_phase。確定の組み合わせオッズは confirmed かつ complete のときだけ"
+        ),
+    )
+    complete: bool | None = Field(
+        None,
+        description="着順が complete のとき true。最終オッズは confirmed かつ true のときだけ",
+    )
+    odds_final: bool = Field(
+        False,
+        description="result_phase が confirmed、complete が true、確定オッズを載せたときだけ true",
+    )

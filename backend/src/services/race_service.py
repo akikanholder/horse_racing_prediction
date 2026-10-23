@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
+from typing import Literal, cast
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.historical import HistoricalBatch, HistoricalExport
@@ -12,6 +13,7 @@ from backend.models.horse import Horse, HorseBasicInfo
 from backend.models.odds import (
     ODDS_ENCODING,
     BetType,
+    FinalRaceOdds,
     OddsPrefer,
     OddsStatus,
     RaceOdds,
@@ -44,6 +46,7 @@ from backend.scrapers.runner_status import (
     merge_non_runners,
 )
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
+from backend.services.final_odds_service import FinalOddsService
 from backend.services.historical_service import HistoricalService
 from backend.services.race_trend_service import RaceTrendService
 
@@ -399,6 +402,25 @@ class RaceService:
                 as_of=as_of,
                 today=today,
             )
+
+    def get_final_combination_odds(
+        self,
+        race_id: str,
+        bet_types: str | list[str] | None = None,
+        *,
+        fetch_mode: str | None = None,
+    ) -> FinalRaceOdds:
+        """Final wide, umaren, and sanrenpuku odds for a past race.
+
+        Prices stay null unless the result is confirmed and complete.
+        ``html`` does not open a browser. ``headless`` and ``auto`` may.
+        A 403 or a login wall stops the page chain.
+        """
+        chosen = fetch_mode if fetch_mode in {"html", "headless", "auto"} else self.fetch_mode
+        mode = cast(Literal["html", "headless", "auto"], chosen)
+        headless: Literal["auto", "off"] = "off" if mode == "html" else "auto"
+        with FinalOddsService(fetch_mode=mode, headless_render=headless) as service:
+            return service.get(race_id, bet_types)
 
     def get_race_odds(
         self,

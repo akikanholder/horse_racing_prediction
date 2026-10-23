@@ -9,14 +9,19 @@ today or later are not stored. A cname whose date cannot be read is stored
 when the request carries a past ``race_date`` or a project ``race_id``
 (``YYYYMMDD`` plus venue and race). A netkeiba race id is not a calendar
 date. An undated menu with no such day is not stored.
-The netkeiba odds API is stored only when its status is ``result`` and
-``data`` is not empty.
+The netkeiba odds API is stored only when its status is ``result``, ``data``
+is not empty, and the odds map has at least one combination. An
+``official_datetime`` of today or later in Asia/Tokyo is not stored.
+``odds/index.html`` is stored only when a price was extracted. A shell of
+``---.-`` is not stored and is not replayed. A caller that already knows the
+race day is today can set ``replay_disabled`` so the odds pages are not
+stored either.
 HTTP 403, a login wall, and a challenge page are not stored. The replayable
 mark is a version. The current version was checked at write time and is not
 parsed again for a denial. A boolean ``True`` from the earlier marker, and a
-file with no mark, is checked once per path and mtime. ``result.html`` and
-the odds API are still judged from the body. This client does not change
-the User-Agent or send credentials.
+file with no mark, is checked once per path and mtime. ``result.html``, the
+odds API, and ``odds/index.html`` are still judged from the body. This
+client does not change the User-Agent or send credentials.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from backend.scrapers.final_odds import _has_price_text, odds_api_is_replayable
 from backend.scrapers.netkeiba_scraper import result_html_is_final, result_html_is_partial
 from backend.scrapers.page_fallback import looks_like_forbidden_page, looks_like_login_wall
 from backend.scrapers.track_freshness import parse_race_day, should_bypass_page_cache
@@ -102,42 +108,21 @@ def _result_replayable(url: str, body: str) -> bool:
 
     A flash or short table fails first. An unsettled page and a provisional
     label fail the finality check. The odds API is replayable only when
-    ``status`` is ``result`` and ``data`` is not empty. Other URLs are
-    replayable here; the live-list, live-JRA, and track checks are separate.
+    ``status`` is ``result``, ``data`` is not empty, the odds map has a
+    combination, and ``official_datetime`` is not today or later.
+    ``odds/index.html`` is replayable only when a price was extracted.
+    Other URLs are replayable here; the live-list, live-JRA, and track
+    checks are separate.
     """
     if _ODDS_API in url:
-        return _odds_api_is_result(body)
+        return odds_api_is_replayable(body)
+    if "odds/index.html" in url:
+        return _has_price_text(body)
     if "result.html" not in url:
         return True
     if result_html_is_partial(body):
         return False
     return result_html_is_final(body)
-
-
-def _odds_api_is_result(body: str) -> bool:
-    """True when this odds payload is a post-race result that has prices.
-
-    ``status`` must be ``result``. Empty ``data`` (``""``, null, ``{}``, or
-    ``[]``) is not a result to keep. The next run fetches it again.
-    """
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict) or payload.get("status") != "result":
-        return False
-    return not _odds_data_empty(payload.get("data"))
-
-
-def _odds_data_empty(data: object) -> bool:
-    """True when the odds API ``data`` field has no payload."""
-    if data is None:
-        return True
-    if isinstance(data, str):
-        return data.strip() == ""
-    if isinstance(data, dict | list):
-        return len(data) == 0
-    return False
 
 
 def _request_text(url: str, params: dict | None) -> str:
@@ -288,10 +273,13 @@ class CachingHTTPClient(HTTPClient):
         super().__init__(min_request_interval=min_request_interval)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_page_cache_dir()
         self._transport = transport
-        # Completeness of result.html and the odds API, once per path and mtime.
+        # Completeness of result.html, the odds API, and odds/index.html,
+        # once per path and mtime.
         self._replay_cache: dict[str, tuple[int, bool]] = {}
         # Denial check for an old or unmarked file, once per path and mtime.
         self._legacy_denial: dict[str, tuple[int, bool]] = {}
+        # Set for a race whose meeting day is today or later. Odds pages are not stored.
+        self.replay_disabled = False
 
     def cached_fetched_at(
         self,
@@ -380,9 +368,10 @@ class CachingHTTPClient(HTTPClient):
         self._last_request_time = datetime.now().timestamp()
         return body
 
-    @staticmethod
-    def _may_read_cache(url: str, params: dict | None) -> bool:
-        """False for a live track page, today's race list, or today's JRA page."""
+    def _may_read_cache(self, url: str, params: dict | None) -> bool:
+        """False for a live track page, today's race list, today's JRA page, or a disabled replay."""
+        if self.replay_disabled:
+            return False
         return (
             not should_bypass_page_cache(url, params)
             and not live_race_list(url, params)
@@ -395,9 +384,11 @@ class CachingHTTPClient(HTTPClient):
         A non-result page stored with the current replayable version is not
         parsed again for a denial or for completeness. An earlier boolean mark,
         and a file with no mark, is checked for a denial once per path and
-        mtime. ``result.html`` and the odds API are judged from the body even
-        when that mark is set. A result page must be confirmed and complete.
-        The odds API must have ``status`` ``result`` and non-empty ``data``.
+        mtime. ``result.html``, the odds API, and ``odds/index.html`` are
+        judged from the body even when that mark is set. A result page must be
+        confirmed and complete. The odds API must have ``status`` ``result``,
+        non-empty ``data``, and a combination, and its ``official_datetime``
+        must not be today or later. An odds index must contain a price.
         """
         path = self._path(key)
         payload = self._load(path)
@@ -439,10 +430,11 @@ class CachingHTTPClient(HTTPClient):
 
         A non-result page with the current replayable version is kept without
         parsing. An earlier boolean mark still skips the completeness parse.
-        The denial check for that old mark is separate. ``result.html`` and
-        the odds API are always judged from the body, mark or not.
+        The denial check for that old mark is separate. ``result.html``, the
+        odds API, and ``odds/index.html`` are always judged from the body,
+        mark or not.
         """
-        if "result.html" in url or _ODDS_API in url:
+        if "result.html" in url or _ODDS_API in url or "odds/index.html" in url:
             return self._body_is_complete(path, url, body)
         if _mark_is_current(payload):
             return True
@@ -456,9 +448,10 @@ class CachingHTTPClient(HTTPClient):
 
         A result page must be confirmed and complete. That rejects a flash,
         a short order, an unsettled page, and a provisional label. The odds
-        API must report ``result``. The judgement is remembered for the path
-        and mtime. A new write changes the mtime, so the next read checks the
-        new body.
+        API must report ``result`` with prices, and not a meeting day of today
+        or later. An odds index must contain a price. The judgement is
+        remembered for the path and mtime. A new write changes the mtime, so
+        the next read checks the new body.
         """
         try:
             mtime = path.stat().st_mtime_ns
