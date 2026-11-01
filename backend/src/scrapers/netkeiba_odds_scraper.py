@@ -97,7 +97,8 @@ _LIVE_STATUSES = frozenset({"result", "middle"})
 _PROVISIONAL_STATUSES = frozenset({"provisional", "tentative", "zenjitsu", "kari", "temp"})
 _ODDS_ATTEMPTS = 3
 _ODDS_BACKOFF_SECONDS = 0.5
-_TRANSIENT_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+# 408 and 425 are transient. 429 is a rate limit and is not retried.
+_TRANSIENT_HTTP = frozenset({408, 425, 500, 502, 503, 504})
 _MARKET_UPDATED_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
     "%Y/%m/%d %H:%M:%S",
@@ -1088,6 +1089,7 @@ def _unavailable(
     race_phase: RacePhase | None = None,
     odds_phase: OddsPhase | None = None,
     is_official_market: bool | None = None,
+    warning: str | None = None,
 ) -> RaceOdds:
     """Empty snapshot. No placeholder odds."""
     return RaceOdds(
@@ -1101,6 +1103,7 @@ def _unavailable(
         odds_phase=odds_phase,
         is_official_market=is_official_market,
         quotes=[],
+        warning=warning,
         fetched_at=fetched_at,
     )
 
@@ -1115,6 +1118,7 @@ def _unavailable_from_http_error(
     response = exc.response
     code = response.status_code if response is not None else None
     reason = f"http {code}" if isinstance(code, int) else "fetch failed"
+    warning = "netkeiba odds returned 429" if code == 429 else None
     phase_args: dict[str, Any] = {
         "race_phase": None,
         "odds_phase": None,
@@ -1131,7 +1135,7 @@ def _unavailable_from_http_error(
             phase_args = _phase_args(status_name, payload)
         elif _body_is_refusal(_response_text(response)):
             reason = _refusal_reason(_response_text(response)) or reason
-    return _unavailable(race_id, fetched_at, reason, bet_type, **phase_args)
+    return _unavailable(race_id, fetched_at, reason, bet_type, warning=warning, **phase_args)
 
 
 def _json_object_from_response(response: requests.Response) -> dict[Any, Any] | None:
@@ -1205,9 +1209,9 @@ def _odds_api_decided(response: requests.Response) -> bool:
 
 
 def _transient_odds_error(exc: Exception) -> bool:
-    """Retry 5xx, timeouts, connection errors, and an undecided odds HTTP 400.
+    """Retry 408, 425, 5xx, timeouts, connection errors, and an undecided HTTP 400.
 
-    Never retry 401, 403, a captcha, or a challenge.
+    Never retry 401, 403, 429, a captcha, or a challenge. 429 is a rate limit.
     """
     if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
         return True
@@ -1220,7 +1224,7 @@ def _transient_odds_error(exc: Exception) -> bool:
     if _body_is_refusal(body):
         return False
     code = response.status_code
-    if code in {401, 403}:
+    if code in {401, 403, 429}:
         return False
     if code in _TRANSIENT_HTTP or (isinstance(code, int) and code >= 500):
         return True

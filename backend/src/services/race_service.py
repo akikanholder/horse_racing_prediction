@@ -1,6 +1,8 @@
 """Race service for aggregating data from multiple sources."""
 
 import logging
+import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -39,6 +41,7 @@ from backend.scrapers.netkeiba_odds_scraper import NetkeibaOddsScraper
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.runner_status import (
     JRA_ODDS_FETCH_FAILED,
+    POST_POSITIONS_MISSING,
     SCRATCH_STATUS_MISSING,
     ScratchPage,
     apply_scratch_page,
@@ -789,6 +792,11 @@ class RaceService:
         if race.entry_count is None and entries:
             race = race.model_copy(update={"entry_count": len(entries)})
         warning = join_warnings(jra_card.warning, netkeiba_card.warning)
+        if entries and all(
+            entry.bracket_number is not None and entry.horse_number is not None
+            for entry in entries
+        ):
+            warning = _drop_warning(warning, POST_POSITIONS_MISSING)
         if entries and any(entry.status is None for entry in entries):
             warning = join_warnings(warning, SCRATCH_STATUS_MISSING)
         warning = join_warnings(warning, post_position_warning(entries))
@@ -826,45 +834,24 @@ class RaceService:
     def _merge_entries(
         self, primary: list[RaceEntry], secondary: list[RaceEntry]
     ) -> list[RaceEntry]:
-        """Fill blank starter fields from the secondary card, keyed by horse number.
+        """Fill blank starter fields from the secondary card.
 
-        Identifier fields already present on the primary (netkeiba) entry are kept.
+        The same horse number is one row. When the numbers do not match,
+        including when only one side has a number, the same normalized horse
+        name is one row. Identifier fields already on the primary stay.
         """
-        secondary_by_number = {
-            entry.horse_number: entry
-            for entry in secondary
-            if entry.horse_number is not None
-        }
-        secondary_by_name = {
-            entry.horse_name: entry
-            for entry in secondary
-            if entry.horse_number is None and entry.horse_name
-        }
+        unused = list(secondary)
         merged: list[RaceEntry] = []
-        seen_numbers: set[int] = set()
-        seen_names: set[str] = set()
-
         for entry in primary:
-            if entry.horse_number is not None:
-                seen_numbers.add(entry.horse_number)
-                other = secondary_by_number.get(entry.horse_number)
-            else:
-                seen_names.add(entry.horse_name)
-                other = secondary_by_name.get(entry.horse_name)
+            other = _take_entry(unused, entry)
             merged.append(self._fill_entry(entry, other) if other else entry)
-
-        for entry in secondary:
-            if entry.horse_number is not None and entry.horse_number not in seen_numbers:
-                merged.append(entry)
-            elif entry.horse_number is None and entry.horse_name not in seen_names:
-                merged.append(entry)
-
+        merged.extend(unused)
         return sorted(
             merged,
-            key=lambda entry: (
-                entry.horse_number is None,
-                entry.horse_number or 0,
-                entry.horse_name,
+            key=lambda item: (
+                item.horse_number is None,
+                item.horse_number or 0,
+                item.horse_name,
             ),
         )
 
@@ -1128,6 +1115,35 @@ def _normalize_bet_types(bet_types: str | list[str] | None) -> list[str]:
             if name and name not in names:
                 names.append(name)
     return names or ["win"]
+
+
+def _entry_name_key(name: str | None) -> str:
+    """Horse name with spaces removed. Full-width letters fold to ASCII."""
+    if not name:
+        return ""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", name))
+
+
+def _take_entry(unused: list[RaceEntry], entry: RaceEntry) -> RaceEntry | None:
+    """Remove the secondary row for this horse. Number first, then the name."""
+    if entry.horse_number is not None:
+        for index, other in enumerate(unused):
+            if other.horse_number == entry.horse_number:
+                return unused.pop(index)
+    key = _entry_name_key(entry.horse_name)
+    if not key:
+        return None
+    matches = [index for index, other in enumerate(unused) if _entry_name_key(other.horse_name) == key]
+    if len(matches) != 1:
+        return None
+    return unused.pop(matches[0])
+
+
+def _drop_warning(warning: str | None, text: str) -> str | None:
+    if not warning:
+        return None
+    parts = [part for part in warning.split("; ") if part != text]
+    return "; ".join(parts) or None
 
 
 def _race_id_note(

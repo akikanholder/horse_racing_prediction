@@ -1,24 +1,32 @@
 """Operations review: odds retries and phase, race ids, encoding, pre-draw cards."""
 
 import json
+import sys
 from datetime import date, datetime
+from pathlib import Path
 
 import pytest
 import requests
 from bs4 import BeautifulSoup
 
 from backend.cli import main as cli_main
+from backend.models.odds import RaceOdds
+from backend.models.race import Race, RaceCard, RaceEntry
+from backend.scrapers.jra_track_scraper import _weekly_cell_date
 from backend.scrapers.netkeiba_odds_scraper import (
     NetkeibaOddsScraper,
     parse_netkeiba_win_odds,
 )
 from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.race_ids import jra_race_id, page_mismatch_warning, parse_race_id
+from backend.scrapers.runner_status import POST_POSITIONS_MISSING
 from backend.services.race_id_service import RaceIdService
+from backend.services.race_service import RaceService
 from backend.utils.date_utils import TOKYO
 from backend.utils.http_client import _text_from_response
 from backend.utils.text_encoding import decode_page_bytes
 
+FIXTURES = Path(__file__).parent / "fixtures"
 FIXTURES_AT = datetime(2026, 11, 1, 9, 0, tzinfo=TOKYO)
 RACE_ID = "202605050811"
 WIN = {
@@ -297,8 +305,180 @@ def test_euc_jp_card_names_are_unicode():
     assert entries[0].horse_number == 1
 
 
+def test_real_waku_classes_keep_seventeen_numbered_rows():
+    html = (FIXTURES / "netkeiba_shutuba_waku_classes.html").read_text(encoding="utf-8")
+    client = _ListClient({"https://race.netkeiba.com/race/shutuba.html": html})
+    scraper = NetkeibaScraper(http_client=client, headless_render="off")  # type: ignore[arg-type]
+    card = scraper.get_race_card("202608050811")
+
+    assert card is not None
+    assert len(card.entries) == 17
+    assert [entry.horse_number for entry in card.entries] == list(range(1, 18))
+    assert all(entry.bracket_number is not None for entry in card.entries)
+    assert card.entries[12].horse_name == "馬13"
+    assert card.entries[12].horse_number == 13
+    assert card.warning is None
+
+
+def _named(name: str, number: int | None, bracket: int | None = None) -> RaceEntry:
+    return RaceEntry(
+        horse_name=name,
+        horse_number=number,
+        bracket_number=bracket,
+        status="entered",
+    )
+
+
+def test_merge_matches_a_null_number_by_horse_name():
+    service = RaceService()
+    primary = [
+        _named("エフォートレス", None),
+        _named("サウンド ムーブ", None),
+    ]
+    secondary = [
+        _named("サウンドムーブ", 2, 2),
+        _named("エフォートレス", 1, 1),
+    ]
+    merged = service._merge_entries(primary, secondary)
+
+    assert [(entry.horse_name, entry.horse_number) for entry in merged] == [
+        ("エフォートレス", 1),
+        ("サウンド ムーブ", 2),
+    ]
+    assert len(merged) == 2
+
+
+def test_merge_drops_the_post_position_warning_once_numbers_are_filled():
+    race = Race(
+        race_id="202608050811",
+        race_name="京都11R",
+        race_number=11,
+        race_date=date(2026, 11, 1),
+        venue="京都",
+        distance=1600,
+        track_type="芝",
+    )
+    service = RaceService()
+    netkeiba = RaceCard(
+        race=race,
+        entries=[_named("馬01", None), _named("馬02", None)],
+        warning=POST_POSITIONS_MISSING,
+    )
+    jra = RaceCard(
+        race=race,
+        entries=[_named("馬01", 1, 1), _named("馬02", 2, 1)],
+    )
+    card = service._merge_race_cards(netkeiba, jra)
+
+    assert card is not None
+    assert len(card.entries) == 2
+    assert [entry.horse_number for entry in card.entries] == [1, 2]
+    assert card.warning is None
+
+
+def test_invalid_date_is_a_warning_and_json_is_only_json(monkeypatch, capsys):
+    snapshot = RaceOdds(
+        race_id=RACE_ID,
+        bet_types=["win"],
+        prefer="live",
+        status="unavailable",
+        fetched_at=FIXTURES_AT,
+    )
+
+    class _Service:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get_race_odds(self, race_id, bet_types="win", prefer="live", **kwargs):
+            assert "expect_date" not in kwargs
+            return snapshot
+
+    monkeypatch.setattr("backend.cli.RaceService", lambda: _Service())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["backend.cli", "odds", RACE_ID, "--json", "--date", "2026-11-31"],
+    )
+    cli_main()
+    out = capsys.readouterr().out
+    assert out.strip().startswith("{")
+    payload = json.loads(out)
+    assert payload["warning"] == "track race date was not a date"
+    assert payload["quotes"] == []
+
+
+def test_card_json_stdout_is_only_json(monkeypatch, capsys):
+    race = Race(
+        race_id=RACE_ID,
+        race_name="京都11R",
+        race_number=11,
+        race_date=date(2026, 11, 1),
+        venue="京都",
+        distance=1600,
+        track_type="芝",
+    )
+    card = RaceCard(race=race, entries=[_named("馬01", 1, 1)])
+
+    class _Service:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get_race_card(self, race_id, **kwargs):
+            return card
+
+    monkeypatch.setattr("backend.cli.RaceService", lambda: _Service())
+    monkeypatch.setattr(sys, "argv", ["backend.cli", "card", RACE_ID, "--json"])
+    cli_main()
+    out = capsys.readouterr().out
+    assert "出馬表" not in out
+    assert json.loads(out)["entries"][0]["horse_number"] == 1
+
+
+def test_http_429_is_not_retried_and_warns():
+    client = _Scripted([_http_error(429, "slow down"), json.dumps(WIN)])
+    snapshot = _scraper(client).get_win_odds(RACE_ID, fetched_at=FIXTURES_AT)
+
+    assert client.calls == 1
+    assert snapshot.quotes == []
+    assert snapshot.reason == "http 429"
+    assert snapshot.warning == "netkeiba odds returned 429"
+
+
+def test_http_408_is_retried():
+    client = _Scripted([_http_error(408, ""), json.dumps(WIN)])
+    snapshot = _scraper(client).get_win_odds(RACE_ID, fetched_at=FIXTURES_AT)
+
+    assert client.calls == 2
+    assert snapshot.quotes[0].odds == 2.1
+
+
+def test_weekly_cell_skips_a_day_that_is_not_in_the_month():
+    november = datetime(2026, 11, 1)
+    assert _weekly_cell_date("31日（土）", november) is None
+    assert _weekly_cell_date("10月31日（土）", november) == datetime(2026, 10, 31)
+    assert _weekly_cell_date("1日（日）", november) == datetime(2026, 11, 1)
+
+
+def test_item03_going_without_a_label_is_read():
+    html = """
+    <div class="RaceData01"><span>芝2500m</span> /
+      <span class="Item03">良</span>
+    </div>
+    <div class="RaceData02"><span>中山</span></div>
+    """
+    header = NetkeibaScraper(headless_render="off")._settled_header(BeautifulSoup(html, "lxml"))
+    assert header.track_condition == "良"
+    assert header.distance == 2500
+    assert header.track_type == "芝"
+
+
 def test_race_id_help_lists_the_day_list(monkeypatch, capsys):
-    import sys
 
     monkeypatch.setattr(sys, "argv", ["backend.cli", "race-id", "--help"])
     with pytest.raises(SystemExit) as exc:

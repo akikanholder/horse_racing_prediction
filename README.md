@@ -189,7 +189,7 @@ python -m backend.cli race-id 2026-11-01 --json
 
 # オッズを取得（単勝が既定。ワイド・馬連・三連複は --bet-types）
 # odds_phase は forecast / provisional / live / final。is_official_market は live と final だけ true
-# 一時的な 400・5xx・タイムアウトは取り直す。401・403・captcha は取り直さない
+# 一時的な 400・408・425・5xx・タイムアウトは取り直す。401・403・429・captcha は取り直さない。429 は警告にして止める
 # --date と --venue を付けると、その日の開催一覧と race id が違うとき warning
 python -m backend.cli odds <race_id> --bet-types wide --prefer live
 python -m backend.cli odds <race_id> --bet-types umaren --prefer live

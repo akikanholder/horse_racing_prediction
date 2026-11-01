@@ -57,9 +57,9 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 | サブコマンド | `--json` の標準出力 |
 |---|---|
 | `odds` `result` `history` `trends` `track` `predictions` | JSON だけ |
-| `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
+| `races` `card` `horse` `courses` `venues` | JSON だけ。見出しは出さない |
 
-混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
+`--json` の標準出力は JSON だけ。見出しは出さない。見つからないとき（出馬表・馬・コース）は日本語の1行を標準エラーに出し、JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
 
 HTTP は JSON だけ。見つからないレース・馬・コースは 404。サービス未初期化は 503。スクレイパ例外は 500。オッズ、確定結果、レース傾向は欠測でも 200 で、本体の `status` / `warning` を見る。傾向で日付も recent meeting も無いときは 400。
 
@@ -412,7 +412,7 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 
 局面が読めない失敗は `odds_phase` も `is_official_market` も null。価格が空でも、API が `result` または `middle` と名乗ったときはその局面を残す。フラグから価格は作らない。馬券種で局面が食い違うときは両方 null と `odds phase sources disagree`。
 
-オッズ API の一時的な失敗は、同じリクエストを最大3回、待ちを 0.5 秒から倍にして取り直す。対象は、本文がオッズ API の `status` も `reason` も持たない HTTP 400、5xx、タイムアウト、接続エラー。`status` または `reason` がある HTTP 400 は API の答えなので取り直さない。その本文の数値は価格にしない。401、403、captcha、チャレンジ、ログイン画面は1回で止め、取り直さない。User-Agent は変えない。
+オッズ API の一時的な失敗は、同じリクエストを最大3回、待ちを 0.5 秒から倍にして取り直す。対象は、本文がオッズ API の `status` も `reason` も持たない HTTP 400、HTTP 408、HTTP 425、5xx、タイムアウト、接続エラー。`status` または `reason` がある HTTP 400 は API の答えなので取り直さない。その本文の数値は価格にしない。401、403、429、captcha、チャレンジ、ログイン画面は1回で止め、取り直さない。429 はこちらへのレート制限なので、`warning` は `netkeiba odds returned 429`、`reason` は `http 429`。User-Agent は変えない。`card` `odds` `result` `final-odds` の `--date` が日付でないとき（`2026-11-31` など）は開催一覧を開かず、`warning` に `track race date was not a date` を付ける。
 
 `OddsQuote`:
 

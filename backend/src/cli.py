@@ -17,6 +17,7 @@ from backend.models.race import RacePayout, SettledFinisher, SettledRaceResult, 
 from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
+from backend.scrapers.runner_status import join_warnings
 from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
 from backend.services.prediction_store import (
     PredictionStore,
@@ -163,32 +164,40 @@ def cmd_races(args):
     """Get weekly races."""
     with _open_service(RaceService, args) as service:
         schedule = service.get_weekly_races()
+        if args.json:
+            print_json(schedule)
+            return
+
         print(f"\n=== 今週のレース ({schedule.week_start} ~ {schedule.week_end}) ===")
         print(f"取得時刻: {schedule.fetched_at}")
         print(f"レース数: {len(schedule.races)}\n")
 
-        if args.json:
-            print_json(schedule)
-        else:
-            for race in schedule.races:
-                print(
-                    f"[{race.race_date}] {race.venue} {race.race_number}R "
-                    f"{race.race_name} ({race.track_type}{race.distance}m)"
-                )
+        for race in schedule.races:
+            print(
+                f"[{race.race_date}] {race.venue} {race.race_number}R "
+                f"{race.race_name} ({race.track_type}{race.distance}m)"
+            )
 
 
 def cmd_race_card(args):
     """Get race card."""
     with _open_service(RaceService, args) as service:
-        meeting, venue = _expect_meeting(args)
+        meeting, venue, date_note = _expect_meeting(args)
         card_kwargs: dict[str, object] = {}
         if meeting is not None:
             card_kwargs["expect_date"] = meeting
         if venue:
             card_kwargs["expect_venue"] = venue
-        race_card = service.get_race_card(args.race_id, **card_kwargs)
+        race_card = _stamp_date_warning(
+            service.get_race_card(args.race_id, **card_kwargs), date_note
+        )
         if not race_card:
-            print(f"レース {args.race_id} が見つかりません")
+            print(f"レース {args.race_id} が見つかりません", file=sys.stderr if args.json else sys.stdout)
+            if date_note and args.json:
+                print(date_note, file=sys.stderr)
+            return
+        if args.json:
+            print_json(race_card)
             return
 
         print(f"\n=== 出馬表: {race_card.race.race_name} ===")
@@ -205,10 +214,7 @@ def cmd_race_card(args):
             _print_track_bias(race_card.race.track_bias)
         print()
 
-        if args.json:
-            print_json(race_card)
-        else:
-            for entry in race_card.entries:
+        for entry in race_card.entries:
                 label = f" {entry.status_label}" if entry.status_label else ""
                 frame = (
                     f"{entry.bracket_number}枠"
@@ -223,8 +229,8 @@ def cmd_race_card(args):
                     f"{entry.horse_name} ({entry.sex}{entry.age}) "
                     f"[{entry.jockey_name}]{label}"
                 )
-            if race_card.warning:
-                print(f"警告: {race_card.warning}")
+        if race_card.warning:
+            print(f"警告: {race_card.warning}")
 
 
 def cmd_horse(args):
@@ -232,7 +238,10 @@ def cmd_horse(args):
     with _open_service(RaceService, args) as service:
         horse = service.get_horse_info(args.horse_id)
         if not horse:
-            print(f"馬 {args.horse_id} が見つかりません")
+            print(f"馬 {args.horse_id} が見つかりません", file=sys.stderr if args.json else sys.stdout)
+            return
+        if args.json:
+            print_json(horse)
             return
 
         print(f"\n=== 競走馬情報: {horse.horse_name} ===")
@@ -267,15 +276,12 @@ def cmd_horse(args):
         if horse.warning:
             print(f"警告: {horse.warning}")
 
-        if args.json:
-            print_json(horse)
-        else:
-            print("\n--- 近走成績（過去走。今走の結果ではない） ---")
-            if not horse.performances:
-                print("なし")
-            for perf in horse.performances[:5]:
-                result = f"{perf.rank}着" if perf.rank else "---"
-                print(f"{_format_performance(perf)} → {result}")
+        print("\n--- 近走成績（過去走。今走の結果ではない） ---")
+        if not horse.performances:
+            print("なし")
+        for perf in horse.performances[:5]:
+            result = f"{perf.rank}着" if perf.rank else "---"
+            print(f"{_format_performance(perf)} → {result}")
 
 
 def _print_pedigree(horse: Horse) -> None:
@@ -400,7 +406,13 @@ def cmd_courses(args):
         if args.venue:
             course = service.get_course_info(args.venue)
             if not course:
-                print(f"競馬場 {args.venue} が見つかりません")
+                print(
+                    f"競馬場 {args.venue} が見つかりません",
+                    file=sys.stderr if args.json else sys.stdout,
+                )
+                return
+            if args.json:
+                print_json(course)
                 return
 
             print(f"\n=== コース情報: {course.venue_name} ===")
@@ -413,27 +425,24 @@ def cmd_courses(args):
                 print(f"芝直線: {course.turf_straight}m")
             if course.dirt_straight:
                 print(f"ダート直線: {course.dirt_straight}m")
-
-            if args.json:
-                print_json(course)
         else:
             courses = service.get_all_course_info()
-            print(f"\n=== 全競馬場コース情報 ({len(courses)}場) ===\n")
-
             if args.json:
                 print_json(courses)
-            else:
-                for course in courses:
-                    print(f"【{course.venue_name}】")
-                    if course.turf_circumference:
-                        print(
-                            f"  芝: 周回{course.turf_circumference}m / 直線{course.turf_straight}m"
-                        )
-                    if course.dirt_circumference:
-                        print(
-                            f"  ダート: 周回{course.dirt_circumference}m / "
-                            f"直線{course.dirt_straight}m"
-                        )
+                return
+            print(f"\n=== 全競馬場コース情報 ({len(courses)}場) ===\n")
+
+            for course in courses:
+                print(f"【{course.venue_name}】")
+                if course.turf_circumference:
+                    print(
+                        f"  芝: 周回{course.turf_circumference}m / 直線{course.turf_straight}m"
+                    )
+                if course.dirt_circumference:
+                    print(
+                        f"  ダート: 周回{course.dirt_circumference}m / "
+                        f"直線{course.dirt_straight}m"
+                    )
 
 
 def _cushion_text(course) -> str:
@@ -515,17 +524,20 @@ def cmd_track(args):
 
 def cmd_final_odds(args):
     """Final wide, umaren, and sanrenpuku odds for a past race."""
-    meeting, venue = _expect_meeting(args)
+    meeting, venue, date_note = _expect_meeting(args)
     final_kwargs: dict[str, object] = {}
     if meeting is not None:
         final_kwargs["expect_date"] = meeting
     if venue:
         final_kwargs["expect_venue"] = venue
     with _open_service(RaceService, args) as service:
-        snapshot = service.get_final_combination_odds(
-            args.race_id,
-            bet_types=args.bet_types,
-            **final_kwargs,
+        snapshot = _stamp_date_warning(
+            service.get_final_combination_odds(
+                args.race_id,
+                bet_types=args.bet_types,
+                **final_kwargs,
+            ),
+            date_note,
         )
 
     if args.json:
@@ -572,17 +584,20 @@ def _format_final_quote(quote: OddsQuote) -> str:
 def cmd_odds(args):
     """Get win, wide, umaren, and sanrenpuku odds quotes."""
     with _open_service(RaceService, args) as service:
-        meeting, venue = _expect_meeting(args)
+        meeting, venue, date_note = _expect_meeting(args)
         odds_kwargs: dict[str, object] = {}
         if meeting is not None:
             odds_kwargs["expect_date"] = meeting
         if venue:
             odds_kwargs["expect_venue"] = venue
-        snapshot = service.get_race_odds(
-            args.race_id,
-            bet_types=args.bet_types,
-            prefer=args.prefer,
-            **odds_kwargs,
+        snapshot = _stamp_date_warning(
+            service.get_race_odds(
+                args.race_id,
+                bet_types=args.bet_types,
+                prefer=args.prefer,
+                **odds_kwargs,
+            ),
+            date_note,
         )
 
     if args.json:
@@ -619,14 +634,29 @@ def cmd_odds(args):
         print(_format_odds_quote(quote))
 
 
-def _expect_meeting(args: Any) -> tuple[date | None, str | None]:
-    """Optional --date and --venue used to check a race id. Unset stays null."""
+def _expect_meeting(args: Any) -> tuple[date | None, str | None, str | None]:
+    """Optional --date and --venue used to check a race id.
+
+    An unreadable ``--date`` does not run the check. The warning is returned
+    so the command can put it on the response.
+    """
     raw = getattr(args, "expect_date", None)
-    venue = getattr(args, "expect_venue", None)
+    venue = getattr(args, "expect_venue", None) or None
     if not raw:
-        return None, venue or None
-    meeting, _warning = parse_race_day(raw)
-    return meeting, venue or None
+        return None, venue, None
+    meeting, warning = parse_race_day(raw)
+    if meeting is None:
+        return None, venue, warning or "track race date was not a date"
+    return meeting, venue, None
+
+
+def _stamp_date_warning(model: Any, note: str | None) -> Any:
+    """Keep an unreadable --date on the response. A missing model stays missing."""
+    if model is None or not note or not hasattr(model, "model_copy"):
+        return model
+    return model.model_copy(
+        update={"warning": join_warnings(getattr(model, "warning", None), note)}
+    )
 
 
 def _odds_phase_label(phase: str | None) -> str:
@@ -702,13 +732,15 @@ def cmd_result(args):
             "retry_interval": getattr(args, "retry_interval", 60),
             "max_wait": getattr(args, "max_wait", 600),
         }
-    meeting, venue = _expect_meeting(args)
+    meeting, venue, date_note = _expect_meeting(args)
     if meeting is not None:
         kwargs["expect_date"] = meeting
     if venue:
         kwargs["expect_venue"] = venue
     with _open_service(RaceService, args) as service:
-        settled = service.get_settled_race_result(args.race_id, **kwargs)
+        settled = _stamp_date_warning(
+            service.get_settled_race_result(args.race_id, **kwargs), date_note
+        )
 
     if args.json:
         print_json(settled)
@@ -1070,14 +1102,15 @@ def cmd_venues(args):
     """Get venue schedules."""
     with _open_service(RaceService, args) as service:
         schedules = service.get_venue_schedules()
-        print(f"\n=== 今週の開催競馬場 ({len(schedules)}場) ===\n")
-
         if args.json:
             print_json(schedules)
-        else:
-            for schedule in schedules:
-                dates_str = ", ".join(str(d) for d in schedule.dates)
-                print(f"【{schedule.venue}】 {dates_str}")
+            return
+
+        print(f"\n=== 今週の開催競馬場 ({len(schedules)}場) ===\n")
+
+        for schedule in schedules:
+            dates_str = ", ".join(str(d) for d in schedule.dates)
+            print(f"【{schedule.venue}】 {dates_str}")
 
 
 def main():
@@ -1235,8 +1268,8 @@ def main():
             "race_phase は pre（API status の yoso と middle。レース前）か "
             "post（API status の result。レース後の確定）。"
             "HTTP 400、空の確定オッズ、壊れた JSON は quotes を空にし reason を返す。"
-            "オッズAPIの一時的な 400、5xx、タイムアウト、接続エラーは待って取り直す。"
-            "401、403、captcha、チャレンジは取り直さない。"
+            "オッズAPIの一時的な 400、408、425、5xx、タイムアウト、接続エラーは待って取り直す。"
+            "401、403、429、captcha、チャレンジは取り直さない。429 はレート制限で、警告にして止める。"
             "odds_phase は forecast（予想オッズ）、provisional（前日暫定）、"
             "live（発売中）、final（確定）。is_official_market は live と final だけ true。"
             "価格は作らない。ページが ---- または 取消 の行は odds を null のまま残す。"

@@ -559,6 +559,10 @@ def _parse_distance_cell(text: str) -> tuple[int | None, str | None]:
     return None, None
 
 
+_WAKU_CLASS = re.compile(r"^Waku\d*$")
+_UMABAN_CLASS = re.compile(r"^Umaban\d*$")
+
+
 def _parse_going(text: str) -> str | None:
     compact = _compact(text)
     if not compact or compact in _PLACEHOLDERS:
@@ -2476,6 +2480,10 @@ class NetkeibaScraper(BaseScraper):
             going_match = re.search(r"馬場[:：]\s*(\S+)", data_text)
             if going_match:
                 header.track_condition = _parse_going(going_match.group(1))
+            if header.track_condition is None:
+                item = data01.select_one(".Item03")
+                if isinstance(item, Tag):
+                    header.track_condition = _parse_going(item.get_text(" ", strip=True))
         return header
 
     def _settled_race_name(self, soup: BeautifulSoup) -> str | None:
@@ -3622,6 +3630,18 @@ class NetkeibaScraper(BaseScraper):
 
         return entries
 
+    def _td_by_class(self, row: Tag, pattern: re.Pattern[str]) -> Tag | None:
+        """A cell whose class token is ``Waku``, ``Waku1`` … ``Waku8``, or ``Umaban`` / ``Umaban1``."""
+        for cell in row.find_all("td"):
+            if not isinstance(cell, Tag):
+                continue
+            classes = cell.get("class") or []
+            if isinstance(classes, str):
+                classes = classes.split()
+            if any(pattern.fullmatch(str(token)) for token in classes):
+                return cell
+        return None
+
     def _bounded_number(self, text: str, low: int, high: int) -> int | None:
         """A cell that is only an integer in range. ``取消`` and blanks stay null."""
         cleaned = self.clean_text(text)
@@ -3640,15 +3660,22 @@ class NetkeibaScraper(BaseScraper):
         Before 枠順 the frame and number cells are blank. The horse stays,
         and those fields stay null. A number is not filled in from the row order.
         """
-        waku = row.select_one("td.Waku, td.Wakuban")
-        umaban = row.select_one("td.Umaban")
+        waku = self._td_by_class(row, _WAKU_CLASS)
+        umaban = self._td_by_class(row, _UMABAN_CLASS)
         info = row.select_one("td.HorseInfo")
-        if isinstance(info, Tag):
-            bracket = self._bounded_number(waku.get_text() if isinstance(waku, Tag) else "", 1, 8)
-            number = self._bounded_number(
-                umaban.get_text() if isinstance(umaban, Tag) else "", 1, 18
-            )
-            return bracket, number, info
+        if isinstance(info, Tag) or waku is not None or umaban is not None:
+            if not isinstance(info, Tag):
+                link = row.find("a", href=re.compile(r"horse/\d+"))
+                parent = link.find_parent("td") if isinstance(link, Tag) else None
+                info = parent if isinstance(parent, Tag) else None
+            if isinstance(info, Tag):
+                bracket = self._bounded_number(
+                    waku.get_text() if isinstance(waku, Tag) else "", 1, 8
+                )
+                number = self._bounded_number(
+                    umaban.get_text() if isinstance(umaban, Tag) else "", 1, 18
+                )
+                return bracket, number, info
         bracket = self._bounded_number(cols[0].get_text(), 1, 8) if cols else None
         number = self._bounded_number(cols[1].get_text(), 1, 18) if len(cols) > 1 else None
         if bracket is not None and number is not None:

@@ -62,6 +62,30 @@ from backend.utils.date_utils import normalize_tokyo_clock, parse_measurement_ti
 
 logger = logging.getLogger(__name__)
 
+
+def _weekly_cell_date(text: str, today: datetime) -> datetime | None:
+    """Date printed on a weekly cell. An impossible day stays null.
+
+    ``10月31日`` uses the printed month. ``31日`` uses today's month.
+    A day that is not in that month is not rolled into another month.
+    """
+    month_and_day = re.search(r"(\d{1,2})月\s*(\d{1,2})日", text)
+    if month_and_day:
+        month = int(month_and_day.group(1))
+        day = int(month_and_day.group(2))
+        year = today.year
+    else:
+        day_only = re.search(r"(\d{1,2})日", text)
+        if day_only is None:
+            return None
+        month = today.month
+        day = int(day_only.group(1))
+        year = today.year
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
 _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
 _MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
 # These names end the open section at any heading level, and also as a row label.
@@ -1203,11 +1227,9 @@ class JRATrackScraper(BaseScraper):
                 if date_row:
                     for i, date_cell in enumerate(date_row):
                         date_text = date_cell.get_text().strip()
-                        date_match = re.search(r"(\d{1,2})日", date_text)
-                        if date_match:
-                            day = int(date_match.group(1))
-                            now = datetime.now()
-                            date = datetime(now.year, now.month, day)
+                        dated = _weekly_cell_date(date_text, datetime.now())
+                        if dated is not None:
+                            date = dated
 
                             weather = Weather.UNKNOWN
                             if weather_row and i < len(weather_row):
