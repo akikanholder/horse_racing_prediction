@@ -379,6 +379,10 @@ class RaceService:
         as_of: date | None = None,
         today: bool = False,
         fetch_mode: str | None = None,
+        request_timeout: float | None = None,
+        retries: int = 0,
+        concurrency: int = 1,
+        time_budget: float | None = None,
     ) -> RaceTrendReport:
         """Win, top-2, top-3, and ROI tables over settled history.
 
@@ -398,10 +402,14 @@ class RaceService:
                 on_date=on_date,
                 date_from=date_from,
                 date_to=date_to,
-                recent_meeting=recent_meeting,
-                as_of=as_of,
-                today=today,
-            )
+            recent_meeting=recent_meeting,
+            as_of=as_of,
+            today=today,
+            request_timeout=request_timeout,
+            retries=retries,
+            concurrency=concurrency,
+            time_budget=time_budget,
+        )
 
     def get_final_combination_odds(
         self,
@@ -776,6 +784,7 @@ class RaceService:
                 "source": publication.source,
                 "warning": publication.warning,
                 "data_sufficiency": publication.data_sufficiency,
+                "blocked_reason": publication.blocked_reason,
             }
         )
         race = card.race.model_copy(update={"track_bias": bias})

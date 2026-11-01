@@ -1217,11 +1217,35 @@ def _class_tokens(tag: Tag) -> set[str]:
     return {str(token) for token in raw}
 
 
+def _result_tables(soup: BeautifulSoup) -> list[Tag]:
+    """Every 全着順 table. A payout block with another summary is not one."""
+    found: list[Tag] = []
+    for table in soup.find_all("table"):
+        if not isinstance(table, Tag):
+            continue
+        summary = table.get("summary")
+        if isinstance(summary, list):
+            summary = " ".join(str(part) for part in summary)
+        if isinstance(summary, str) and "全着順" in summary:
+            found.append(table)
+    return found
+
+
 def _result_table(soup: BeautifulSoup) -> Tag | None:
-    table = soup.find("table", summary="全着順")
-    if isinstance(table, Tag):
-        return table
-    return None
+    """The full order when the page also prints a shorter 全着順 block.
+
+    The early page can put a 5-row table before the full one. The full table
+    wins. A flash table loses to any longer table that is not itself a flash.
+    """
+    tables = _result_tables(soup)
+    if not tables:
+        return None
+
+    def rank(table: Tag) -> tuple[int, int]:
+        flash = 1 if _table_is_flash(table, soup) else 0
+        return (-flash, len(_data_rows(table)))
+
+    return max(tables, key=rank)
 
 
 def _data_rows(table: Tag) -> list[Tag]:
@@ -1230,25 +1254,35 @@ def _data_rows(table: Tag) -> list[Tag]:
     ]
 
 
-def _is_flash_table(soup: BeautifulSoup) -> bool:
-    """True for the early 速報 table: ``FirstDisplay`` rows and no ``Table_Show_All``.
+def _table_is_flash(table: Tag, soup: BeautifulSoup) -> bool:
+    """True when this table is the early top rows, not the full order.
 
-    A table that already has ``Table_Show_All`` is the full order, even when the
-    first rows still carry ``FirstDisplay``.
+    ``Table_Show_All`` with any row that is not ``FirstDisplay`` is the full
+    order. The same class on a table whose every row is ``FirstDisplay`` and
+    that still says 全着順を見る is the early block with the class copied on.
+    A real 5-runner ``HorseList`` table is not this case.
     """
-    table = _result_table(soup)
-    if table is None or "Table_Show_All" in _class_tokens(table):
-        return False
     rows = _data_rows(table)
     if not rows or not all("FirstDisplay" in _class_tokens(row) for row in rows):
         return False
-    if _FLASH_MARK.search(soup.get_text(" ", strip=True)):
+    marked = _FLASH_MARK.search(soup.get_text(" ", strip=True)) is not None
+    if "Table_Show_All" in _class_tokens(table):
+        return marked
+    if marked:
         return True
     # A real 5-runner field that is only FirstDisplay rows, with no
     # Table_Show_All, looks the same as the early flash. The page does not
     # say which it is, so this stays incomplete (fail closed). An ordinary
     # HorseList table of five runners is not this case and stays complete.
     return len(rows) == 5
+
+
+def _is_flash_table(soup: BeautifulSoup) -> bool:
+    """True when the order we would read is still the early 速報 table."""
+    table = _result_table(soup)
+    if table is None:
+        return False
+    return _table_is_flash(table, soup)
 
 
 def result_html_is_partial(html: str) -> bool:
@@ -2387,7 +2421,7 @@ class NetkeibaScraper(BaseScraper):
     ) -> SettledRaceResult:
         """Read one result page. Do not fill blanks from the race id."""
         header = self._settled_header(soup)
-        table = soup.find("table", summary="全着順")
+        table = _result_table(soup)
         if not isinstance(table, Tag):
             if header.race_name is None and header.race_date is None and header.venue is None:
                 return self._empty_settled_result(race_id, fetched_at, RACE_RESULT_NOT_FOUND)
@@ -2673,7 +2707,7 @@ class NetkeibaScraper(BaseScraper):
     def _result_html_needs_fallback(self, html: str) -> bool:
         """True when the result table is missing columns, empty, or short of the card."""
         soup = BeautifulSoup(html, "lxml")
-        table = soup.find("table", summary="全着順")
+        table = _result_table(soup)
         if not isinstance(table, Tag):
             return False
         columns = self._settled_columns(table)

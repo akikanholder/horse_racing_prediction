@@ -10,6 +10,7 @@ credentials.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from typing import Literal
@@ -69,6 +70,8 @@ class RaceTrendService:
         self._list_races = list_races
         self._pedigree_lookup = pedigree_lookup
         self._today = clock or _tokyo_today
+        self._fetch_extra: dict[str, object] = {}
+        self._budget_deadline: float | None = None
 
     def _list(self, day: date) -> Sequence[Race]:
         if self._list_races is not None:
@@ -106,6 +109,10 @@ class RaceTrendService:
         as_of: date | None = None,
         today: bool = False,
         sires: Mapping[str, Pedigree] | None = None,
+        request_timeout: float | None = None,
+        retries: int = 0,
+        concurrency: int = 1,
+        time_budget: float | None = None,
     ) -> RaceTrendReport:
         """Filter settled races and return the trend tables.
 
@@ -115,6 +122,10 @@ class RaceTrendService:
         existing pedigree code.
         """
         computed_at = tokyo_now()
+        self._fetch_extra = _fetch_extra(request_timeout, retries, concurrency, time_budget)
+        self._budget_deadline = None
+        if time_budget is not None:
+            self._budget_deadline = time.monotonic() + time_budget
         selected: list[str] = []
         for venue in venues or []:
             text = _text(venue)
@@ -156,6 +167,7 @@ class RaceTrendService:
             date_to=None if on_date else date_to,
             venues=selected,
             flat_only=True,
+            **self._fetch_extra,
         )
         return self._from_batch(filt, batch, computed_at, sires, extra_note=note)
 
@@ -207,13 +219,17 @@ class RaceTrendService:
             )
         batches: list[HistoricalBatch] = []
         if previous is not None:
-            previous_batch = self._historical.get(on_date=previous, venues=[venue], flat_only=True)
+            previous_batch = self._historical.get(
+                on_date=previous, venues=[venue], flat_only=True, **self._fetch_extra
+            )
             batches.append(previous_batch)
             if previous_batch.stopped_at_race_id:
                 return self._from_batches(
                     filt, batches, computed_at, sires, window, join_warnings(*notes)
                 )
-        today_batch = self._historical.get(on_date=as_of, venues=[venue], flat_only=True)
+        today_batch = self._historical.get(
+            on_date=as_of, venues=[venue], flat_only=True, **self._fetch_extra
+        )
         batches.append(today_batch)
         return self._from_batches(filt, batches, computed_at, sires, window, join_warnings(*notes))
 
@@ -227,6 +243,11 @@ class RaceTrendService:
         window: RecentMeetingWindow | None = None,
     ) -> RaceTrendReport:
         return self._from_batches(filt, [batch], computed_at, sires, window, extra_note)
+
+    def _budget_spent(self) -> bool:
+        if self._budget_deadline is None:
+            return False
+        return time.monotonic() >= self._budget_deadline
 
     def _from_batches(
         self,
@@ -264,6 +285,22 @@ class RaceTrendService:
             history_skipped=skipped,
             computed_at=computed_at,
         )
+        if self._budget_spent():
+            horse_ids = _horse_ids(report, races)
+            unfetched = dict.fromkeys(
+                horse_ids, f"{SIRE_NOT_LOADED}: trend time budget exhausted"
+            )
+            return aggregate_race_trends(
+                races,
+                filt=filt,
+                sires={},
+                sire_unfetched=unfetched,
+                extra_excluded=extra,
+                recent_meeting=window,
+                batch_warning=join_warnings(*notes, "trend time budget exhausted"),
+                history_skipped=skipped,
+                computed_at=computed_at,
+            )
         if sires is not None:
             return aggregate_race_trends(
                 races,
@@ -427,6 +464,25 @@ def _going(value: str | None) -> Going | None:
     if text in {"良", "稍重", "重", "不良"}:
         return text  # type: ignore[return-value]
     return None
+
+
+def _fetch_extra(
+    request_timeout: float | None,
+    retries: int,
+    concurrency: int,
+    time_budget: float | None,
+) -> dict[str, object]:
+    """Only the options a caller set. Default calls keep the old signature."""
+    extra: dict[str, object] = {}
+    if request_timeout is not None:
+        extra["request_timeout"] = request_timeout
+    if retries:
+        extra["retries"] = retries
+    if concurrency != 1:
+        extra["concurrency"] = concurrency
+    if time_budget is not None:
+        extra["time_budget"] = time_budget
+    return extra
 
 
 def _tokyo_today() -> date:

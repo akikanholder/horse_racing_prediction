@@ -58,7 +58,7 @@ from backend.scrapers.track_readings import (
     printed_year,
     weather_label,
 )
-from backend.utils.date_utils import normalize_tokyo_clock, parse_measurement_time, tokyo_now
+from backend.utils.date_utils import TOKYO, normalize_tokyo_clock, parse_measurement_time, tokyo_now
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +403,15 @@ class JRATrackScraper(BaseScraper):
                 race_date_warning=race_date_warning,
             )
         info = self._from_pages(loaded.pages, venue)
+        going_note = _going_clock_note(
+            BeautifulSoup(html, "lxml"),
+            info,
+            race_date=race_date,
+            today=today,
+            race_date_warning=race_date_warning,
+        )
+        if going_note:
+            info = info.model_copy(update={"warning": join_warnings(info.warning, going_note)})
         if loaded.status == "blocked":
             extra = join_warnings(self._transport.fallback_warning, self._blocked_warning(loaded))
             info = self._with_fetch_block(info, loaded)
@@ -1072,8 +1081,8 @@ class JRATrackScraper(BaseScraper):
         block = _venue_block(soup, venue)
         if block is None:
             return None
-        unit = block.find("div", class_="unit")
-        if not isinstance(unit, Tag):
+        unit = _latest_unit(block, year)
+        if unit is None:
             return None
         cell = unit.find("div", class_="cushion")
         if not isinstance(cell, Tag):
@@ -1105,8 +1114,8 @@ class JRATrackScraper(BaseScraper):
         block = _venue_block(soup, venue)
         if block is None:
             return None, None
-        unit = block.find("div", class_="unit")
-        if not isinstance(unit, Tag):
+        unit = _latest_unit(block, year)
+        if unit is None:
             return None, None
         stamp = unit.find("div", class_="time")
         measured = None
@@ -1120,15 +1129,20 @@ class JRATrackScraper(BaseScraper):
     def _extract_measurement_time(
         self, soup: BeautifulSoup, section_name: str, year: int | None
     ) -> datetime | None:
-        """Measurement clock printed in ``section_name``. No year means null.
+        """Latest clock printed in ``section_name``. No year means null.
 
-        週間情報 is not this section. A clock there is not the cushion or
-        moisture time.
+        A selected dropdown option is the reading next to the number. When
+        that option is absent, the latest clock in the section is used.
+        An older entry in the same section is not reused. 週間情報 is not
+        this section.
         """
+        selected = _selected_clock(soup, section_name, year)
+        if selected is not None:
+            return selected
         text = measurement_sections_from_soup(soup).get(section_name, "")
         times = measurement_times(text, year)
         if times:
-            return times[0]
+            return max(times)
         return None
 
     def _extract_grass_info(self, soup: BeautifulSoup) -> GrassInfo | None:
@@ -1206,8 +1220,10 @@ class JRATrackScraper(BaseScraper):
                         date_match = re.search(r"(\d{1,2})日", date_text)
                         if date_match:
                             day = int(date_match.group(1))
-                            now = datetime.now()
-                            date = datetime(now.year, now.month, day)
+                            now = tokyo_now()
+                            date = _calendar_day(now.year, now.month, day)
+                            if date is None:
+                                continue
 
                             weather = Weather.UNKNOWN
                             if weather_row and i < len(weather_row):
@@ -1258,6 +1274,109 @@ def _cushion_number(info: TrackInfo) -> float | None:
     if info.turf is None or info.turf.cushion is None:
         return None
     return info.turf.cushion.value
+
+
+def _calendar_day(year: int, month: int, day: int) -> datetime | None:
+    """A calendar day, or null when that month does not have ``day``.
+
+    A weekly header of 31日 in November is the previous month's day. It is
+    not a measurement, and it must not abort the baba parse.
+    """
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def _latest_unit(block: Tag, year: int | None) -> Tag | None:
+    """The unit with the latest printed clock. An undated unit does not win."""
+    units = [
+        unit
+        for unit in block.find_all("div", class_="unit", recursive=False)
+        if isinstance(unit, Tag)
+    ]
+    if not units:
+        units = [unit for unit in block.find_all("div", class_="unit") if isinstance(unit, Tag)]
+    best: Tag | None = None
+    best_time: datetime | None = None
+    for unit in units:
+        stamp = unit.find("div", class_="time")
+        measured = None
+        if isinstance(stamp, Tag):
+            measured = parse_measurement_time(stamp.get_text(" ", strip=True), year)
+        if measured is None:
+            if best is None:
+                best = unit
+            continue
+        if best_time is None or measured >= best_time:
+            best = unit
+            best_time = measured
+    return best
+
+
+def _selected_clock(soup: BeautifulSoup, section_name: str, year: int | None) -> datetime | None:
+    """Clock of the selected measurement option, when the page prints one."""
+    select_id = {"クッション値": "cushion_list", "含水率": "moist_list"}.get(section_name)
+    if select_id is None:
+        return None
+    select = soup.find("select", id=select_id)
+    if not isinstance(select, Tag):
+        return None
+    chosen = select.find("option", selected=True)
+    if not isinstance(chosen, Tag):
+        return None
+    return parse_measurement_time(chosen.get_text(" ", strip=True), year)
+
+
+GOING_NOT_RACE_DATE = "going reading is not the race date"
+
+
+def _going_clock_note(
+    soup: BeautifulSoup,
+    info: TrackInfo,
+    *,
+    race_date: date | None,
+    today: date | None,
+    race_date_warning: str | None,
+) -> str | None:
+    """Warn when 馬場状態 is an older day than the cushion or moisture reading.
+
+    The same day as those readings is already covered by ``stale``. A going
+    clock is not copied onto a newer cushion or moisture number.
+    """
+    if race_date_warning:
+        return None
+    year = info.date.year if info.date is not None else None
+    text = measurement_sections_from_soup(soup).get("馬場状態", "")
+    times = measurement_times(text, year)
+    if not times:
+        return None
+    going_day = max(times).astimezone(TOKYO).date()
+    compared = race_date or today or tokyo_now().date()
+    if going_day == compared:
+        return None
+    reading = _reading_day(info)
+    if reading is not None and going_day == reading:
+        return None
+    return f"{GOING_NOT_RACE_DATE}: {going_day.isoformat()}"
+
+
+def _reading_day(info: TrackInfo) -> date | None:
+    """Latest cushion or moisture day. The going clock is not included."""
+    stamps: list[datetime] = []
+    for course in (info.turf, info.dirt):
+        if course is None:
+            continue
+        if course.cushion is not None and course.cushion.measured_at is not None:
+            stamps.append(course.cushion.measured_at)
+        if course.moisture is not None and course.moisture.measured_at is not None:
+            stamps.append(course.moisture.measured_at)
+    if not stamps:
+        return None
+    latest = max(stamps)
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=TOKYO)
+    return latest.astimezone(TOKYO).date()
 
 
 def _venue_block(soup: BeautifulSoup, venue: str) -> Tag | None:

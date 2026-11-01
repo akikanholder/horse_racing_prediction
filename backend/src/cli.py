@@ -772,26 +772,52 @@ def _print_historical_race(race: HistoricalRace) -> None:
 def cmd_trends(args):
     """Win rate, top-2, top-3, and ROI over settled history."""
     if args.today and (
-        args.date or args.date_from or args.date_to or args.recent_meeting or args.as_of
+        args.date
+        or getattr(args, "meeting_date", None)
+        or args.date_from
+        or args.date_to
+        or args.recent_meeting
+        or args.as_of
     ):
         print("--today は Asia/Tokyo のその日だけです。ほかの日付と一緒には使えません")
         sys.exit(1)
-    if not args.today and not args.recent_meeting and not args.date and not args.date_from:
+    if (
+        not args.today
+        and not args.recent_meeting
+        and not args.date
+        and not getattr(args, "meeting_date", None)
+        and not args.date_from
+    ):
         print("--today か --date か --from か --recent-meeting を指定してください")
         sys.exit(1)
+    if args.retries < 0:
+        print("--retries は 0 以上の整数です")
+        sys.exit(1)
+    meeting_date = args.date or getattr(args, "meeting_date", None)
+    if args.date and getattr(args, "meeting_date", None) and args.date != args.meeting_date:
+        print("--date と開催日の引数が違います")
+        sys.exit(1)
+    venues = list(args.venue or [])
+    if getattr(args, "meeting_venue", None):
+        if args.meeting_venue not in venues:
+            venues.append(args.meeting_venue)
     with _open_service(RaceService, args) as service:
         report = service.get_race_trends(
-            venues=args.venue,
+            venues=venues or None,
             surface=args.surface,
             distance=args.distance,
             race_class=args.race_class,
             going=args.going,
-            on_date=None if args.today else _cli_date(args.date),
+            on_date=None if args.today else _cli_date(meeting_date),
             date_from=_cli_date(args.date_from),
             date_to=_cli_date(args.date_to),
             recent_meeting=args.recent_meeting,
             as_of=_cli_date(args.as_of),
             today=args.today,
+            request_timeout=args.timeout,
+            retries=args.retries,
+            concurrency=args.concurrency,
+            time_budget=args.time_budget,
         )
     if args.json:
         print_json(report)
@@ -1249,6 +1275,40 @@ def main():
     trends_parser.add_argument(
         "--as-of",
         help="recent meeting の当日。YYYYMMDD または YYYY-MM-DD。無ければ今日（Asia/Tokyo）",
+    )
+    trends_parser.add_argument(
+        "meeting_date",
+        nargs="?",
+        help="開催日。YYYYMMDD または YYYY-MM-DD。--date と同じ",
+    )
+    trends_parser.add_argument(
+        "meeting_venue",
+        nargs="?",
+        help="競馬場。--venue と同じ。例: trends 20261018 東京",
+    )
+    trends_parser.add_argument(
+        "--timeout",
+        type=_finite_arg("timeout"),
+        default=20,
+        help="1リクエストの待ち秒数。既定 20。403 の回避には使わない",
+    )
+    trends_parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="タイムアウト・5xx・接続断だけ再試行する回数。403・captcha・ログインは再試行しない",
+    )
+    trends_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="同時に進めるレース数の上限（1から4）。共有セッションなので取得は1本ずつ",
+    )
+    trends_parser.add_argument(
+        "--time-budget",
+        type=_finite_arg("time_budget"),
+        default=None,
+        help="全体の秒数。超えたら取得済みの集計を返し、残りは warning。省略すると上限なし",
     )
     trends_parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     trends_parser.set_defaults(func=cmd_trends)

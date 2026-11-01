@@ -46,6 +46,13 @@ class TrackBias(BaseModel):
         "unavailable",
         description="sufficient は内外とペースの両方。thin は片方。無いときは unavailable",
     )
+    blocked_reason: Literal["captcha", "challenge", "login", "http_403"] | None = Field(
+        None,
+        description=(
+            "accessD または馬場情報の取得を止めた理由。"
+            "ラベルが別の公開 JRA ページから取れたときは null。403 本文からは作らない"
+        ),
+    )
     warning: str | None = Field(
         None,
         description=(
@@ -229,10 +236,11 @@ class RaceCard(BaseModel):
                 update={
                     "inside_outside": existing.inside_outside,
                     "pace_bias": existing.pace_bias,
-                    "source": existing.source,
-                    "data_sufficiency": existing.data_sufficiency,
-                    "warning": existing.warning,
-                }
+                "source": existing.source,
+                "data_sufficiency": existing.data_sufficiency,
+                "warning": existing.warning,
+                "blocked_reason": existing.blocked_reason,
+            }
             )
         if self.race.track_bias != base:
             self.race = self.race.model_copy(update={"track_bias": base})
