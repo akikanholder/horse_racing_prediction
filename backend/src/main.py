@@ -20,6 +20,13 @@ from backend.models.race_trends import Going, RaceTrendReport
 from backend.models.track import TrackInfo
 from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
 from backend.services.csv_export_service import CsvExportService, NoRacesFoundError
+from backend.services.prediction_report import (
+    diff_editions,
+    export_backtest,
+    parse_edition,
+    parse_race_id,
+    roi_summary,
+)
 from backend.services.prediction_store import (
     DuplicateRecordError,
     PredictionStore,
@@ -125,9 +132,7 @@ async def root():
             "race_odds": (
                 "/api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live"
             ),
-            "final_odds": (
-                "/api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku"
-            ),
+            "final_odds": ("/api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku"),
             "horses": "/api/horses/{horse_id}",
             "courses": "/api/courses",
             "course_detail": "/api/courses/{venue}",
@@ -136,6 +141,9 @@ async def root():
             "race_csv_export": "/api/races/export?date=YYYY-MM-DD",
             "predictions": "/api/predictions?date=YYYYMMDD",
             "predictions_settle": "/api/predictions/settle?date=YYYYMMDD",
+            "predictions_export": "/api/predictions/export?from=YYYYMMDD&to=YYYYMMDD",
+            "predictions_diff": "/api/predictions/diff?date=YYYYMMDD",
+            "predictions_roi": "/api/predictions/roi?from=YYYYMMDD&to=YYYYMMDD",
         },
     }
 
@@ -542,6 +550,8 @@ async def get_final_combination_odds(
     fetch_mode が html のときはヘッドレスを開かない。
     403、ログイン、captcha はそこで止め、別の身元では取りにいかない。
     払戻からオッズは作らない。
+    確定かつ complete のとき、依頼した馬券種の確定払戻を ``payouts`` に載せる。
+    ページに無い馬券種は入れず、``confirmed payout was not on the result`` を warning に足す。
 
     Args:
         race_id: レースID
@@ -890,6 +900,122 @@ def settle_predictions(
         raise _prediction_error(exc) from exc
     except Exception as exc:
         logger.error("Failed to settle predictions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _prediction_span(date_from: str, date_to: str | None) -> tuple[date, date]:
+    try:
+        start = parse_meeting_date(date_from)
+        end = parse_meeting_date(date_to) if date_to else start
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    if end < start:
+        raise _prediction_error(
+            PredictionValidationError("date range ends before it starts"),
+            status_code=400,
+        )
+    return start, end
+
+
+@app.get("/api/predictions/export", tags=["Predictions"])
+def export_predictions_api(
+    date_from: Annotated[str, Query(alias="from", description="YYYYMMDD または YYYY-MM-DD")],
+    date_to: Annotated[str | None, Query(alias="to", description="終了日。含む")] = None,
+    bins: Annotated[int, Query(description="等幅の確率帯。1 から 100")] = 10,
+    edition: Annotated[
+        str,
+        Query(
+            description=(
+                "day_before / pre_post_30m / pre_post_45m / final。"
+                "既定 final は当日の最新、無ければ前日の最新"
+            )
+        ),
+    ] = "final",
+):
+    """馬ごとの予想と、settle 済みの着順・勝敗。校正表、Brier、対数損失。
+
+    確定単勝オッズはこの API では取りにいかない。``final_odds`` は null で、
+    warning は ``final win odds were not on the prediction record``。
+    払戻からオッズは作らない。勝敗か勝率が null の行は校正に入れない。
+    ``edition`` の既定は ``final``。前日と当日は足さない。
+    """
+    start, end = _prediction_span(date_from, date_to)
+    try:
+        return export_backtest(
+            _prediction_store(), start, end, bins=bins, edition=parse_edition(edition)
+        )
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    except Exception as exc:
+        logger.error("Failed to export predictions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/predictions/diff", tags=["Predictions"])
+def diff_predictions_api(
+    date_text: Annotated[str, Query(alias="date", description="YYYYMMDD または YYYY-MM-DD")],
+    race_id: Annotated[str | None, Query(alias="race", description="12桁の race_id")] = None,
+):
+    """同じレースの前日（day_before）と、当日の最新（pre_post_30m か pre_post_45m）。
+
+    確率、印、馬券、精算済みの収支差。未精算の収支は null。
+    """
+    try:
+        day = parse_meeting_date(date_text)
+        selected = parse_race_id(race_id)
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    try:
+        return diff_editions(_prediction_store(), day, race_id=selected)
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    except Exception as exc:
+        logger.error("Failed to diff predictions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/predictions/roi", tags=["Predictions"])
+def roi_predictions_api(
+    date_from: Annotated[str, Query(alias="from", description="YYYYMMDD または YYYY-MM-DD")],
+    date_to: Annotated[str | None, Query(alias="to", description="終了日。含む")] = None,
+    by: Annotated[
+        str,
+        Query(description="day、bet_type、surface、odds_band。カンマ区切り"),
+    ] = "day,bet_type,surface,odds_band",
+    odds_bands: Annotated[
+        str | None,
+        Query(alias="odds_bands", description="増加する正の境界。既定は 1,3,5,10,20,50,100"),
+    ] = None,
+    edition: Annotated[
+        str,
+        Query(
+            description=(
+                "day_before / pre_post_30m / pre_post_45m / final。"
+                "既定 final は当日の最新、無ければ前日の最新"
+            )
+        ),
+    ] = "final",
+):
+    """bought の的中率と回収。reference は入れない。
+
+    返還は賭け金と払戻に入り、的中率の分母からは外す。
+    ワイドのオッズ帯は null。未精算は集計しない。
+    ``edition`` の既定は ``final``。同じレースの前日と当日は足さない。
+    """
+    start, end = _prediction_span(date_from, date_to)
+    try:
+        return roi_summary(
+            _prediction_store(),
+            start,
+            end,
+            by=by,
+            odds_bands=odds_bands,
+            edition=parse_edition(edition),
+        )
+    except PredictionValidationError as exc:
+        raise _prediction_error(exc, status_code=400) from exc
+    except Exception as exc:
+        logger.error("Failed to summarize prediction ROI: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

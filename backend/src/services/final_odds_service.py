@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Literal
 
 from backend.models.odds import ODDS_ENCODING, BetType, FinalRaceOdds, NonRunner, OddsQuote
-from backend.models.race import SettledRaceResult
+from backend.models.race import RacePayout, SettledRaceResult
 from backend.scrapers.final_odds import (
     COMBO_ODDS_MISSING,
     FINAL_ODDS_NOT_ON_PAGE,
@@ -59,6 +59,12 @@ logger = logging.getLogger(__name__)
 
 _COMBO_TYPES: tuple[BetType, ...] = ("wide", "umaren", "sanrenpuku")
 _PAGE_TYPE = {"wide": "b5", "umaren": "b4", "sanrenpuku": "b7"}
+_PAYOUT_LABELS: dict[BetType, frozenset[str]] = {
+    "wide": frozenset({"ワイド"}),
+    "umaren": frozenset({"馬連"}),
+    "sanrenpuku": frozenset({"3連複", "三連複"}),
+}
+PAYOUT_MISSING = "confirmed payout was not on the result"
 _ODDS_PAGE = "https://race.netkeiba.com/odds/index.html"
 HeadlessChoice = Callable[[str], str] | Literal["auto", "off"]
 
@@ -163,11 +169,13 @@ class FinalOddsService:
         if client is not None and not _past_meeting(settled):
             previous = bool(getattr(client, "replay_disabled", False))
             client.replay_disabled = True  # type: ignore[attr-defined]
+        payout_rows, payout_note = _combination_payouts(settled, selected)
         try:
             quotes, runners, warning = self._load(race_id, selected, fetched_at, settled)
         finally:
             if client is not None and not _past_meeting(settled):
                 client.replay_disabled = previous  # type: ignore[attr-defined]
+        warning = join_warnings(warning, payout_note)
         if not quotes:
             note = warning or FINAL_ODDS_NOT_ON_PAGE
             return _empty(
@@ -178,6 +186,7 @@ class FinalOddsService:
                 warning=note,
                 result_phase="confirmed",
                 complete=True,
+                payouts=payout_rows,
             )
         labeled = [label_final_market_quote(quote) for quote in quotes]
         return FinalRaceOdds(
@@ -195,6 +204,7 @@ class FinalOddsService:
             odds_final=True,
             quotes=labeled,
             non_runners=runners,
+            payouts=payout_rows,
             warning=warning,
             fetched_at=fetched_at,
         )
@@ -533,6 +543,27 @@ def _combo_bet_types(bet_types: str | list[str] | None) -> list[BetType]:
     return raw
 
 
+def _combination_payouts(
+    settled: SettledRaceResult,
+    selected: list[BetType],
+) -> tuple[list[RacePayout], str | None]:
+    """Confirmed payout rows for the requested combination types.
+
+    The yen amounts are the result page's. A missing ticket is left out and
+    named. Odds are not turned into a payout, and a payout is not an odds price.
+    """
+    rows = [
+        row
+        for row in settled.payouts
+        if any(row.bet_type in _PAYOUT_LABELS[bet_type] for bet_type in selected)
+    ]
+    present = {row.bet_type for row in rows}
+    missing = [bet_type for bet_type in selected if not (present & _PAYOUT_LABELS[bet_type])]
+    if not missing:
+        return rows, None
+    return rows, f"{PAYOUT_MISSING}: {', '.join(missing)}"
+
+
 def _empty(
     race_id: str,
     bet_types: list[BetType],
@@ -542,6 +573,7 @@ def _empty(
     warning: str | None,
     result_phase: Literal["provisional", "confirmed"] | None = None,
     complete: bool | None = None,
+    payouts: list[RacePayout] | None = None,
 ) -> FinalRaceOdds:
     return FinalRaceOdds(
         race_id=race_id,
@@ -558,6 +590,7 @@ def _empty(
         odds_final=False,
         quotes=[],
         non_runners=None,
+        payouts=list(payouts or []),
         warning=warning,
         fetched_at=fetched_at,
     )
