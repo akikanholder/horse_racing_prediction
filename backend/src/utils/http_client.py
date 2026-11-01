@@ -10,6 +10,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from backend.utils.text_encoding import decode_page_bytes
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,14 +129,9 @@ class HTTPClient:
             )
             response.raise_for_status()
 
-            if encoding:
-                response.encoding = encoding
-            elif response.encoding is None:
-                response.encoding = "utf-8"
-
             self._last_request_time = time.time()
             self._remember_response(response)
-            return response.text
+            return _text_from_response(response, encoding)
 
         except requests.RequestException as e:
             logger.error(f"Request failed for {url}: {e}")
@@ -173,14 +170,9 @@ class HTTPClient:
             )
             response.raise_for_status()
 
-            if encoding:
-                response.encoding = encoding
-            elif response.encoding is None:
-                response.encoding = "utf-8"
-
             self._last_request_time = time.time()
             self._remember_response(response)
-            return response.text
+            return _text_from_response(response, encoding)
 
         except requests.RequestException as e:
             logger.error(f"Request failed for {url}: {e}")
@@ -200,6 +192,16 @@ class HTTPClient:
         if self._session:
             self._session.close()
             self._session = None
+
+
+def _text_from_response(response: requests.Response, requested: str | None) -> str:
+    """Unicode text. EUC-JP bytes are not decoded as UTF-8."""
+    content_type = response.headers.get("Content-Type")
+    return decode_page_bytes(
+        response.content,
+        requested=requested,
+        content_type=content_type,
+    )
 
 
 class AsyncHTTPClient:
@@ -270,10 +272,15 @@ class AsyncHTTPClient:
                 logger.debug(f"Async requesting: {url} (attempt {attempt + 1})")
                 response = await client.get(url, params=params, headers=request_headers)
                 response.raise_for_status()
-                return response.text
+                return decode_page_bytes(
+                    response.content,
+                    requested=None,
+                    content_type=response.headers.get("content-type"),
+                )
 
             except httpx.HTTPError as e:
-                if attempt == self.max_retries:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status in {401, 403} or attempt == self.max_retries:
                     logger.error(f"Async request failed for {url}: {e}")
                     raise
                 wait_time = self.backoff_factor * (2**attempt)

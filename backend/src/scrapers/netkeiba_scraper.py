@@ -60,8 +60,10 @@ from backend.scrapers.page_fallback import (
     PageFallback,
     embedded_json_payloads,
     looks_like_login_wall,
+    page_block_reason,
     same_site_horse_result_urls,
 )
+from backend.scrapers.race_ids import page_mismatch_warning
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
     NETKEIBA_SHUTUBA_FORBIDDEN,
@@ -70,6 +72,7 @@ from backend.scrapers.runner_status import (
     apply_records,
     as_page_source,
     join_warnings,
+    post_position_warning,
     records_from_entries,
     row_status,
     same_site_status_urls,
@@ -1921,6 +1924,15 @@ class NetkeibaScraper(BaseScraper):
             )
             if looks_like_login_wall(html):
                 raise AccessBlocked(401, "requires login")
+            blocked = page_block_reason(html)
+            if blocked == "captcha":
+                raise AccessBlocked(None, "returned a captcha", reason="captcha")
+            if blocked == "challenge":
+                raise AccessBlocked(None, "returned a challenge", reason="challenge")
+            if blocked == "http_403":
+                raise AccessBlocked(403, "returned 403", reason="http_403")
+            if blocked == "login":
+                raise AccessBlocked(401, "requires login", reason="login")
             races = self._races_on_date(
                 BeautifulSoup(html, "lxml"), target_date, date_str, list_url
             )
@@ -2189,6 +2201,21 @@ class NetkeibaScraper(BaseScraper):
         if card is None:
             return None
         warning = self._shutuba_warning(card, loaded.warning, loaded.status)
+        page_note = None
+        if card.race is not None:
+            page_venue = None
+            if loaded.pages:
+                page_venue = self._meeting_header_venue(
+                    BeautifulSoup(loaded.pages[0].body, "lxml")
+                )
+            page_note = page_mismatch_warning(
+                race_id,
+                venue=page_venue or card.race.venue,
+                round_number=card.race.round_number,
+                day_number=card.race.day_number,
+                race_number=None,
+            )
+        warning = join_warnings(warning, page_note)
         if warning != card.warning:
             card = card.model_copy(update={"warning": warning})
         return card
@@ -3364,6 +3391,7 @@ class NetkeibaScraper(BaseScraper):
             race_number = self._extract_race_number(race_id)
             race_date = self._extract_date_from_race_id(race_id) or date.today()
             venue_code, venue, race_data_text = self._confirmed_meeting(soup, race_id)
+            round_number, day_number = self._meeting_numbers(soup)
             if venue == "不明":
                 distance, track_type = None, None
                 track_condition = None
@@ -3389,6 +3417,8 @@ class NetkeibaScraper(BaseScraper):
                 race_date=race_date,
                 venue=venue,
                 venue_code=venue_code,
+                round_number=round_number,
+                day_number=day_number,
                 distance=distance or 0,
                 track_type=track_type or "不明",
                 track_condition=track_condition,
@@ -3401,6 +3431,18 @@ class NetkeibaScraper(BaseScraper):
         except Exception as e:
             logger.warning(f"Failed to parse race info: {e}")
             return None
+
+    def _meeting_numbers(self, soup: BeautifulSoup) -> tuple[int | None, int | None]:
+        """回 and 日目 printed in RaceData02. Absent text stays null."""
+        data02 = soup.select_one(".RaceData02")
+        if not isinstance(data02, Tag):
+            return None, None
+        text = self.clean_text(data02.get_text(" ", strip=True))
+        round_match = re.search(r"(\d+)\s*回", text)
+        day_match = re.search(r"(\d+)\s*日目", text)
+        round_number = int(round_match.group(1)) if round_match else None
+        day_number = int(day_match.group(1)) if day_match else None
+        return round_number, day_number
 
     def _confirmed_meeting(self, soup: BeautifulSoup, race_id: str) -> tuple[str | None, str, str]:
         """Return venue code, name, and RaceData01 text when the page is that meeting.
@@ -3529,8 +3571,9 @@ class NetkeibaScraper(BaseScraper):
         self, card: RaceCard, chain_warning: str | None, status: str
     ) -> str | None:
         """A printed status for every starter drops the fallback warning."""
+        positions = post_position_warning(card.entries)
         if card.entries and all(entry.status is not None for entry in card.entries):
-            return None
+            return positions
         blocked = None
         if status == "blocked":
             blocked = (
@@ -3542,7 +3585,7 @@ class NetkeibaScraper(BaseScraper):
         if not card.entries and blocked is None and headless is None:
             return None
         missing = SCRATCH_STATUS_MISSING if card.entries else None
-        return join_warnings(blocked, headless, missing)
+        return join_warnings(blocked, headless, missing, positions)
 
     def _parse_race_entries(
         self,
@@ -3565,7 +3608,9 @@ class NetkeibaScraper(BaseScraper):
             if not isinstance(row, Tag):
                 continue
             cols = row.find_all(["td", "th"])
-            if len(cols) < 4:
+            if len(cols) < 2:
+                continue
+            if len(cols) < 4 and row.find("a", href=re.compile(r"horse/")) is None:
                 continue
 
             try:
@@ -3577,6 +3622,45 @@ class NetkeibaScraper(BaseScraper):
 
         return entries
 
+    def _bounded_number(self, text: str, low: int, high: int) -> int | None:
+        """A cell that is only an integer in range. ``取消`` and blanks stay null."""
+        cleaned = self.clean_text(text)
+        if not cleaned.isdigit():
+            return None
+        number = int(cleaned)
+        if low <= number <= high:
+            return number
+        return None
+
+    def _entry_identity(
+        self, row: Tag, cols: list[Tag]
+    ) -> tuple[int | None, int | None, Tag | None]:
+        """Frame, number, and the horse cell.
+
+        Before 枠順 the frame and number cells are blank. The horse stays,
+        and those fields stay null. A number is not filled in from the row order.
+        """
+        waku = row.select_one("td.Waku, td.Wakuban")
+        umaban = row.select_one("td.Umaban")
+        info = row.select_one("td.HorseInfo")
+        if isinstance(info, Tag):
+            bracket = self._bounded_number(waku.get_text() if isinstance(waku, Tag) else "", 1, 8)
+            number = self._bounded_number(
+                umaban.get_text() if isinstance(umaban, Tag) else "", 1, 18
+            )
+            return bracket, number, info
+        bracket = self._bounded_number(cols[0].get_text(), 1, 8) if cols else None
+        number = self._bounded_number(cols[1].get_text(), 1, 18) if len(cols) > 1 else None
+        if bracket is not None and number is not None:
+            horse_cell = cols[3] if len(cols) > 3 else cols[2]
+            return bracket, number, horse_cell
+        link = row.find("a", href=re.compile(r"horse/\d+"))
+        if isinstance(link, Tag):
+            parent = link.find_parent(["td", "th"])
+            cell = parent if isinstance(parent, Tag) else link
+            return bracket, number, cell
+        return None, None, None
+
     def _parse_entry_row(
         self,
         row: Tag,
@@ -3587,19 +3671,17 @@ class NetkeibaScraper(BaseScraper):
     ) -> RaceEntry | None:
         """Parse a single entry row."""
         try:
-            bracket_text = self.clean_text(cols[0].get_text())
-            bracket_number = self.extract_number(bracket_text)
-            if not bracket_number:
+            bracket_number, horse_number, horse_cell = self._entry_identity(row, cols)
+            if horse_cell is None:
                 return None
-
-            horse_number_text = self.clean_text(cols[1].get_text())
-            horse_number = self.extract_number(horse_number_text)
-            if not horse_number:
+            horse_link = horse_cell.find("a", href=re.compile(r"horse/"))
+            if horse_link is None:
+                horse_link = horse_cell.find("a")
+            horse_name = self.clean_text(
+                horse_link.get_text() if isinstance(horse_link, Tag) else horse_cell.get_text()
+            )
+            if not horse_name or horse_name in {"馬名", "枠", "馬番"}:
                 return None
-
-            horse_cell = cols[3] if len(cols) > 3 else cols[2]
-            horse_link = horse_cell.find("a")
-            horse_name = self.clean_text(horse_cell.get_text())
 
             horse_id = None
             if horse_link:

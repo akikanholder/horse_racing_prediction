@@ -355,12 +355,15 @@ def venv_failure_hint(stderr: str) -> str:
 def describe_node(which: Callable[[str], str | None], run: Runner) -> str:
     path = which("node")
     if not path:
-        return note("node not found (optional, not required)")
+        return note("node not found (optional; node-based tests skip)")
     result = run([path, "--version"], cwd=None, capture=True)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
-        return note(f"node is on PATH but --version failed ({detail}). Optional, setup continues.")
-    return note(f"node {result.stdout.strip()} (optional, not required)")
+        return note(
+            f"node is on PATH but --version failed ({detail}). "
+            "Optional; node-based tests skip and setup continues."
+        )
+    return note(f"node {result.stdout.strip()} (optional; node-based tests skip when it is missing)")
 
 
 def parse_options(argv: Sequence[str] | None = None) -> Options:

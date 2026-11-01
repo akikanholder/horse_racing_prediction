@@ -114,7 +114,7 @@ uv pip compile pyproject.toml requirements.pip.in \
 - `backend/.venv` が壊れている、または Python の版が違う: `make setup-force`。`--force` が無くても、Python が動かないか `requires-python` を外れている環境は作り直す。
 - Chromium が共有ライブラリ不足で起動しない: Linux では `backend/.venv/bin/python -m playwright install-deps chromium`（管理者権限）。ブラウザの取得先は Playwright の配布で、JRA と netkeiba には繋がない。
 - `backend/requirements.lock` が無い: 未固定のインストールには落とさず失敗する。ファイルを戻すか、上の `pip-compile` で作り直す。
-- `node` が無い: 注記だけで、失敗にはしない。
+- `node` が無い: 注記だけで、失敗にはしない。Node を使うテストは skip する。Node のインストールはセットアップでは行わない。
 
 ## 使用方法
 
@@ -182,7 +182,15 @@ python -m backend.cli track
 python -m backend.cli track --venue 中山 --merge
 python -m backend.cli track --venue 東京 --json
 
+# 日付と競馬場から race id（回・日は開催一覧。推測しない）
+python -m backend.cli race-id 2026-11-01 東京 11
+python -m backend.cli race-id 2026-11-01 東京
+python -m backend.cli race-id 2026-11-01 --json
+
 # オッズを取得（単勝が既定。ワイド・馬連・三連複は --bet-types）
+# odds_phase は forecast / provisional / live / final。is_official_market は live と final だけ true
+# 一時的な 400・5xx・タイムアウトは取り直す。401・403・captcha は取り直さない
+# --date と --venue を付けると、その日の開催一覧と race id が違うとき warning
 python -m backend.cli odds <race_id> --bet-types wide --prefer live
 python -m backend.cli odds <race_id> --bet-types umaren --prefer live
 python -m backend.cli odds <race_id> --bet-types sanrenpuku --prefer live

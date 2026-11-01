@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 from backend.models.course import Course, CourseCondition, WeeklyVenueSchedule
 from backend.models.historical import HistoricalBatch, HistoricalExport
@@ -44,6 +44,7 @@ from backend.scrapers.runner_status import (
     apply_scratch_page,
     join_warnings,
     merge_non_runners,
+    post_position_warning,
 )
 from backend.scrapers.training_scraper import TrainingScraper, credentials_from_env
 from backend.services.final_odds_service import FinalOddsService
@@ -51,6 +52,8 @@ from backend.services.historical_service import HistoricalService
 from backend.services.race_trend_service import RaceTrendService
 
 logger = logging.getLogger(__name__)
+
+_ModelT = TypeVar("_ModelT")
 
 
 class RaceService:
@@ -179,10 +182,22 @@ class RaceService:
 
         return sorted(all_races.values(), key=lambda race: (race.venue, race.race_number))
 
-    def get_race_card(self, race_id: str, *, fetch_mode: str | None = None) -> RaceCard | None:
+    def get_race_card(
+        self,
+        race_id: str,
+        *,
+        fetch_mode: str | None = None,
+        expect_date: date | None = None,
+        expect_venue: str | None = None,
+    ) -> RaceCard | None:
         """Get race card with all entries."""
         with self._using(fetch_mode):
-            return self._race_card(race_id)
+            card = self._race_card(race_id)
+        if card is None:
+            return None
+        return self._annotate_race_id(
+            card, race_id, expect_date=expect_date, expect_venue=expect_venue
+        )
 
     def _race_card(self, race_id: str) -> RaceCard | None:
         """Get race card with all entries.
@@ -270,10 +285,12 @@ class RaceService:
         sleeper: Callable[[float], None] | None = None,
         clock: Callable[[], float] | None = None,
         now: Callable[[], datetime] | None = None,
+        expect_date: date | None = None,
+        expect_venue: str | None = None,
     ) -> SettledRaceResult:
         """Settled finish order and payouts for one race."""
         with self._using(fetch_mode):
-            return self._settled_race_result(
+            settled = self._settled_race_result(
                 race_id,
                 wait_complete=wait_complete,
                 retry_interval=retry_interval,
@@ -282,6 +299,24 @@ class RaceService:
                 clock=clock,
                 now=now,
             )
+        return self._annotate_race_id(
+            settled, race_id, expect_date=expect_date, expect_venue=expect_venue
+        )
+
+    def _annotate_race_id(
+        self,
+        model: _ModelT,
+        race_id: str,
+        *,
+        expect_date: date | None,
+        expect_venue: str | None,
+    ) -> _ModelT:
+        """Attach a list or shape mismatch. A blocked list is not retried."""
+        note = _race_id_note(self.netkeiba_scraper, race_id, expect_date, expect_venue)
+        if not note or not hasattr(model, "model_copy"):
+            return model
+        current = getattr(model, "warning", None)
+        return model.model_copy(update={"warning": join_warnings(current, note)})  # type: ignore[attr-defined, no-any-return]
 
     def _settled_race_result(
         self,
@@ -409,6 +444,8 @@ class RaceService:
         bet_types: str | list[str] | None = None,
         *,
         fetch_mode: str | None = None,
+        expect_date: date | None = None,
+        expect_venue: str | None = None,
     ) -> FinalRaceOdds:
         """Final wide, umaren, and sanrenpuku odds for a past race.
 
@@ -420,7 +457,10 @@ class RaceService:
         mode = cast(Literal["html", "headless", "auto"], chosen)
         headless: Literal["auto", "off"] = "off" if mode == "html" else "auto"
         with FinalOddsService(fetch_mode=mode, headless_render=headless) as service:
-            return service.get(race_id, bet_types)
+            snapshot = service.get(race_id, bet_types)
+        return self._annotate_race_id(
+            snapshot, race_id, expect_date=expect_date, expect_venue=expect_venue
+        )
 
     def get_race_odds(
         self,
@@ -429,10 +469,15 @@ class RaceService:
         prefer: str = "live",
         *,
         fetch_mode: str | None = None,
+        expect_date: date | None = None,
+        expect_venue: str | None = None,
     ) -> RaceOdds:
         """Get win, wide, umaren, and sanrenpuku odds quotes for EV."""
         with self._using(fetch_mode):
-            return self._race_odds(race_id, bet_types, prefer)
+            snapshot = self._race_odds(race_id, bet_types, prefer)
+        return self._annotate_race_id(
+            snapshot, race_id, expect_date=expect_date, expect_venue=expect_venue
+        )
 
     def _race_odds(
         self,
@@ -743,13 +788,10 @@ class RaceService:
         entries = self._merge_entries(netkeiba_card.entries, jra_card.entries)
         if race.entry_count is None and entries:
             race = race.model_copy(update={"entry_count": len(entries)})
-        warning = None
+        warning = join_warnings(jra_card.warning, netkeiba_card.warning)
         if entries and any(entry.status is None for entry in entries):
-            warning = join_warnings(
-                jra_card.warning,
-                netkeiba_card.warning,
-                SCRATCH_STATUS_MISSING,
-            )
+            warning = join_warnings(warning, SCRATCH_STATUS_MISSING)
+        warning = join_warnings(warning, post_position_warning(entries))
         return RaceCard(race=race, entries=entries, warning=warning)
 
     @property
@@ -788,20 +830,43 @@ class RaceService:
 
         Identifier fields already present on the primary (netkeiba) entry are kept.
         """
-        secondary_by_number = {entry.horse_number: entry for entry in secondary}
+        secondary_by_number = {
+            entry.horse_number: entry
+            for entry in secondary
+            if entry.horse_number is not None
+        }
+        secondary_by_name = {
+            entry.horse_name: entry
+            for entry in secondary
+            if entry.horse_number is None and entry.horse_name
+        }
         merged: list[RaceEntry] = []
-        seen: set[int] = set()
+        seen_numbers: set[int] = set()
+        seen_names: set[str] = set()
 
         for entry in primary:
-            seen.add(entry.horse_number)
-            other = secondary_by_number.get(entry.horse_number)
+            if entry.horse_number is not None:
+                seen_numbers.add(entry.horse_number)
+                other = secondary_by_number.get(entry.horse_number)
+            else:
+                seen_names.add(entry.horse_name)
+                other = secondary_by_name.get(entry.horse_name)
             merged.append(self._fill_entry(entry, other) if other else entry)
 
         for entry in secondary:
-            if entry.horse_number not in seen:
+            if entry.horse_number is not None and entry.horse_number not in seen_numbers:
+                merged.append(entry)
+            elif entry.horse_number is None and entry.horse_name not in seen_names:
                 merged.append(entry)
 
-        return sorted(merged, key=lambda entry: entry.horse_number)
+        return sorted(
+            merged,
+            key=lambda entry: (
+                entry.horse_number is None,
+                entry.horse_number or 0,
+                entry.horse_name,
+            ),
+        )
 
     def _fill_entry(self, primary: RaceEntry, secondary: RaceEntry) -> RaceEntry:
         """Copy empty primary fields from the secondary entry."""
@@ -809,7 +874,13 @@ class RaceService:
         id_fields = {"horse_id", "jockey_id", "trainer_id"}
         status_fields = {"status", "status_label", "source", "fetched_at"}
         for field_name in RaceEntry.model_fields:
-            if field_name in {"bracket_number", "horse_number"} or field_name in status_fields:
+            if field_name in status_fields:
+                continue
+            if field_name in {"bracket_number", "horse_number"}:
+                current = getattr(primary, field_name)
+                incoming = getattr(secondary, field_name)
+                if current is None and incoming is not None:
+                    updates[field_name] = incoming
                 continue
             current = getattr(primary, field_name)
             incoming = getattr(secondary, field_name)
@@ -965,6 +1036,8 @@ def _merge_odds_snapshots(
     race_phase = _shared_race_phase(snapshots)
     non_runners = merge_non_runners([snapshot.non_runners for snapshot in snapshots])
     warning = join_warnings(*(snapshot.warning for snapshot in snapshots))
+    odds_phase, official, phase_note = _shared_odds_phase(snapshots)
+    warning = join_warnings(warning, phase_note)
     if not quotes:
         return RaceOdds(
             race_id=race_id,
@@ -974,6 +1047,8 @@ def _merge_odds_snapshots(
             reason=_combined_reason(bet_types, snapshots),
             encoding=ODDS_ENCODING,
             race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=official,
             quotes=[],
             non_runners=non_runners,
             warning=warning,
@@ -988,6 +1063,8 @@ def _merge_odds_snapshots(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=official,
         quotes=quotes,
         non_runners=non_runners,
         warning=warning,
@@ -1001,6 +1078,30 @@ def _shared_race_phase(snapshots: list[RaceOdds]) -> RacePhase | None:
     if len(phases) == 1:
         return next(iter(phases))
     return None
+
+
+def _shared_odds_phase(
+    snapshots: list[RaceOdds],
+) -> tuple[str | None, bool | None, str | None]:
+    """One odds_phase when every snapshot that named one agrees.
+
+    A disagreement is null and a warning. ``is_official_market`` follows the
+    same rule. A missing flag is not filled from the other bet type.
+    """
+    phases = {snapshot.odds_phase for snapshot in snapshots if snapshot.odds_phase is not None}
+    officials = {
+        snapshot.is_official_market
+        for snapshot in snapshots
+        if snapshot.is_official_market is not None
+    }
+    note = None
+    phase = next(iter(phases)) if len(phases) == 1 else None
+    official = next(iter(officials)) if len(officials) == 1 else None
+    if len(phases) > 1 or len(officials) > 1:
+        note = "odds phase sources disagree"
+        phase = None
+        official = None
+    return phase, official, note
 
 
 def _combined_reason(bet_types: list[BetType], snapshots: list[RaceOdds]) -> str:
@@ -1027,3 +1128,24 @@ def _normalize_bet_types(bet_types: str | list[str] | None) -> list[str]:
             if name and name not in names:
                 names.append(name)
     return names or ["win"]
+
+
+def _race_id_note(
+    netkeiba: object,
+    race_id: str,
+    meeting: date | None,
+    venue: str | None,
+) -> str | None:
+    """Warn when the id is not on that day's list. No date means a shape check only."""
+    from backend.scrapers.netkeiba_scraper import NetkeibaScraper
+    from backend.scrapers.race_ids import parse_race_id
+    from backend.services.race_id_service import RaceIdService
+
+    if meeting is None and not venue:
+        if parse_race_id(race_id).kind is None:
+            return "race id was not a netkeiba or JRA id"
+        return None
+    if not isinstance(netkeiba, NetkeibaScraper):
+        return None
+    service = RaceIdService(netkeiba)
+    return service.mismatch(race_id, meeting, venue)
