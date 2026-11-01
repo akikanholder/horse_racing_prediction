@@ -26,6 +26,8 @@ from backend.models.race import CardRunnerStatus, PageFetchSource, RaceEntry
 logger = logging.getLogger(__name__)
 
 SCRATCH_STATUS_MISSING = "scratch status was not on the page"
+POST_POSITIONS_MISSING = "post positions were not on the page"
+RACE_CARD_NOT_FOUND = "race card was not found"
 JRA_SHUTUBA_FORBIDDEN = "JRA shutuba returned 403"
 JRA_SHUTUBA_LOGIN = "JRA shutuba requires login"
 NETKEIBA_SHUTUBA_FORBIDDEN = "netkeiba shutuba returned 403"
@@ -65,6 +67,18 @@ _COMBINATION = re.compile(
 def compact(text: str) -> str:
     """Drop whitespace. The printed label is compared without gaps."""
     return re.sub(r"\s+", "", text or "")
+
+
+def post_position_warning(entries: list) -> str | None:
+    """枠 or 馬番 missing on a horse that is already entered. Numbers are not made up."""
+    if not entries:
+        return None
+    if any(
+        getattr(entry, "bracket_number", None) is None or getattr(entry, "horse_number", None) is None
+        for entry in entries
+    ):
+        return POST_POSITIONS_MISSING
+    return None
 
 
 def join_warnings(*parts: str | None) -> str | None:
@@ -314,10 +328,13 @@ def _optional_int(value: object) -> int | None:
 
 
 def records_from_entries(entries: list[RaceEntry]) -> list[StatusRecord]:
-    """Status already parsed from a starter row."""
+    """Status already parsed from a starter row.
+
+    A horse whose number is not on the page yet is not given one here.
+    """
     records: list[StatusRecord] = []
     for entry in entries:
-        if entry.status is None:
+        if entry.status is None or entry.horse_number is None:
             continue
         records.append(
             StatusRecord(
@@ -338,13 +355,48 @@ def apply_records(
     source: str,
     fetched_at: datetime,
 ) -> list[RaceEntry]:
-    """Fill missing status. Do not replace a status the earlier page printed."""
+    """Fill missing status. Do not replace a status the earlier page printed.
+
+    Horses still waiting for 枠順 stay on the card. A later record with the
+    same horse name fills the number the page printed. It does not invent one.
+    """
     page_source = as_page_source(source)
-    by_number = {entry.horse_number: entry for entry in entries}
-    order = [entry.horse_number for entry in entries]
+    numbered = [entry for entry in entries if entry.horse_number is not None]
+    unnumbered = [entry for entry in entries if entry.horse_number is None]
+    by_number = {entry.horse_number: entry for entry in numbered}
+    order = [entry.horse_number for entry in numbered]
+    consumed: set[str] = set()
     for record in records:
         current = by_number.get(record.horse_number)
         if current is None:
+            named = [
+                entry
+                for entry in unnumbered
+                if entry.horse_name
+                and entry.horse_name == record.horse_name
+                and entry.horse_name not in consumed
+            ]
+            if len(named) == 1:
+                entry = named[0]
+                consumed.add(entry.horse_name)
+                by_number[record.horse_number] = entry.model_copy(
+                    update={
+                        "horse_number": record.horse_number,
+                        "bracket_number": entry.bracket_number
+                        if entry.bracket_number is not None
+                        else record.bracket_number,
+                        "status": entry.status if entry.status is not None else record.status,
+                        "status_label": entry.status_label
+                        if entry.status is not None
+                        else record.status_label,
+                        "source": entry.source if entry.status is not None else page_source,
+                        "fetched_at": entry.fetched_at
+                        if entry.status is not None
+                        else fetched_at,
+                    }
+                )
+                order.append(record.horse_number)
+                continue
             if not record.horse_name or record.bracket_number is None:
                 continue
             order.append(record.horse_number)
@@ -368,7 +420,8 @@ def apply_records(
                 "fetched_at": fetched_at,
             }
         )
-    return [by_number[number] for number in order]
+    leftover = [entry for entry in unnumbered if entry.horse_name not in consumed]
+    return [by_number[number] for number in order if number in by_number] + leftover
 
 
 def same_site_status_urls(html: str, page_url: str) -> list[str]:

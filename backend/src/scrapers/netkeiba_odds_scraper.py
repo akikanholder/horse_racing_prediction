@@ -49,6 +49,8 @@ HTTP 400 や空の確定オッズは quotes を空にし、reason を返す。�
 
 import json
 import logging
+import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -59,6 +61,7 @@ from backend.models.odds import (
     BetType,
     NonRunner,
     OddsKind,
+    OddsPhase,
     OddsQuote,
     OddsSource,
     OddsStatus,
@@ -66,6 +69,11 @@ from backend.models.odds import (
     RacePhase,
 )
 from backend.scrapers.base_scraper import BaseScraper
+from backend.scrapers.page_fallback import (
+    looks_like_forbidden_page,
+    looks_like_login_wall,
+    page_block_reason,
+)
 from backend.scrapers.runner_status import (
     PriceCell,
     RangeCell,
@@ -85,6 +93,12 @@ UMAREN_ODDS_KEY = "4"
 SANRENPUKU_ODDS_KEY = "7"
 PLACE_ODDS_KEY = "2"
 _LIVE_STATUSES = frozenset({"result", "middle"})
+# 前日暫定。API の status 名。middle に「暫定」が付くときも同じ局面。
+_PROVISIONAL_STATUSES = frozenset({"provisional", "tentative", "zenjitsu", "kari", "temp"})
+_ODDS_ATTEMPTS = 3
+_ODDS_BACKOFF_SECONDS = 0.5
+# 408 and 425 are transient. 429 is a rate limit and is not retried.
+_TRANSIENT_HTTP = frozenset({408, 425, 500, 502, 503, 504})
 _MARKET_UPDATED_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
     "%Y/%m/%d %H:%M:%S",
@@ -118,11 +132,27 @@ class NetkeibaOddsScraper(BaseScraper):
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    def __init__(self, http_client: HTTPClient | None = None):
-        """Use a Session that already carries browser-like odds headers."""
+    def __init__(
+        self,
+        http_client: HTTPClient | None = None,
+        *,
+        max_attempts: int = _ODDS_ATTEMPTS,
+        backoff_seconds: float = _ODDS_BACKOFF_SECONDS,
+        sleeper: Callable[[float], None] | None = None,
+    ):
+        """Use a Session that already carries browser-like odds headers.
+
+        Transient failures (undecided HTTP 400, 5xx, timeout, connection
+        error) are retried ``max_attempts`` times with exponential backoff.
+        401, 403, a captcha, and a challenge are not retried. The odds client
+        does not also let urllib3 retry those statuses.
+        """
         if http_client is None:
-            http_client = HTTPClient(headers=self.BROWSER_HEADERS)
+            http_client = HTTPClient(headers=self.BROWSER_HEADERS, max_retries=0)
         super().__init__(http_client)
+        self._max_attempts = max(1, max_attempts)
+        self._backoff_seconds = backoff_seconds
+        self._sleeper = sleeper or time.sleep
 
     def get_win_odds(self, race_id: str, *, fetched_at: datetime | None = None) -> RaceOdds:
         """Fetch win odds for one race.
@@ -203,23 +233,24 @@ class NetkeibaOddsScraper(BaseScraper):
         }
         try:
             # compress=0 で JSON。HTML 用の euc-jp は使わない。
-            body = self.http_client.get(
-                url,
-                params=params,
-                headers=headers,
-                encoding=self.ENCODING,
-            )
-            payload = json.loads(body)
+            body = self._get_odds_body(url, params, headers, bet_type, race_id)
         except requests.HTTPError as e:
             # 400 の本文に数値が混ざっていても価格にはしない。
             logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
             return _unavailable_from_http_error(e, race_id, fetched, bet_type)
-        except json.JSONDecodeError as e:
-            logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
-            return _unavailable(race_id, fetched, "malformed odds payload", bet_type)
         except Exception as e:
             logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
             return _unavailable(race_id, fetched, "fetch failed", bet_type)
+        if body is None:
+            return _unavailable(race_id, fetched, "fetch failed", bet_type)
+        refusal = _refusal_reason(body)
+        if refusal is not None:
+            return _unavailable(race_id, fetched, refusal, bet_type)
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to fetch %s odds for %s: %s", bet_type, race_id, e)
+            return _unavailable(race_id, fetched, "malformed odds payload", bet_type)
 
         if bet_type == "wide":
             return parse_netkeiba_wide_odds(payload, race_id, fetched_at=fetched)
@@ -230,6 +261,54 @@ class NetkeibaOddsScraper(BaseScraper):
         if bet_type == "place":
             return parse_netkeiba_place_odds(payload, race_id, fetched_at=fetched)
         return parse_netkeiba_win_odds(payload, race_id, fetched_at=fetched)
+
+    def _get_odds_body(
+        self,
+        url: str,
+        params: dict[str, str],
+        headers: dict[str, str],
+        bet_type: BetType,
+        race_id: str,
+    ) -> str | None:
+        """GET the odds API. Retry only transient failures.
+
+        A 400 whose JSON already names ``status`` or ``reason`` is the API's
+        answer and is not retried. 401, 403, captcha, and a challenge stop
+        on the first response.
+        """
+        last: Exception | None = None
+        for attempt in range(self._max_attempts):
+            if attempt:
+                delay = self._backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retrying %s odds for %s in %.2fs after a transient error (%s/%s)",
+                    bet_type,
+                    race_id,
+                    delay,
+                    attempt + 1,
+                    self._max_attempts,
+                )
+                self._sleeper(delay)
+            try:
+                return self.http_client.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    encoding=self.ENCODING,
+                )
+            except requests.HTTPError as exc:
+                last = exc
+                if not _transient_odds_error(exc):
+                    raise
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last = exc
+            except requests.RequestException as exc:
+                last = exc
+                if not _transient_odds_error(exc):
+                    raise
+        if last is not None:
+            raise last
+        return None
 
 
 def parse_netkeiba_win_odds(
@@ -253,7 +332,17 @@ def parse_netkeiba_win_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    win_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    (
+        win_map,
+        kind,
+        source,
+        snapshot_status,
+        market_updated_at,
+        reason,
+        race_phase,
+        odds_phase,
+        is_official_market,
+    ) = opened
     quotes, runners = _quotes_from_win_map(
         win_map,
         race_id=race_id,
@@ -265,7 +354,13 @@ def parse_netkeiba_win_odds(
     runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
         empty = _unavailable(
-            race_id, fetched_at, reason or "odds unavailable", "win", race_phase=race_phase
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            "win",
+            race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=is_official_market,
         )
         return empty.model_copy(update={"non_runners": runners})
 
@@ -277,6 +372,8 @@ def parse_netkeiba_win_odds(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=quotes,
         non_runners=runners,
         fetched_at=fetched_at,
@@ -304,7 +401,7 @@ def parse_netkeiba_place_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    place_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    place_map, kind, source, snapshot_status, market_updated_at, reason, race_phase, odds_phase, is_official_market = opened
     quotes, runners = _quotes_from_place_map(
         place_map,
         race_id=race_id,
@@ -316,7 +413,13 @@ def parse_netkeiba_place_odds(
     runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
         empty = _unavailable(
-            race_id, fetched_at, reason or "odds unavailable", "place", race_phase=race_phase
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            "place",
+            race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=is_official_market,
         )
         return empty.model_copy(update={"non_runners": runners})
     return RaceOdds(
@@ -327,6 +430,8 @@ def parse_netkeiba_place_odds(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=quotes,
         non_runners=runners,
         fetched_at=fetched_at,
@@ -354,7 +459,7 @@ def parse_netkeiba_wide_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    wide_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    wide_map, kind, source, snapshot_status, market_updated_at, reason, race_phase, odds_phase, is_official_market = opened
     quotes, runners = _quotes_from_wide_map(
         wide_map,
         race_id=race_id,
@@ -366,7 +471,13 @@ def parse_netkeiba_wide_odds(
     runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
         empty = _unavailable(
-            race_id, fetched_at, reason or "odds unavailable", "wide", race_phase=race_phase
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            "wide",
+            race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=is_official_market,
         )
         return empty.model_copy(update={"non_runners": runners})
 
@@ -378,6 +489,8 @@ def parse_netkeiba_wide_odds(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=quotes,
         non_runners=runners,
         fetched_at=fetched_at,
@@ -406,7 +519,7 @@ def parse_netkeiba_umaren_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    umaren_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    umaren_map, kind, source, snapshot_status, market_updated_at, reason, race_phase, odds_phase, is_official_market = opened
     quotes, runners = _quotes_from_umaren_map(
         umaren_map,
         race_id=race_id,
@@ -418,7 +531,13 @@ def parse_netkeiba_umaren_odds(
     runners = _merge_runner_lists(runners, _runners_in_payload(payload, fetched_at))
     if not quotes:
         empty = _unavailable(
-            race_id, fetched_at, reason or "odds unavailable", "umaren", race_phase=race_phase
+            race_id,
+            fetched_at,
+            reason or "odds unavailable",
+            "umaren",
+            race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=is_official_market,
         )
         return empty.model_copy(update={"non_runners": runners})
 
@@ -430,6 +549,8 @@ def parse_netkeiba_umaren_odds(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=quotes,
         non_runners=runners,
         fetched_at=fetched_at,
@@ -458,7 +579,7 @@ def parse_netkeiba_sanrenpuku_odds(
     )
     if isinstance(opened, RaceOdds):
         return opened
-    trio_map, kind, source, snapshot_status, market_updated_at, reason, race_phase = opened
+    trio_map, kind, source, snapshot_status, market_updated_at, reason, race_phase, odds_phase, is_official_market = opened
     quotes, runners = _quotes_from_sanrenpuku_map(
         trio_map,
         race_id=race_id,
@@ -475,6 +596,8 @@ def parse_netkeiba_sanrenpuku_odds(
             reason or "odds unavailable",
             "sanrenpuku",
             race_phase=race_phase,
+            odds_phase=odds_phase,
+            is_official_market=is_official_market,
         )
         return empty.model_copy(update={"non_runners": runners})
 
@@ -486,6 +609,8 @@ def parse_netkeiba_sanrenpuku_odds(
         reason=None,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=quotes,
         non_runners=runners,
         fetched_at=fetched_at,
@@ -508,6 +633,8 @@ def _read_market(
         datetime | None,
         str | None,
         RacePhase | None,
+        OddsPhase | None,
+        bool | None,
     ]
     | RaceOdds
 ):
@@ -518,7 +645,7 @@ def _read_market(
     reason = _clean_reason(payload.get("reason"))
     raw_status = payload.get("status")
     status_name = raw_status.strip().lower() if isinstance(raw_status, str) else ""
-    race_phase = _phase_from_status(status_name)
+    phase_args = _phase_args(status_name, payload)
     data = payload.get("data")
     if not isinstance(data, dict):
         return _unavailable(
@@ -526,7 +653,7 @@ def _read_market(
             fetched_at,
             reason or "odds unavailable",
             bet_type,
-            race_phase=race_phase,
+            **phase_args,
         )
 
     odds_root = data.get("odds")
@@ -537,7 +664,7 @@ def _read_market(
             fetched_at,
             reason or "odds unavailable",
             bet_type,
-            race_phase=race_phase,
+            **phase_args,
         )
 
     kind, source, snapshot_status = _classify(status_name)
@@ -547,20 +674,34 @@ def _read_market(
             fetched_at,
             reason or f"unsupported odds status: {status_name}",
             bet_type,
-            race_phase=race_phase,
+            **phase_args,
         )
 
     market_updated_at = _parse_market_updated_at(data.get("official_datetime"))
-    return odds_map, kind, source, snapshot_status, market_updated_at, reason, race_phase
+    return (
+        odds_map,
+        kind,
+        source,
+        snapshot_status,
+        market_updated_at,
+        reason,
+        phase_args["race_phase"],
+        phase_args["odds_phase"],
+        phase_args["is_official_market"],
+    )
 
 
 def _classify(
     status_name: str,
 ) -> tuple[OddsKind | None, OddsSource | None, OddsStatus | None]:
-    """Map the API status onto quote kind without relabeling yoso as live."""
+    """Map the API status onto quote kind without relabeling yoso as live.
+
+    A provisional pre-sale board is still ``kind=live``. ``odds_phase`` says
+    ``provisional`` and ``is_official_market`` is false. ``kind`` is not rewritten.
+    """
     if status_name == "yoso":
         return "yoso", "netkeiba_yoso", "yoso"
-    if status_name in _LIVE_STATUSES:
+    if status_name in _LIVE_STATUSES or status_name in _PROVISIONAL_STATUSES:
         return "live", "netkeiba_live", "live"
     return None, None, None
 
@@ -568,14 +709,82 @@ def _classify(
 def _phase_from_status(status_name: str) -> RacePhase | None:
     """Map netkeiba status onto race-before (pre) or race-after (post).
 
-    ``yoso`` and ``middle`` are before the race is settled.
+    ``yoso``, ``middle``, and a provisional pre-sale status are before the race.
     ``result`` is the final market after the race.
     """
-    if status_name in {"yoso", "middle"}:
+    if status_name in {"yoso", "middle"} or status_name in _PROVISIONAL_STATUSES:
         return "pre"
     if status_name == "result":
         return "post"
     return None
+
+
+_PHASE_LABEL_KEYS = (
+    "reason",
+    "message",
+    "label",
+    "state",
+    "phase",
+    "odds_status",
+    "odds_type",
+    "sale_status",
+    "sale_type",
+    "odds_kbn",
+)
+
+
+def _phase_label(payload: object) -> str:
+    """Short labels the odds API uses for the board. Prices are not labels."""
+    if not isinstance(payload, dict):
+        return ""
+    parts: list[str] = []
+
+    def take(obj: dict[str, Any]) -> None:
+        for key in _PHASE_LABEL_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        for key in ("provisional", "is_provisional", "tentative"):
+            if obj.get(key) is True:
+                parts.append("暫定")
+
+    take(payload)
+    data = payload.get("data")
+    if isinstance(data, dict):
+        take(data)
+    return " ".join(parts)
+
+
+def _sale_phase(status_name: str, payload: object) -> tuple[OddsPhase | None, bool | None]:
+    """forecast / provisional / live / final, and whether that board is official.
+
+    ``is_official_market`` is true only for 発売中 and 確定. 予想 and 前日暫定
+    are false. An unnamed failure is null. Prices are not filled from this flag.
+    """
+    label = _phase_label(payload)
+    named_provisional = "暫定" in label
+    if status_name == "yoso":
+        return "forecast", False
+    if status_name == "result":
+        return "final", True
+    if status_name in _PROVISIONAL_STATUSES or (
+        status_name in {"middle", "live"} and named_provisional
+    ):
+        return "provisional", False
+    if status_name in {"middle", "live"}:
+        return "live", True
+    if named_provisional:
+        return "provisional", False
+    return None, None
+
+
+def _phase_args(status_name: str, payload: object) -> dict[str, Any]:
+    odds_phase, official = _sale_phase(status_name, payload)
+    return {
+        "race_phase": _phase_from_status(status_name),
+        "odds_phase": odds_phase,
+        "is_official_market": official,
+    }
 
 
 def _quotes_from_win_map(
@@ -878,6 +1087,9 @@ def _unavailable(
     bet_type: BetType = "win",
     *,
     race_phase: RacePhase | None = None,
+    odds_phase: OddsPhase | None = None,
+    is_official_market: bool | None = None,
+    warning: str | None = None,
 ) -> RaceOdds:
     """Empty snapshot. No placeholder odds."""
     return RaceOdds(
@@ -888,7 +1100,10 @@ def _unavailable(
         reason=reason,
         encoding=ODDS_ENCODING,
         race_phase=race_phase,
+        odds_phase=odds_phase,
+        is_official_market=is_official_market,
         quotes=[],
+        warning=warning,
         fetched_at=fetched_at,
     )
 
@@ -903,7 +1118,12 @@ def _unavailable_from_http_error(
     response = exc.response
     code = response.status_code if response is not None else None
     reason = f"http {code}" if isinstance(code, int) else "fetch failed"
-    race_phase: RacePhase | None = None
+    warning = "netkeiba odds returned 429" if code == 429 else None
+    phase_args: dict[str, Any] = {
+        "race_phase": None,
+        "odds_phase": None,
+        "is_official_market": None,
+    }
     if response is not None:
         payload = _json_object_from_response(response)
         if payload is not None:
@@ -912,8 +1132,10 @@ def _unavailable_from_http_error(
                 reason = f"http {code}: {api_reason}"
             raw_status = payload.get("status")
             status_name = raw_status.strip().lower() if isinstance(raw_status, str) else ""
-            race_phase = _phase_from_status(status_name)
-    return _unavailable(race_id, fetched_at, reason, bet_type, race_phase=race_phase)
+            phase_args = _phase_args(status_name, payload)
+        elif _body_is_refusal(_response_text(response)):
+            reason = _refusal_reason(_response_text(response)) or reason
+    return _unavailable(race_id, fetched_at, reason, bet_type, warning=warning, **phase_args)
 
 
 def _json_object_from_response(response: requests.Response) -> dict[Any, Any] | None:
@@ -933,6 +1155,82 @@ def _clean_reason(value: object) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _response_text(response: requests.Response) -> str:
+    """Error body as text. A missing encoding stays UTF-8. Odds are not read."""
+    if not response.encoding:
+        response.encoding = ODDS_ENCODING
+    try:
+        return response.text or ""
+    except Exception:
+        return ""
+
+
+def _body_is_refusal(body: str) -> bool:
+    """401/403 pages, captcha, and Cloudflare challenges are not transient."""
+    if not body:
+        return False
+    if looks_like_login_wall(body) or looks_like_forbidden_page(body):
+        return True
+    return page_block_reason(body) is not None
+
+
+def _refusal_reason(body: str) -> str | None:
+    """A stable reason when the odds body is a refusal. Otherwise null."""
+    if not body or not _body_is_refusal(body):
+        return None
+    if looks_like_login_wall(body):
+        return "netkeiba odds requires login"
+    reason = page_block_reason(body)
+    if reason == "captcha":
+        return "netkeiba odds returned a captcha"
+    if reason == "challenge":
+        return "netkeiba odds returned a challenge"
+    if reason == "login":
+        return "netkeiba odds requires login"
+    return "netkeiba odds returned 403"
+
+
+def _odds_api_decided(response: requests.Response) -> bool:
+    """True when a 400 body is the odds API's own answer, not a transport glitch.
+
+    A decided body names ``status`` or ``reason``. Numbers in it are not quotes
+    and the call is not retried.
+    """
+    payload = _json_object_from_response(response)
+    if payload is None:
+        return False
+    status = payload.get("status")
+    if isinstance(status, str) and status.strip():
+        return True
+    reason = payload.get("reason")
+    return isinstance(reason, str) and bool(reason.strip())
+
+
+def _transient_odds_error(exc: Exception) -> bool:
+    """Retry 408, 425, 5xx, timeouts, connection errors, and an undecided HTTP 400.
+
+    Never retry 401, 403, 429, a captcha, or a challenge. 429 is a rate limit.
+    """
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if not isinstance(exc, requests.HTTPError):
+        return False
+    response = exc.response
+    if response is None:
+        return True
+    body = _response_text(response)
+    if _body_is_refusal(body):
+        return False
+    code = response.status_code
+    if code in {401, 403, 429}:
+        return False
+    if code in _TRANSIENT_HTTP or (isinstance(code, int) and code >= 500):
+        return True
+    if code == 400:
+        return not _odds_api_decided(response)
+    return False
 
 
 def _parse_market_updated_at(value: object) -> datetime | None:

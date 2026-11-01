@@ -62,6 +62,51 @@ from backend.utils.date_utils import TOKYO, normalize_tokyo_clock, parse_measure
 
 logger = logging.getLogger(__name__)
 
+
+def _weekly_cell_date(text: str, today: datetime) -> datetime | None:
+    """Date printed on a weekly cell. A day that cannot exist stays null.
+
+    ``10月31日`` uses the printed month. A December cell read in January is
+    the previous year, and a January cell read in December is the next year.
+    ``31日`` with no month uses today's month. When that month has no such
+    day (``31日`` on 1 November), the cell is the previous month, and the
+    previous year when today is January. ``32日`` and ``2月31日`` stay null.
+    """
+    month_and_day = re.search(r"(\d{1,2})月\s*(\d{1,2})日", text)
+    if month_and_day:
+        return _weekly_month_day(
+            today, int(month_and_day.group(1)), int(month_and_day.group(2))
+        )
+    day_only = re.search(r"(\d{1,2})日", text)
+    if day_only is None:
+        return None
+    day = int(day_only.group(1))
+    try:
+        return datetime(today.year, today.month, day)
+    except ValueError:
+        month = today.month - 1
+        year = today.year
+        if month == 0:
+            month = 12
+            year -= 1
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+
+
+def _weekly_month_day(today: datetime, month: int, day: int) -> datetime | None:
+    """Year for a printed month, including the December/January boundary."""
+    year = today.year
+    if month == 12 and today.month == 1:
+        year -= 1
+    elif month == 1 and today.month == 12:
+        year += 1
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
 _INDEX_TAB = re.compile(r"^index\d*\.html$", re.IGNORECASE)
 _MEASUREMENT_SECTIONS = ("馬場状態", "クッション値", "含水率")
 # These names end the open section at any heading level, and also as a row label.
@@ -964,7 +1009,7 @@ class JRATrackScraper(BaseScraper):
         ]
 
         text = soup.get_text()
-        for pattern, method in weather_patterns:
+        for pattern, _method in weather_patterns:
             match = re.search(pattern, text)
             if match:
                 weather_str = match.group(1) if match.lastindex else ""
@@ -1217,36 +1262,33 @@ class JRATrackScraper(BaseScraper):
                 if date_row:
                     for i, date_cell in enumerate(date_row):
                         date_text = date_cell.get_text().strip()
-                        date_match = re.search(r"(\d{1,2})日", date_text)
-                        if date_match:
-                            day = int(date_match.group(1))
-                            now = tokyo_now()
-                            date = _calendar_day(now.year, now.month, day)
-                            if date is None:
-                                continue
+                        dated = _weekly_cell_date(date_text, tokyo_now())
+                        if dated is None:
+                            continue
+                        date = dated
 
-                            weather = Weather.UNKNOWN
-                            if weather_row and i < len(weather_row):
-                                weather_text = weather_row[i].get_text().strip()
-                                weather = Weather.from_string(weather_text)
+                        weather = Weather.UNKNOWN
+                        if weather_row and i < len(weather_row):
+                            weather_text = weather_row[i].get_text().strip()
+                            weather = Weather.from_string(weather_text)
 
-                            rainfall = None
-                            if rainfall_row and i < len(rainfall_row):
-                                rainfall = self._parse_float(rainfall_row[i].get_text())
+                        rainfall = None
+                        if rainfall_row and i < len(rainfall_row):
+                            rainfall = self._parse_float(rainfall_row[i].get_text())
 
-                            watering = False
-                            if watering_row and i < len(watering_row):
-                                watering_text = watering_row[i].get_text().strip()
-                                watering = "あり" in watering_text
+                        watering = False
+                        if watering_row and i < len(watering_row):
+                            watering_text = watering_row[i].get_text().strip()
+                            watering = "あり" in watering_text
 
-                            weekly_info.append(
-                                WeeklyInfo(
-                                    date=date,
-                                    weather=weather,
-                                    rainfall_mm=rainfall,
-                                    watering=watering,
-                                )
+                        weekly_info.append(
+                            WeeklyInfo(
+                                date=date,
+                                weather=weather,
+                                rainfall_mm=rainfall,
+                                watering=watering,
                             )
+                        )
 
         return weekly_info
 
@@ -1274,18 +1316,6 @@ def _cushion_number(info: TrackInfo) -> float | None:
     if info.turf is None or info.turf.cushion is None:
         return None
     return info.turf.cushion.value
-
-
-def _calendar_day(year: int, month: int, day: int) -> datetime | None:
-    """A calendar day, or null when that month does not have ``day``.
-
-    A weekly header of 31日 in November is the previous month's day. It is
-    not a measurement, and it must not abort the baba parse.
-    """
-    try:
-        return datetime(year, month, day)
-    except ValueError:
-        return None
 
 
 def _latest_unit(block: Tag, year: int | None) -> Tag | None:

@@ -21,6 +21,7 @@ from backend.scrapers.final_odds import (
 from backend.scrapers.jra_headless import HeadlessTransport
 from backend.scrapers.page_cache import bind_page_cache_metadata
 from backend.scrapers.page_fallback import FetchedBody, PageFallback, looks_like_login_wall
+from backend.scrapers.race_ids import page_mismatch_warning
 from backend.scrapers.runner_status import (
     HEADLESS_UNAVAILABLE,
     JRA_ODDS_FETCH_FAILED,
@@ -33,10 +34,11 @@ from backend.scrapers.runner_status import (
     ScratchPage,
     apply_records,
     as_page_source,
+    compact,
     join_warnings,
     marks_from_html,
     marks_from_json,
-    compact,
+    post_position_warning,
     records_from_entries,
     row_status,
     same_site_status_urls,
@@ -1249,7 +1251,21 @@ class JRAScraper(BaseScraper):
             return None
 
         race = self._parse_shutuba_race(soup, race_id, cname, len(entries), source=source)
-        return RaceCard(race=race, entries=entries)
+        header = soup.select_one("div.race_header") or soup
+        header_text = self.clean_text(header.get_text(" ", strip=True))
+        page_venue = next(
+            (name for name in self.VENUE_CODES if name in header_text),
+            None,
+        )
+        note = page_mismatch_warning(
+            race_id,
+            venue=page_venue,
+            round_number=race.round_number,
+            day_number=race.day_number,
+            race_date=race.race_date,
+        )
+        warning = join_warnings(post_position_warning(entries), note)
+        return RaceCard(race=race, entries=entries, warning=warning)
 
     def _parse_shutuba_race(
         self,
@@ -1316,7 +1332,7 @@ class JRAScraper(BaseScraper):
         for row in soup.select("table tr"):
             if not isinstance(row, Tag) or _row_in_exclusion_block(row):
                 continue
-            if row.select_one("td.waku") is None or row.select_one("td.horse") is None:
+            if row.select_one("td.horse") is None:
                 continue
             rows.append(row)
         numbers = self._shutuba_horse_numbers(rows)
@@ -1381,20 +1397,24 @@ class JRAScraper(BaseScraper):
             horse_number = self.extract_number(self._cell_text(row, "td.num"))
         horse_cell = row.select_one("td.horse")
         jockey_cell = row.select_one("td.jockey")
-        if (
-            bracket_number is None
-            or horse_number is None
-            or horse_cell is None
-            or jockey_cell is None
-        ):
+        if horse_cell is None:
             return None
+        number_text = compact(self._cell_text(row, "td.num"))
+        if horse_number is None and status_from_token(number_text) is not None:
+            return None
+        if bracket_number is None and horse_number is None and jockey_cell is None:
+            name_probe = horse_cell.select_one(".name")
+            if name_probe is None or not self.clean_text(name_probe.get_text()):
+                return None
 
         name_node = horse_cell.select_one(".name")
         horse_name = self.clean_text(name_node.get_text(" ", strip=True) if name_node else "")
         if not horse_name:
             return None
 
-        sex, age = self._parse_sex_age(self._node_text(jockey_cell.select_one("p.age")))
+        sex, age = self._parse_sex_age(
+            self._node_text(jockey_cell.select_one("p.age")) if jockey_cell is not None else ""
+        )
         weight_diff = self._horse_weight_diff(horse_cell)
         printed = row_status(row)
         status = printed[0] if printed is not None else "entered"
@@ -1405,8 +1425,12 @@ class JRAScraper(BaseScraper):
             horse_name=horse_name,
             sex=sex,
             age=age,
-            weight=self.extract_float(self._node_text(jockey_cell.select_one("p.weight"))),
-            jockey_name=self._person_name(jockey_cell.select_one("p.jockey")),
+            weight=self.extract_float(
+                self._node_text(jockey_cell.select_one("p.weight")) if jockey_cell is not None else ""
+            ),
+            jockey_name=self._person_name(
+                jockey_cell.select_one("p.jockey") if jockey_cell is not None else None
+            ),
             trainer_name=self._person_name(horse_cell.select_one("p.trainer")),
             owner_name=self._node_text(horse_cell.select_one("p.owner")) or None,
             horse_weight=self._horse_weight(horse_cell),
