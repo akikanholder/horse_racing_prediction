@@ -28,6 +28,8 @@ OddsKind = Literal["yoso", "live", "result"]
 BetType = Literal["win", "wide", "umaren", "sanrenpuku", "place"]
 OddsStatus = Literal["live", "yoso", "unavailable", "result"]
 OddsPrefer = Literal["live", "yoso"]
+# forecast: 予想オッズ. provisional: 前日暫定. live: 発売中. final: 確定.
+OddsPhase = Literal["forecast", "provisional", "live", "final"]
 NonRunnerStatus = Literal["scratched", "excluded", "unknown"]
 PageFetchSource = Literal["jra_html", "jra_js", "netkeiba_html", "netkeiba_js", "headless"]
 # オッズAPIの JSON を読む文字コード。馬成績ページの EUC-JP ではない。
@@ -237,6 +239,7 @@ class RaceOdds(BaseModel):
     prefer=live で市場オッズが取れないとき、yoso へは自動で切り替えない。
     予想オッズが必要なら呼び出し側が prefer=yoso を指定する。
     encoding は utf-8。race_phase は pre（レース前）か post（レース後）。
+    odds_phase は予想・前日暫定・発売中・確定。is_official_market は発売中と確定だけ true。
     失敗理由は reason。着順の warning とは別名にしない。
     """
 
@@ -271,6 +274,25 @@ class RaceOdds(BaseModel):
             "pre=レース前（API の yoso と middle）。"
             "post=レース後の確定（API の result）。"
             "判別できない失敗は null。HTTP 400 や空の確定オッズから価格は作らない"
+        ),
+    )
+    odds_phase: OddsPhase | None = Field(
+        None,
+        description=(
+            "forecast=予想オッズ（API の yoso）。"
+            "provisional=前日暫定（API が暫定と出す発売前の数字）。"
+            "live=発売中（API の middle で暫定の印が無い）。"
+            "final=確定（API の result）。"
+            "ページが局面を出さないときは null。status と race_phase は置き換えない"
+        ),
+    )
+    is_official_market: bool | None = Field(
+        None,
+        description=(
+            "発売中（live）と確定（final）のとき true。"
+            "予想（forecast）と前日暫定（provisional）のとき false。"
+            "局面が読めないときは null。価格が空でも局面が live か final なら true。"
+            "価格そのものは quotes。ここから価格は作らない"
         ),
     )
     quotes: list[OddsQuote] = Field(default_factory=list, description="オッズ引用")

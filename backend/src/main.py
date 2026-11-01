@@ -23,6 +23,7 @@ from backend.services.csv_export_service import CsvExportService, NoRacesFoundEr
 from backend.services.prediction_report import (
     diff_editions,
     export_backtest,
+    parse_edition,
     parse_race_id,
     roi_summary,
 )
@@ -921,16 +922,28 @@ def export_predictions_api(
     date_from: Annotated[str, Query(alias="from", description="YYYYMMDD または YYYY-MM-DD")],
     date_to: Annotated[str | None, Query(alias="to", description="終了日。含む")] = None,
     bins: Annotated[int, Query(description="等幅の確率帯。1 から 100")] = 10,
+    edition: Annotated[
+        str,
+        Query(
+            description=(
+                "day_before / pre_post_30m / pre_post_45m / final。"
+                "既定 final は当日の最新、無ければ前日の最新"
+            )
+        ),
+    ] = "final",
 ):
     """馬ごとの予想と、settle 済みの着順・勝敗。校正表、Brier、対数損失。
 
     確定単勝オッズはこの API では取りにいかない。``final_odds`` は null で、
     warning は ``final win odds were not on the prediction record``。
     払戻からオッズは作らない。勝敗か勝率が null の行は校正に入れない。
+    ``edition`` の既定は ``final``。前日と当日は足さない。
     """
     start, end = _prediction_span(date_from, date_to)
     try:
-        return export_backtest(_prediction_store(), start, end, bins=bins)
+        return export_backtest(
+            _prediction_store(), start, end, bins=bins, edition=parse_edition(edition)
+        )
     except PredictionValidationError as exc:
         raise _prediction_error(exc, status_code=400) from exc
     except Exception as exc:
@@ -943,7 +956,7 @@ def diff_predictions_api(
     date_text: Annotated[str, Query(alias="date", description="YYYYMMDD または YYYY-MM-DD")],
     race_id: Annotated[str | None, Query(alias="race", description="12桁の race_id")] = None,
 ):
-    """同じレースの前日（day_before）と当日（pre_post_45m）の差。
+    """同じレースの前日（day_before）と、当日の最新（pre_post_30m か pre_post_45m）。
 
     確率、印、馬券、精算済みの収支差。未精算の収支は null。
     """
@@ -973,15 +986,32 @@ def roi_predictions_api(
         str | None,
         Query(alias="odds_bands", description="増加する正の境界。既定は 1,3,5,10,20,50,100"),
     ] = None,
+    edition: Annotated[
+        str,
+        Query(
+            description=(
+                "day_before / pre_post_30m / pre_post_45m / final。"
+                "既定 final は当日の最新、無ければ前日の最新"
+            )
+        ),
+    ] = "final",
 ):
     """bought の的中率と回収。reference は入れない。
 
     返還は賭け金と払戻に入り、的中率の分母からは外す。
     ワイドのオッズ帯は null。未精算は集計しない。
+    ``edition`` の既定は ``final``。同じレースの前日と当日は足さない。
     """
     start, end = _prediction_span(date_from, date_to)
     try:
-        return roi_summary(_prediction_store(), start, end, by=by, odds_bands=odds_bands)
+        return roi_summary(
+            _prediction_store(),
+            start,
+            end,
+            by=by,
+            odds_bands=odds_bands,
+            edition=parse_edition(edition),
+        )
     except PredictionValidationError as exc:
         raise _prediction_error(exc, status_code=400) from exc
     except Exception as exc:

@@ -26,6 +26,9 @@ _RACE_ID = re.compile(r"^[0-9]{12}$")
 _QUANT = Decimal("0.0001")
 _DELTA = Decimal("0.000001")
 _BY_KEYS = ("day", "bet_type", "surface", "odds_band")
+_EDITIONS = ("day_before", "pre_post_30m", "pre_post_45m")
+_SAME_DAY = frozenset({"pre_post_30m", "pre_post_45m"})
+_REPORT_EDITIONS = _EDITIONS + ("final",)
 _DEFAULT_BANDS = "1,3,5,10,20,50,100"
 _BET_FIELDS = (
     "prob",
@@ -144,6 +147,57 @@ def parse_race_id(value: str | None) -> str | None:
     return value
 
 
+def parse_edition(value: str | None) -> str:
+    """Which prediction run to keep. The default is the latest same-day run."""
+    chosen = "final" if value is None or value == "" else value
+    if chosen not in _REPORT_EDITIONS:
+        raise PredictionValidationError(f"unknown edition: {chosen}")
+    return chosen
+
+
+def select_for_edition(
+    records: list[dict[str, Any]],
+    edition: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """One record per race.
+
+    ``final`` keeps the latest same-day run (``pre_post_30m`` or
+    ``pre_post_45m``) when one exists, otherwise the latest ``day_before``.
+    A named edition keeps the latest ``run_at`` of that edition. Older runs
+    of the chosen pool are left out and named.
+    """
+    chosen = parse_edition(edition)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    order: list[str] = []
+    warnings: list[str] = []
+    for record in records:
+        race_id = _race_id(record)
+        if race_id is None:
+            warnings.append("race_id was not on the record")
+            continue
+        if race_id not in grouped:
+            order.append(race_id)
+        grouped[race_id].append(record)
+    selected: list[dict[str, Any]] = []
+    for race_id in order:
+        rows = grouped[race_id]
+        if chosen == "final":
+            same = [record for record in rows if _edition(record) in _SAME_DAY]
+            pool = same or [record for record in rows if _edition(record) == "day_before"]
+            label = "same-day" if same else "day_before"
+        else:
+            pool = [record for record in rows if _edition(record) == chosen]
+            label = chosen
+        if not pool:
+            warnings.append(f"no {label if chosen == 'final' else chosen} record for {race_id}")
+            continue
+        pick, note = _latest_record(pool, label)
+        selected.append(pick)
+        if note:
+            warnings.append(note)
+    return selected, warnings
+
+
 def iter_meeting_records(store: PredictionStore, start: date, end: date) -> list[dict[str, Any]]:
     """Records from ``start`` through ``end``, file order within each day."""
     if end < start:
@@ -162,17 +216,21 @@ def export_backtest(
     end: date,
     *,
     bins: int = 10,
+    edition: str | None = None,
     final_win_odds: FinalWinOdds | None = None,
 ) -> dict[str, Any]:
-    """One row per horse per prediction run, plus a calibration table.
+    """One row per horse per selected prediction run, plus a calibration table.
 
-    Finish and the win flag come from a settled ``result``. Final win odds
-    come only from ``final_win_odds``. A payout is not turned into a price.
+    ``edition`` defaults to ``final``: the latest same-day run for each race,
+    or the latest day-before run when that race has no same-day run. Finish
+    and the win flag come from a settled ``result``. Final win odds come only
+    from ``final_win_odds``. A payout is not turned into a price.
     """
+    chosen = parse_edition(edition)
     count = parse_bins(bins)
+    records, warnings = select_for_edition(iter_meeting_records(store, start, end), chosen)
     rows: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for record in iter_meeting_records(store, start, end):
+    for record in records:
         for row in _export_rows(record, final_win_odds):
             rows.append(row)
             if row["warning"]:
@@ -185,6 +243,7 @@ def export_backtest(
     return {
         "from": start.isoformat(),
         "to": end.isoformat(),
+        "edition": chosen,
         "rows": rows,
         "calibration": calibration,
         "warning": _join(*warnings),
@@ -197,11 +256,12 @@ def diff_editions(
     *,
     race_id: str | None = None,
 ) -> dict[str, Any]:
-    """Compare day_before and pre_post_45m for each race on one meeting day.
+    """Compare the latest day_before run with the latest same-day run.
 
-    Probabilities, marks, and bets are the stored fields. Profit uses the
-    settled stake and payout totals. An edition that is still pending has a
-    null profit and a warning.
+    Same-day is ``pre_post_30m`` or ``pre_post_45m``, whichever ``run_at`` is
+    later. Older runs of that side are left out. Probabilities, marks, and
+    bets are the stored fields. Profit uses the settled stake and payout
+    totals. An edition that is still pending has a null profit and a warning.
     """
     selected = parse_race_id(race_id)
     records = store.read(day)
@@ -216,27 +276,32 @@ def diff_editions(
     pairs: list[dict[str, Any]] = []
     unpaired: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for identity in grouped:
-        before = _edition_rows(grouped[identity], "day_before")
-        same = _edition_rows(grouped[identity], "pre_post_45m")
-        if not before or not same:
-            missing = "pre_post_45m" if before else "day_before"
-            for record in before or same:
-                note = f"no {missing} record for this race"
-                unpaired.append(_unpaired(record, note))
-                warnings.append(note)
+    for identity, rows in grouped.items():
+        before_rows = [record for record in rows if _edition(record) == "day_before"]
+        same_rows = [record for record in rows if _edition(record) in _SAME_DAY]
+        before, before_note = (
+            _latest_record(before_rows, "day_before") if before_rows else (None, None)
+        )
+        same, same_note = _latest_record(same_rows, "same-day") if same_rows else (None, None)
+        if before_note:
+            warnings.append(before_note)
+        if same_note:
+            warnings.append(same_note)
+        if before is None or same is None:
+            if before is None and same is None:
+                warnings.append(f"no day_before or same-day record for {identity}")
+                continue
+            missing = "same-day" if before is not None else "day_before"
+            kept = before or same
+            note = f"no {missing} record for this race"
+            unpaired.append(_unpaired(kept, note))  # type: ignore[arg-type]
+            warnings.append(note)
             continue
-        extra: list[str] = []
-        if len(before) > 1:
-            extra.append("more than one day_before record")
-        if len(same) > 1:
-            extra.append("more than one pre_post_45m record")
-        for left in before:
-            for right in same:
-                pair = _diff_pair(left, right, extra)
-                pairs.append(pair)
-                if pair["warning"]:
-                    warnings.append(pair["warning"])
+        extra = [note for note in (before_note, same_note) if note]
+        pair = _diff_pair(before, same, extra)
+        pairs.append(pair)
+        if pair["warning"]:
+            warnings.append(pair["warning"])
     if not records:
         note = (
             "no prediction records" if selected is None else "no prediction records for this race"
@@ -258,21 +323,30 @@ def roi_summary(
     *,
     by: str | None = None,
     odds_bands: str | None = None,
+    edition: str | None = None,
 ) -> dict[str, Any]:
-    """ROI and hit rate for bought bets. Reference bets stay out.
+    """ROI and hit rate for bought bets on one edition per race.
 
+    ``edition`` defaults to ``final``, so a day-before sheet and a same-day
+    sheet for the same race are not added together. Reference bets stay out.
     Refunded tickets stay in the stake and the return (the stake comes back)
     and stay out of the hit rate. A wide ticket has no single odds, so its
-    odds band is null.
+    odds band is null. That warning is one line, and only when the grouping
+    includes ``odds_band``.
     """
+    chosen = parse_edition(edition)
     keys = parse_by(by)
     edges = parse_odds_bands(odds_bands)
-    warnings: list[str] = []
+    records, warnings = select_for_edition(iter_meeting_records(store, start, end), chosen)
     lines: list[_RoiLine] = []
-    for record in iter_meeting_records(store, start, end):
-        parsed, notes = _roi_lines(record, edges)
+    wide_unbanded = 0
+    for record in records:
+        parsed, notes, wide_count = _roi_lines(record, edges)
         lines.extend(parsed)
         warnings.extend(notes)
+        wide_unbanded += wide_count
+    if "odds_band" in keys and wide_unbanded:
+        warnings.append(f"{WIDE_ODDS_RANGE}: {wide_unbanded}")
     grouped: dict[tuple[Any, ...], list[_RoiLine]] = defaultdict(list)
     for line in lines:
         grouped[_group_key(line, keys)].append(line)
@@ -292,6 +366,7 @@ def roi_summary(
     return {
         "from": start.isoformat(),
         "to": end.isoformat(),
+        "edition": chosen,
         "by": keys,
         "odds_bands": [label for _number, label in edges],
         "groups": groups,
@@ -359,14 +434,14 @@ def format_diff(report: Mapping[str, Any]) -> str:
         lines.append("なし")
     for pair in report["pairs"]:
         lines.append(
-            f"\n--- {pair['race_id']} {pair['day_before']['record_id']} -> {pair['pre_post_45m']['record_id']} ---"
+            f"\n--- {pair['race_id']} {pair['day_before']['record_id']} -> {pair['same_day']['record_id']} ---"
         )
         for horse in pair["horses"]:
             lines.append(
                 f"馬番{horse['horse_number']} "
-                f"確率 {_plain(horse['win_prob_day_before'])} -> {_plain(horse['win_prob_pre_post_45m'])} "
+                f"確率 {_plain(horse['win_prob_day_before'])} -> {_plain(horse['win_prob_same_day'])} "
                 f"差 {_plain(horse['win_prob_delta'])} "
-                f"印 {horse['buy_mark_day_before'] or '-'} -> {horse['buy_mark_pre_post_45m'] or '-'}"
+                f"印 {horse['buy_mark_day_before'] or '-'} -> {horse['buy_mark_same_day'] or '-'}"
             )
         bets = pair["bets"]
         lines.append(
@@ -374,7 +449,7 @@ def format_diff(report: Mapping[str, Any]) -> str:
         )
         profit = pair["profit"]
         lines.append(
-            f"収支 {_plain(profit['day_before_profit_yen'])} -> {_plain(profit['pre_post_45m_profit_yen'])} "
+            f"収支 {_plain(profit['day_before_profit_yen'])} -> {_plain(profit['same_day_profit_yen'])} "
             f"差 {_plain(profit['profit_delta_yen'])}"
         )
         if pair["warning"]:
@@ -623,7 +698,7 @@ def _diff_pair(
     return {
         "race_id": _race_id(left),
         "day_before": _run_ref(left),
-        "pre_post_45m": _run_ref(right),
+        "same_day": _run_ref(right),
         "horses": horses,
         "bets": bets,
         "profit": profit,
@@ -646,7 +721,7 @@ def _diff_horses(
         if former is None:
             horse_notes.append(f"horse was not on the day_before record: {number}")
         if latter is None:
-            horse_notes.append(f"horse was not on the pre_post_45m record: {number}")
+            horse_notes.append(f"horse was not on the same-day record: {number}")
         left_prob = None if former is None else former.get("win_prob")
         right_prob = None if latter is None else latter.get("win_prob")
         if former is not None and left_prob is None:
@@ -664,12 +739,12 @@ def _diff_horses(
             {
                 "horse_number": number,
                 "win_prob_day_before": left_prob if _is_number(left_prob) else None,
-                "win_prob_pre_post_45m": right_prob if _is_number(right_prob) else None,
+                "win_prob_same_day": right_prob if _is_number(right_prob) else None,
                 "win_prob_delta": _delta(left_prob, right_prob) if present else None,
                 "ability_mark_day_before": None if former is None else former.get("ability_mark"),
-                "ability_mark_pre_post_45m": None if latter is None else latter.get("ability_mark"),
+                "ability_mark_same_day": None if latter is None else latter.get("ability_mark"),
                 "buy_mark_day_before": None if former is None else former.get("buy_mark"),
-                "buy_mark_pre_post_45m": None if latter is None else latter.get("buy_mark"),
+                "buy_mark_same_day": None if latter is None else latter.get("buy_mark"),
                 "marks_changed": marks_changed,
                 "warning": _join(*horse_notes),
             }
@@ -681,8 +756,8 @@ def _diff_bets(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
-    before, before_notes = _bets_by_key(left, "day_before")
-    same, same_notes = _bets_by_key(right, "pre_post_45m")
+    before, before_notes = _bets_by_key(left, _edition(left) or "day_before")
+    same, same_notes = _bets_by_key(right, _edition(right) or "same-day")
     notes = before_notes + same_notes
     added = [same[key] for key in same if key not in before]
     removed = [before[key] for key in before if key not in same]
@@ -699,7 +774,7 @@ def _diff_bets(
                 "combination": list(key[1]),
                 "fields": fields,
                 "day_before": {name: before[key].get(name) for name in fields},
-                "pre_post_45m": {name: same[key].get(name) for name in fields},
+                "same_day": {name: same[key].get(name) for name in fields},
             }
         )
     return {"added": added, "removed": removed, "changed": changed}, notes
@@ -709,8 +784,8 @@ def _diff_profit(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> tuple[dict[str, Any], str | None]:
-    before, before_note = _profit(left, "day_before")
-    same, same_note = _profit(right, "pre_post_45m")
+    before, before_note = _profit(left, _edition(left) or "day_before")
+    same, same_note = _profit(right, _edition(right) or "same-day")
     delta = None
     if before is not None and same is not None:
         delta = same["profit_yen"] - before["profit_yen"]
@@ -719,9 +794,9 @@ def _diff_profit(
             "day_before_stake_yen": None if before is None else before["stake_yen"],
             "day_before_payout_yen": None if before is None else before["payout_yen"],
             "day_before_profit_yen": None if before is None else before["profit_yen"],
-            "pre_post_45m_stake_yen": None if same is None else same["stake_yen"],
-            "pre_post_45m_payout_yen": None if same is None else same["payout_yen"],
-            "pre_post_45m_profit_yen": None if same is None else same["profit_yen"],
+            "same_day_stake_yen": None if same is None else same["stake_yen"],
+            "same_day_payout_yen": None if same is None else same["payout_yen"],
+            "same_day_profit_yen": None if same is None else same["profit_yen"],
             "profit_delta_yen": delta,
         },
         _join(before_note, same_note),
@@ -758,14 +833,15 @@ class _RoiLine:
 def _roi_lines(
     record: dict[str, Any],
     edges: list[tuple[Decimal, str]],
-) -> tuple[list[_RoiLine], list[str]]:
+) -> tuple[list[_RoiLine], list[str], int]:
     notes: list[str] = []
+    wide_unbanded = 0
     result = record.get("result")
     identity = record.get("record_id")
     if not isinstance(result, dict) or result.get("status") != "settled":
         if _has_bought(record):
             notes.append(f"record was not settled: {identity}")
-        return [], notes
+        return [], notes, 0
     settlement = _as_dict(result.get("settlement"))
     settled_bets = _as_list(settlement.get("bets"))
     race = _as_dict(record.get("race"))
@@ -794,7 +870,10 @@ def _roi_lines(
             notes.append(f"hit was not settled: {label}")
             continue
         band, band_note = _odds_band(bet, edges)
-        if band_note:
+        if band_note == WIDE_ODDS_RANGE:
+            wide_unbanded += 1
+            band_note = None
+        elif band_note:
             notes.append(f"{band_note}: {label}")
         lines.append(
             _RoiLine(
@@ -809,7 +888,7 @@ def _roi_lines(
                 warning=band_note,
             )
         )
-    return lines, notes
+    return lines, notes, wide_unbanded
 
 
 def _roi_group(keys: list[str], key: tuple[Any, ...], lines: list[_RoiLine]) -> dict[str, Any]:
@@ -917,9 +996,16 @@ def _horses_by_number(record: dict[str, Any]) -> dict[int, dict[str, Any]]:
     return found
 
 
-def _edition_rows(records: list[dict[str, Any]], edition: str) -> list[dict[str, Any]]:
-    rows = [record for record in records if _edition(record) == edition]
-    return sorted(rows, key=lambda record: str(_run(record).get("run_at") or ""))
+def _latest_record(records: list[dict[str, Any]], label: str) -> tuple[dict[str, Any], str | None]:
+    """The row with the latest run_at. Older rows of this pool are named."""
+    ordered = sorted(records, key=lambda record: str(_run(record).get("run_at") or ""))
+    pick = ordered[-1]
+    if len(ordered) == 1:
+        return pick, None
+    left_out = len(ordered) - 1
+    unit = "run" if left_out == 1 else "runs"
+    race_id = _race_id(pick) or ""
+    return pick, f"used the latest {label} record for {race_id}; {left_out} older {unit} left out"
 
 
 def _unpaired(record: dict[str, Any], warning: str) -> dict[str, Any]:

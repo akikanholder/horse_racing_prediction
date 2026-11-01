@@ -126,7 +126,10 @@ def test_http_400_with_prices_does_not_become_quotes(bet_type):
 
 @pytest.mark.parametrize("bet_type", ["win", "wide", "umaren", "sanrenpuku"])
 def test_http_400_without_json_stays_empty(bet_type):
-    scraper = NetkeibaOddsScraper(http_client=_RaisingHTTP(_http_error(400, "<html>bad</html>")))
+    scraper = NetkeibaOddsScraper(
+        http_client=_RaisingHTTP(_http_error(400, "<html>bad</html>")),
+        sleeper=lambda _seconds: None,
+    )
     snapshot = getattr(scraper, FETCHERS[bet_type])(RACE_ID, fetched_at=FETCHED_AT)
 
     assert snapshot.quotes == []
@@ -137,7 +140,10 @@ def test_http_400_without_json_stays_empty(bet_type):
 
 
 def test_http_500_is_an_empty_quote_list():
-    scraper = NetkeibaOddsScraper(http_client=_RaisingHTTP(_http_error(500, "")))
+    scraper = NetkeibaOddsScraper(
+        http_client=_RaisingHTTP(_http_error(500, "")),
+        sleeper=lambda _seconds: None,
+    )
     snapshot = scraper.get_win_odds(RACE_ID, fetched_at=FETCHED_AT)
 
     assert snapshot.quotes == []
@@ -147,7 +153,10 @@ def test_http_500_is_an_empty_quote_list():
 
 
 def test_connection_error_is_fetch_failed():
-    scraper = NetkeibaOddsScraper(http_client=_RaisingHTTP(requests.ConnectionError("down")))
+    scraper = NetkeibaOddsScraper(
+        http_client=_RaisingHTTP(requests.ConnectionError("down")),
+        sleeper=lambda _seconds: None,
+    )
     snapshot = scraper.get_wide_odds(RACE_ID, fetched_at=FETCHED_AT)
 
     assert snapshot.quotes == []

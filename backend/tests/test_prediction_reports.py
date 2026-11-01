@@ -477,28 +477,29 @@ def test_diff_reports_probability_mark_bet_and_profit_changes(tmp_path: Path):
     report = diff_editions(store, _meeting())
     pair = report["pairs"][0]
     assert pair["day_before"]["record_id"].endswith("day_before_20261017T180000+0900")
-    assert "pre_post_45m" in pair["pre_post_45m"]["record_id"]
+    assert "pre_post_45m" in pair["same_day"]["record_id"]
+    assert pair["same_day"]["edition"] == "pre_post_45m"
     horses = {row["horse_number"]: row for row in pair["horses"]}
     assert horses[7]["win_prob_delta"] == 0.18
     assert horses[7]["marks_changed"] is True
     assert horses[7]["buy_mark_day_before"] == "◎"
-    assert horses[7]["buy_mark_pre_post_45m"] == "○"
+    assert horses[7]["buy_mark_same_day"] == "○"
     assert horses[1]["win_prob_delta"] is None
     assert horses[1]["marks_changed"] is None
-    assert "horse was not on the pre_post_45m record: 1" in horses[1]["warning"]
+    assert "horse was not on the same-day record: 1" in horses[1]["warning"]
     assert horses[3]["marks_changed"] is None
     changed = pair["bets"]["changed"]
     assert changed[0]["ticket_type"] == "win"
     assert changed[0]["fields"] == ["prob", "odds", "stake_yen"]
     assert changed[0]["day_before"]["stake_yen"] == 1000
-    assert changed[0]["pre_post_45m"]["odds"] == 4.0
+    assert changed[0]["same_day"]["odds"] == 4.0
     assert pair["bets"]["added"][0]["ticket_type"] == "wide"
     assert pair["bets"]["removed"] == []
     assert pair["profit"]["day_before_profit_yen"] == 2600
-    assert pair["profit"]["pre_post_45m_profit_yen"] == 1300
+    assert pair["profit"]["same_day_profit_yen"] == 1300
     assert pair["profit"]["profit_delta_yen"] == -1300
     assert report["unpaired"][0]["race_id"] == OTHER_RACE
-    assert "no pre_post_45m record for this race" in report["unpaired"][0]["warning"]
+    assert "no same-day record for this race" in report["unpaired"][0]["warning"]
 
 
 def test_unsettled_editions_leave_profit_null(tmp_path: Path):
@@ -516,7 +517,7 @@ def test_unsettled_editions_leave_profit_null(tmp_path: Path):
     report = diff_editions(store, _meeting(), race_id=RACE_ID)
     profit = report["pairs"][0]["profit"]
     assert profit["day_before_profit_yen"] is None
-    assert profit["pre_post_45m_profit_yen"] is None
+    assert profit["same_day_profit_yen"] is None
     assert profit["profit_delta_yen"] is None
     assert "day_before edition was not settled" in report["pairs"][0]["warning"]
     assert "pre_post_45m edition was not settled" in report["pairs"][0]["warning"]
@@ -579,7 +580,7 @@ def test_roi_groups_hits_misses_refunds_and_leaves_wide_unbanded(tmp_path: Path)
     )
     report = roi_summary(store, _meeting(), _meeting(NEXT_DAY))
     assert "record was not settled" in report["warning"]
-    assert "wide odds are a range and were not banded" in report["warning"]
+    assert "wide odds are a range and were not banded: 1" in report["warning"]
     groups = {
         (group["day"], group["bet_type"], group["surface"], group["odds_band"]): group
         for group in report["groups"]
@@ -611,7 +612,7 @@ def test_roi_groups_hits_misses_refunds_and_leaves_wide_unbanded(tmp_path: Path)
     assert wide["odds_band"] is None
     assert wide["bet_count"] == 1
     assert wide["return_yen"] == 0
-    assert "wide odds are a range and were not banded" in wide["warning"]
+    assert wide["warning"] is None
     dirt = groups[(NEXT_DAY, "win", "ダート", "3-5")]
     assert dirt["return_yen"] == 400
     assert dirt["roi"] == 3.0
@@ -622,6 +623,7 @@ def test_roi_groups_hits_misses_refunds_and_leaves_wide_unbanded(tmp_path: Path)
     )
 
     by_day = roi_summary(store, _meeting(), _meeting(NEXT_DAY), by="day")
+    assert "wide odds are a range" not in (by_day["warning"] or "")
     day_groups = {group["day"]: group for group in by_day["groups"]}
     assert "bet_type" not in day_groups[DAY]
     assert day_groups[DAY]["bet_count"] == 8
@@ -751,7 +753,7 @@ def test_cli_and_api_report_commands(
     assert ",," in written or written.count(",,") >= 0
     body = list(csv.DictReader(io.StringIO(written)))
     assert body[0]["final_odds"] == ""
-    assert {row["edition"] for row in body} == {"day_before", "pre_post_45m"}
+    assert {row["edition"] for row in body} == {"pre_post_45m"}
 
     diff_out, _err = run(
         "predictions", "diff", "20261018", "--race", RACE_ID, "--dir", str(tmp_path), "--json"
@@ -773,14 +775,28 @@ def test_cli_and_api_report_commands(
     roi_row = next(csv.DictReader(io.StringIO(roi_out)))
     assert roi_row["bet_type"] == "win"
     assert roi_row["surface"] == "芝"
-    assert roi_row["stake_yen"] == "300"
-    assert roi_row["return_yen"] == "1260"
+    assert roi_row["stake_yen"] == "200"
+    assert roi_row["return_yen"] == "840"
+    csv_stdout, csv_stderr = run(
+        "predictions",
+        "export",
+        "--from",
+        DAY,
+        "--format",
+        "csv",
+        "--json",
+        "--dir",
+        str(tmp_path),
+    )
+    assert csv_stdout.startswith("record_id,")
+    assert "Brier:" in csv_stderr
 
     monkeypatch.setenv("HRP_PREDICTIONS_DIR", str(tmp_path))
     with TestClient(app) as client:
         exported = client.get("/api/predictions/export", params={"from": "20261018", "bins": 10})
         assert exported.status_code == 200
-        assert exported.json()["calibration"]["scored"] == 2
+        assert exported.json()["edition"] == "final"
+        assert exported.json()["calibration"]["scored"] == 1
         assert exported.json()["rows"][0]["final_odds"] is None
         compared = client.get("/api/predictions/diff", params={"date": "20261018", "race": RACE_ID})
         assert compared.status_code == 200
@@ -797,3 +813,126 @@ def test_cli_and_api_report_commands(
             "/api/predictions/export", params={"from": "20261019", "to": "20261018"}
         )
         assert backwards.status_code == 400
+        earlier = client.get(
+            "/api/predictions/export",
+            params={"from": "20261018", "edition": "day_before"},
+        )
+        assert earlier.status_code == 200
+        assert {row["edition"] for row in earlier.json()["rows"]} == {"day_before"}
+        unknown = client.get(
+            "/api/predictions/roi",
+            params={"from": "20261018", "edition": "morning"},
+        )
+        assert unknown.status_code == 400
+
+
+def test_final_edition_keeps_one_run_when_both_editions_and_duplicates_exist(tmp_path: Path):
+    store = _store(tmp_path)
+    early = _sheet(
+        run_at="2026-10-17T12:00:00+09:00",
+        horses=[_horse(7, "サンプル", 0.10, 8.0)],
+        bets=[_bet("win", [7], stake=1000, odds=8.0)],
+    )
+    latest_before = _sheet(
+        horses=[_horse(7, "サンプル", 0.20, 5.0)],
+        bets=[_bet("win", [7], stake=100, odds=5.0)],
+    )
+    forty_five = _sheet(
+        edition="pre_post_45m",
+        run_at="2026-10-18T14:00:00+09:00",
+        horses=[_horse(7, "サンプル", 0.30, 4.0, mark="○")],
+        bets=[_bet("win", [7], stake=200, odds=4.0)],
+    )
+    thirty = _sheet(
+        edition="pre_post_30m",
+        run_at="2026-10-18T14:15:00+09:00",
+        horses=[_horse(7, "サンプル", 0.40, 3.0, mark="◎")],
+        bets=[_bet("wide", [3, 7], stake=100), _bet("win", [7], stake=400, odds=3.0)],
+    )
+    store.add([early, latest_before, forty_five, thirty])
+    _settle(
+        store,
+        {
+            RACE_ID: _settled(
+                results=[_finish(7, 1), _finish(3, 2)],
+                payouts=[_payout("単勝", "7", 200), _payout("ワイド", "1-2", 150)],
+            )
+        },
+    )
+    final = roi_summary(store, _meeting(), _meeting(), by="bet_type")
+    assert final["edition"] == "final"
+    assert "used the latest same-day record" in final["warning"]
+    assert "wide odds are a range" not in (final["warning"] or "")
+    wins = {group["bet_type"]: group for group in final["groups"]}
+    assert wins["win"]["stake_yen"] == 400
+    assert wins["win"]["return_yen"] == 800
+    assert "wide" not in wins or wins["wide"]["stake_yen"] == 100
+    day_before = roi_summary(store, _meeting(), _meeting(), edition="day_before", by="bet_type")
+    assert day_before["groups"][0]["stake_yen"] == 100
+    assert day_before["groups"][0]["return_yen"] == 200
+    assert "used the latest day_before record" in day_before["warning"]
+    assert "1 older run left out" in day_before["warning"]
+    forty = roi_summary(store, _meeting(), _meeting(), edition="pre_post_45m", by="bet_type")
+    assert forty["groups"][0]["stake_yen"] == 200
+    exported = export_backtest(store, _meeting(), _meeting())
+    assert [row["edition"] for row in exported["rows"]] == ["pre_post_30m"]
+    assert exported["rows"][0]["win_prob"] == 0.40
+    compared = diff_editions(store, _meeting())
+    pair = compared["pairs"][0]
+    assert pair["day_before"]["run_at"] == "2026-10-17T18:00:00+09:00"
+    assert pair["same_day"]["edition"] == "pre_post_30m"
+    assert pair["profit"]["day_before_profit_yen"] == 100
+    assert pair["profit"]["same_day_profit_yen"] == 300
+    assert pair["profit"]["profit_delta_yen"] == 200
+    banded = roi_summary(store, _meeting(), _meeting(), by="odds_band")
+    assert "wide odds are a range and were not banded: 1" in banded["warning"]
+
+
+def test_transient_odds_fetch_leaves_only_that_race_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    store = _store(tmp_path)
+    store.add(
+        [
+            _sheet(horses=[_horse(7, "甲", 0.2, 4.0)], bets=[_bet("win", [7])]),
+            _sheet(race_id=OTHER_RACE, horses=[_horse(2, "乙", 0.3, 5.0)], bets=[_bet("win", [2])]),
+        ]
+    )
+    calls: list[str] = []
+
+    class _Service:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get_settled_race_result(self, race_id, **kwargs):
+            calls.append(race_id)
+            if race_id == RACE_ID:
+                raise RuntimeError("timeout")
+            return _settled(race_id, results=[_finish(2, 1, odds=5.5)])
+
+    monkeypatch.setattr("backend.cli.RaceService", lambda: _Service())
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cli",
+            "predictions",
+            "export",
+            "--from",
+            DAY,
+            "--dir",
+            str(tmp_path),
+            "--fetch-final-odds",
+            "--json",
+        ],
+    )
+    cli_main()
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [RACE_ID, OTHER_RACE]
+    by_race = {row["race_id"]: row for row in payload["rows"]}
+    assert by_race[RACE_ID]["final_odds"] is None
+    assert "final win odds fetch failed for 202610180811" in by_race[RACE_ID]["warning"]
+    assert by_race[OTHER_RACE]["final_odds"] == 5.5
+    assert "stopped at" not in (payload["warning"] or "")
