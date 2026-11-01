@@ -56,7 +56,7 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 
 | サブコマンド | `--json` の標準出力 |
 |---|---|
-| `odds` `result` `history` `trends` `track` `predictions` | JSON だけ |
+| `odds` `result` `history` `trends` `track` `predictions` | JSON だけ。`predictions export --format` と `predictions roi --format csv` は、その本文を標準出力にする |
 | `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
 
 混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
@@ -82,7 +82,7 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli trends --date 20261018 --venue 東京 --surface 芝 --json` | `GET /api/races/trends?date=20261018&venue=東京&surface=芝` | その開催日だけ。`YYYY-MM-DD` も同じ。確定レースの人気・枠・脚質・騎手・父の集計。予想の入力にしない |
 | `python -m backend.cli trends --recent-meeting --venue 東京 --json` | `GET /api/races/trends?recent_meeting=true&venue=東京` | 当日（Asia/Tokyo）の確定と、同じ競馬場の前開催日 |
 | `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds` |
-| `python -m backend.cli final-odds <race_id> --bet-types wide,umaren,sanrenpuku --json` | `GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku` | `FinalRaceOdds`。過去の確定ワイド・馬連・三連複 |
+| `python -m backend.cli final-odds <race_id> --bet-types wide,umaren,sanrenpuku --json` | `GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku` | `FinalRaceOdds`。過去の確定ワイド・馬連・三連複と、その馬券種の確定払戻 |
 | `python -m backend.cli courses --json` | `GET /api/courses` | `Course` の配列 |
 | `python -m backend.cli courses --venue 東京 --json` | `GET /api/courses/{venue}` | `Course` |
 | （CLI なし） | `GET /api/courses/{venue}/conditions` | `CourseCondition` |
@@ -91,6 +91,9 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli predictions add sheet.json --json` | `POST /api/predictions` | 予想記録を検証して開催日の JSONL へ追記する。重複 `record_id` は拒否 |
 | `python -m backend.cli predictions show --date 20261018 --json` | `GET /api/predictions?date=20261018` | その開催日の予想記録 |
 | `python -m backend.cli predictions settle --date 20261018 --json` | `POST /api/predictions/settle?date=20261018` | 確定かつ complete のレースだけ `result` を埋める。未確定は pending のまま |
+| `python -m backend.cli predictions export --from 20260926 --to 20261101 --format csv --json` | `GET /api/predictions/export?from=20260926&to=20261101` | 馬ごとの勝率・予想時オッズ・着順・勝敗。校正表、Brier、対数損失。API は確定オッズを取りにいかない |
+| `python -m backend.cli predictions diff 20261018 --json` | `GET /api/predictions/diff?date=20261018` | 同じレースの前日と当日。確率、印、馬券、精算済みの収支差 |
+| `python -m backend.cli predictions roi --from 20260926 --to 20261101 --by day,bet_type,surface,odds_band --json` | `GET /api/predictions/roi?from=20260926&to=20261101` | bought の的中率と回収。日、馬券種、芝/ダート、オッズ帯 |
 | （CLI なし） | `POST /api/races/export?date=YYYY-MM-DD` | CSV 書き出し。予想の入力ではない |
 
 オッズの例:
@@ -512,6 +515,8 @@ python -m backend.cli final-odds 202605040711 --bet-types sanrenpuku --fetch-mod
 ページの見出しか表にある `確定オッズ` と `最終オッズ` はどちらも確定。メニューやボタンの同じ文言は確定にしない。オッズ API は `status` が `result` で組み合わせが空でないときだけ確定価格にする。着順が `confirmed` かつ `complete` なら、ページに見出しが無くてもこの API の価格を確定にする。`middle` と `yoso` は捨てる。`---.-` のような空欄は価格にしない。確定オッズの報告では、その API 引用の `source` は `netkeiba_result`、`kind` は `result`、`FinalRaceOdds.status` は `result`（`odds_final` が true のとき）。発売中の `odds` は従来どおり `source` `netkeiba_live`、`kind` `live`、`status` `live` のまま。ページ由来の確定オッズ（`jra_html` など）の `kind` は `live` のまま。確定オッズの `market_updated_at` は Asia/Tokyo の `+09:00`。ナイーブな `official_datetime`（例 `2026-10-18 15:28:07`）にも `+09:00` を付ける。発売中の引用の時刻はオフセットを足さない。
 
 ワイドは範囲。払戻が `odds_min × 100` から `odds_max × 100` のあいだ（10円単位の端数）なら一致。馬連と三連複は `払戻 ≈ odds × 100`（10円以内）。違うときは価格を置き換えず、`warning` に `final odds and payout disagree: umaren 1-3`。ページに無い組は作らない。`combination odds were not on the page: wide` のように欠測の馬券種を書く。
+
+確定かつ complete のとき、依頼した馬券種の払戻行を `payouts` に載せる。中身は結果ページの `RacePayout`（`bet_type` は ワイド / 馬連 / 3連複 または 三連複、`combination`、`payout`）。単勝や複勝は入れない。ページにその馬券種が無いときは行を作らず、`warning` に `confirmed payout was not on the result: umaren`。オッズから払戻は作らない。払戻からオッズも作らない。確定でないときは `payouts` は空。精算は `predictions settle` が、同じ結果取得の払戻を使う。`final-odds` を精算のためにもう一度開かない。
 
 過去の確定オッズは `backend/.cache/pages` に残す。オッズ API は `status` が `result` かつオッズが空でないときだけ。`official_datetime` が今日（Asia/Tokyo）以降のときは保存しない。`odds/index.html` は価格を読めたときだけ保存する。`---.-` だけの文書は保存しないし、保存済みでも読み返さない。開催日が今日以降のレースは、結果ページの日付を見てオッズ本文を保存しない。今日以降の開催一覧と JRA の当日ページは従来どおり保存しない。
 
@@ -1040,6 +1045,73 @@ python -m backend.cli predictions settle --date 2026-10-18 --json
 `settle` の `--json` は `date`、`path`、`settled`、`pending`。`YYYY-MM-DD` も受け付ける。
 
 HTTP は同じ意味。検証失敗は 422。重複は 409。日付が読めないときは 400。サービス未初期化の精算は 503。未確定でも精算の HTTP は 200 で、`pending` を見る。
+
+### 校正の書き出し
+
+予想の確率は計算しない。記録された `horses[].win_prob` と、精算済みの着順を並べる。1行が1予想・1頭。
+
+```bash
+python -m backend.cli predictions export --from 20260926 --to 20261101 --format csv --json
+python -m backend.cli predictions export --from 20261018 --format jsonl --output horses.jsonl
+python -m backend.cli predictions export --from 20261018 --to 20261018 --fetch-final-odds --bins 10 --json
+```
+
+`--from` と `--to` は `YYYYMMDD` または `YYYY-MM-DD`。`--to` を省略すると開始日だけ。終了が開始より前なら拒否する。`--dir` はほかの予想コマンドと同じ。
+
+| 列 | 意味 | 欠測 |
+|---|---|---|
+| `win_prob` | 記録の推定勝率 | null。`win_prob was not on the record` |
+| `odds_at_prediction` | 記録の `odds_win`。予想時の単勝 | null。`odds at prediction time were not on the record` |
+| `final_odds` | 確定単勝オッズ | 既定は null。`final win odds were not on the prediction record`。払戻からは作らない |
+| `finish_position` | 精算の着順 | 未精算、またはその馬番が着順に無いときは null |
+| `won` | 入着で着順が 1 のとき true、ほかの入着は false | 着順が null、または入着でないときは null。false にはしない |
+| `date` `venue` `surface` `distance_m` `going` `field_size` | 記録のレース。`surface` は 芝 / ダート / 障害のまま | 記録が null の馬場は null。ダートを `ダ` には書き換えない |
+
+`--format csv` の空欄は null。`--format jsonl` は1頭1行で null を残す。`--output` が無ければその本文を標準出力へ出し、校正表は標準エラーへ出す。`--output` があるときはファイルに馬の行を書き、標準出力は校正表（`--json` のときは JSON）。`--json` は馬の行、校正、`warning`。
+
+`--fetch-final-odds` だけがネットワークを開く。取得は `result` と同じ確定結果で、レースごとに一度。`result_phase` が `confirmed` かつ `complete` のとき、着順行に印字された単勝オッズだけを `final_odds` にする。印字が無ければ null。`final win odds were not on the result: 7`。確定でないときは null。`final win odds require a confirmed complete race`。401 / 403、ログイン、captcha、チャレンジはそこで止め、残りのレースも開かない。`stopped at {race_id}: …`。User-Agent の差し替え、別の身元はしない。HTTP の export はこの取得をしない。
+
+校正は `win_prob` と `won` が両方ある行だけ。それ以外は `skipped` に数え、`calibration skipped rows without a settled win flag or win_prob`。帯は `--bins`（1 から 100、既定 10）の等幅。0 以上 1 以下。最後の帯だけ右端を含む。各帯は `lo`、`hi`、`count`、`mean_predicted`、`observed_win_rate`。件数 0 の帯は平均も実勝率も null。
+
+Brier は `(win_prob - won)^2` の平均。対数損失は自然対数。`win_prob` が 0 または 1 で、勝敗と一致するときはその行の損失を 0 にする。一致しないときは全体の `log_loss` を null にし、`log loss is undefined when win_prob is 0 or 1`。採点できる行が無いときは Brier も対数損失も null。`no settled win probabilities to score`。平均、実勝率、Brier、対数損失は小数4桁、四捨五入。
+
+同じ馬の前日と当日は別の行。校正は両方を数える。一つにまとめない。
+
+### 前日と当日
+
+```bash
+python -m backend.cli predictions diff 20261018 --json
+python -m backend.cli predictions diff 20261018 --race 202610180811 --json
+```
+
+`day_before` が前日、`pre_post_45m` が当日。同じ `race_id` の組を全部出す。同じ edition が複数あるときは、組ごとに `more than one day_before record` または `more than one pre_post_45m record`。片方しか無いときは `unpaired` と `no pre_post_45m record for this race`（または `day_before`）。
+
+馬は馬番で揃える。`win_prob_delta` は当日の確率から前日の確率を引く。片方の馬が無い、または確率が null のときは差も null。印は `ability_mark` と `buy_mark`。両方に馬がいるときだけ `marks_changed`。片側にしかいない馬は null。
+
+馬券は `ticket_type` と `combination`。当日にしか無いものは `added`、前日にしか無いものは `removed`。両方にあって `prob`、`odds`、`odds_min`、`odds_max`、`ev`、`ev_conservative`、`stake_yen`、`status`、`reason` のどれかが違うときは `changed` と、違ったフィールド名。同じ組が片側に二つあるときは比べず、`duplicate bet on day_before: win 7`。
+
+収支は精算の `payout_total_yen - stake_total_yen`。`profit_delta_yen` は当日の収支から前日の収支を引く。未精算、または合計が null の側は null。`day_before edition was not settled`、`pre_post_45m settlement total was null`。返還は精算がすでに払戻へ入れている。ここでもう一度足さない。
+
+`--race` は12桁。違う文字列は拒否する。HTTP は `race`。
+
+### 回収
+
+```bash
+python -m backend.cli predictions roi --from 20260926 --to 20261101 --by day,bet_type,surface,odds_band --json
+python -m backend.cli predictions roi --from 20261018 --by day --odds-bands 1,3,5,10 --format csv
+```
+
+`bought` だけ。`reference` は件数にも賭け金にも入れない。未精算の `bought` は入れず、`record was not settled: {record_id}`。賭け金が null、払戻が null、的中が null で返還でもない行は入れず、それぞれ warning。
+
+返還は `stake_yen` と `return_yen` の両方に入る（賭け金が戻る）。`hit_count` と的中率の分母には入れない。的中率は `hit_count / (bet_count - refund_count)`。分母が 0 のときは null。`no decided bets`。ROI は `return_yen / stake_yen - 1`。小数4桁、四捨五入。賭け金が 0 のときは null。`no stake on bought bets`。0 が元返し。`profit_yen` は `return_yen - stake_yen`。
+
+`--by` は `day`、`bet_type`、`surface`、`odds_band` のどれか。カンマ区切り。既定は四つ全部。知らない名前は拒否する。`surface` は記録の 芝 / ダート / 障害。`day` は `race.date`。
+
+オッズ帯は単一の `odds`。境界は `--odds-bands`（既定 `1,3,5,10,20,50,100`）。増加する正の数。`1` 以上 `3` 未満は `1-3`、最後の境界以上は `100+`、最初の境界未満は `<1`。境界の上の値は上の帯。ワイドは `odds` が null なので帯も null。`wide odds are a range and were not banded`。`odds_min` と `odds_max` の中点は作らない。ほかの券種で `odds` が null のときも帯は null。`odds were not on the bet`。
+
+`--format table` が既定。`csv` の空欄は null。`json` と `--json` は同じオブジェクト。`from`、`to`、`by`、`odds_bands`、`groups`、`warning`。
+
+HTTP の日付が読めないとき、範囲が逆のとき、`--by` や帯や `--bins` や `--race` が読めないときは 400。
 
 ## 対象外
 

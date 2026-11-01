@@ -18,6 +18,20 @@ from backend.models.race_trends import RaceTrendReport, TrendBucket
 from backend.models.running_style import RunningStyle
 from backend.models.training import Training
 from backend.scrapers.track_freshness import parse_race_day, require_finite_seconds
+from backend.services.prediction_report import (
+    FinalWinOdds,
+    diff_editions,
+    export_backtest,
+    format_calibration,
+    format_diff,
+    format_roi,
+    iter_meeting_records,
+    roi_as_csv,
+    roi_summary,
+    rows_as_csv,
+    rows_as_jsonl,
+    unique_race_ids,
+)
 from backend.services.prediction_store import (
     PredictionStore,
     PredictionValidationError,
@@ -472,6 +486,10 @@ def cmd_final_odds(args):
     if snapshot.warning:
         print(f"警告: {snapshot.warning}")
     print(f"取得時刻: {snapshot.fetched_at}")
+    if snapshot.payouts:
+        print("\n確定払戻:")
+        for payout in snapshot.payouts:
+            print(_format_payout(payout))
     if not snapshot.quotes:
         return
     print()
@@ -950,6 +968,119 @@ def cmd_predictions_settle(args):
         print(f"  {item['record_id']} {phase} complete={item['complete']} {warning}".rstrip())
 
 
+def _meeting_span(args) -> tuple[date, date]:
+    start = parse_meeting_date(args.date_from)
+    end = parse_meeting_date(args.date_to) if args.date_to else start
+    if end < start:
+        raise PredictionValidationError("date range ends before it starts")
+    return start, end
+
+
+def _odds_fetch_blocked(settled: SettledRaceResult) -> bool:
+    """A refused result page stops the rest of the export. A 403 in the body does not."""
+    if settled.http_status in {401, 403}:
+        return True
+    if settled.login_required:
+        return True
+    return settled.blocked_reason in {"captcha", "challenge", "login", "http_403"}
+
+
+def _fetch_final_win_odds(args, race_ids: list[str]) -> FinalWinOdds:
+    """Printed win odds from the result command. One fetch per race.
+
+    Only a confirmed and complete result contributes a price. A payout is not
+    a price. 401 / 403, login, captcha, and a challenge stop the remaining races.
+    """
+    bundle = FinalWinOdds()
+    if not race_ids:
+        return bundle
+    with _open_service(RaceService, args) as service:
+        for index, race_id in enumerate(race_ids):
+            try:
+                settled = service.get_settled_race_result(race_id)
+            except Exception:
+                logger.exception("final win odds fetch failed for %s", race_id)
+                reason = f"stopped at {race_id}: final win odds fetch failed"
+                for rest in race_ids[index:]:
+                    bundle.race_warning[rest] = reason
+                return bundle
+            if _odds_fetch_blocked(settled):
+                reason = (
+                    f"stopped at {race_id}: {settled.warning or 'final win odds fetch was refused'}"
+                )
+                for rest in race_ids[index:]:
+                    bundle.race_warning[rest] = reason
+                return bundle
+            if settled.result_phase != "confirmed" or not settled.complete:
+                bundle.race_warning[race_id] = "final win odds require a confirmed complete race"
+                continue
+            prices: dict[int, float | None] = {}
+            for row in settled.results:
+                if row.horse_number is None:
+                    continue
+                prices[row.horse_number] = row.odds
+            bundle.by_race[race_id] = prices
+    return bundle
+
+
+def cmd_predictions_export(args):
+    """Export one row per horse per prediction run, plus calibration."""
+    store = _prediction_store(args)
+    start, end = _meeting_span(args)
+    final_odds = None
+    if args.fetch_final_odds:
+        records = iter_meeting_records(store, start, end)
+        final_odds = _fetch_final_win_odds(args, unique_race_ids(records))
+    report = export_backtest(
+        store,
+        start,
+        end,
+        bins=args.bins,
+        final_win_odds=final_odds,
+    )
+    if args.format and args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = (
+            rows_as_csv(report["rows"]) if args.format == "csv" else rows_as_jsonl(report["rows"])
+        )
+        path.write_text(body, encoding="utf-8", newline="\n")
+        report = {**report, "format": args.format, "path": str(path)}
+    if args.json or not args.format:
+        print_json(report)
+        return
+    if args.output:
+        print(format_calibration(report))
+        return
+    text = rows_as_csv(report["rows"]) if args.format == "csv" else rows_as_jsonl(report["rows"])
+    sys.stdout.write(text)
+    sys.stderr.write(format_calibration(report))
+
+
+def cmd_predictions_diff(args):
+    """Compare the day-before and same-day editions of one meeting."""
+    store = _prediction_store(args)
+    report = diff_editions(store, parse_meeting_date(args.date), race_id=args.race)
+    if args.json:
+        print_json(report)
+        return
+    sys.stdout.write(format_diff(report))
+
+
+def cmd_predictions_roi(args):
+    """ROI and hit rate for settled bought bets."""
+    store = _prediction_store(args)
+    start, end = _meeting_span(args)
+    report = roi_summary(store, start, end, by=args.by, odds_bands=args.odds_bands)
+    if args.json or args.format == "json":
+        print_json(report)
+        return
+    if args.format == "csv":
+        sys.stdout.write(roi_as_csv(report))
+        return
+    sys.stdout.write(format_roi(report))
+
+
 def cmd_venues(args):
     """Get venue schedules."""
     with _open_service(RaceService, args) as service:
@@ -1130,7 +1261,9 @@ def main():
             "人気がページにあれば popularity。source と fetched_at（+09:00）。"
             "race_phase は確定オッズを載せたとき post。result_phase は着順の局面。"
             "確定かつ complete のときだけ odds_final。それ以外は quotes が空で warning。"
-            "価格は作らない。403・ログイン・captcha で取得を止める。"
+            "同じ条件のとき、依頼した馬券種の確定払戻を payouts に載せる。"
+            "ページに無い馬券種は入れず warning。価格も払戻も作らない。"
+            "403・ログイン・captcha で取得を止める。"
         ),
     )
     final_odds_parser.add_argument("race_id", help="レースID")
@@ -1261,6 +1394,8 @@ def main():
             "確率、期待値、買うかどうか、金額、rules の中身はこのコマンドでは計算しない。"
             "settle は既存の確定結果の取得が confirmed かつ complete のときだけ result を埋める。"
             "それ以外は行を変えず、報告する。401 / 403 とログインは取り直さない。"
+            "export は馬ごとの確率・予想時オッズ・着順・勝敗。確定オッズは --fetch-final-odds のときだけ。"
+            "diff は前日と当日。roi は的中率と回収。欠測は null と warning。金額は作らない。"
         ),
     )
     pred_sub = predictions_parser.add_subparsers(dest="predictions_command", required=True)
@@ -1293,6 +1428,92 @@ def main():
     settle_parser.add_argument("--date", required=True, help="YYYYMMDD または YYYY-MM-DD")
     _prediction_flags(settle_parser)
     settle_parser.set_defaults(func=cmd_predictions_settle)
+
+    export_parser = pred_sub.add_parser(
+        "export",
+        parents=[jra_flags],
+        help="馬ごとの予想と着順を CSV または JSONL で出す。校正表も付ける",
+        description=(
+            "1予想・1頭が1行。推定勝率、予想時の単勝オッズ、確定単勝オッズ、着順、勝敗、"
+            "開催日・競馬場・芝/ダート・距離・馬場・頭数。"
+            "着順と勝敗は settle 済みの result だけ。未精算は null。"
+            "確定単勝オッズは --fetch-final-odds のとき、result と同じ確定結果の印字だけ。"
+            "confirmed かつ complete でないとき、払戻からは作らない。"
+            "401 / 403・ログイン・captcha・チャレンジは残りを取りにいかない。"
+            "校正表は確率帯の件数・平均予測・実勝率、Brier、対数損失。"
+            "勝敗か勝率が null の行は校正に入れない。"
+        ),
+    )
+    export_parser.add_argument(
+        "--from", dest="date_from", required=True, help="開始日。YYYYMMDD または YYYY-MM-DD"
+    )
+    export_parser.add_argument("--to", dest="date_to", help="終了日。含む。省略すると開始日だけ")
+    export_parser.add_argument(
+        "--format", choices=["csv", "jsonl"], help="馬の行。csv の空欄は null。jsonl は null"
+    )
+    export_parser.add_argument("--output", help="--format の書き出し先。省略すると標準出力")
+    export_parser.add_argument(
+        "--bins",
+        type=int,
+        default=10,
+        help="校正の等幅の確率帯。1 から 100。既定は 10",
+    )
+    export_parser.add_argument(
+        "--fetch-final-odds",
+        action="store_true",
+        help="確定かつ complete の結果ページに印字された単勝オッズを付ける。払戻からは作らない",
+    )
+    _prediction_flags(export_parser)
+    export_parser.set_defaults(func=cmd_predictions_export)
+
+    diff_parser = pred_sub.add_parser(
+        "diff",
+        help="同じレースの前日と当日の予想を比べる",
+        description=(
+            "record_id は race_id、edition、run_at。"
+            "edition は day_before（前日）と pre_post_45m（当日）。"
+            "確率、能力印、買い目印、馬券の差。"
+            "精算済みなら二つの収支の差。未精算の収支は null。"
+            "片方しか無いレースは unpaired。"
+        ),
+    )
+    diff_parser.add_argument("date", help="開催日。YYYYMMDD または YYYY-MM-DD")
+    diff_parser.add_argument("--race", help="12桁の race_id。省略するとその日の全レース")
+    _prediction_flags(diff_parser)
+    diff_parser.set_defaults(func=cmd_predictions_diff)
+
+    roi_parser = pred_sub.add_parser(
+        "roi",
+        help="的中率と回収を日・馬券種・芝ダート・オッズ帯で集計する",
+        description=(
+            "bought だけ。reference は入れない。"
+            "返還は賭け金と払戻の両方に入り、的中率の分母からは外す。"
+            "ワイドは単一オッズが無いのでオッズ帯は null。"
+            "未精算、賭け金、払戻が無い行は集計せず warning。"
+            "ROI は払戻 / 賭け金 - 1。小数4桁。0 が元返し。"
+        ),
+    )
+    roi_parser.add_argument(
+        "--from", dest="date_from", required=True, help="開始日。YYYYMMDD または YYYY-MM-DD"
+    )
+    roi_parser.add_argument("--to", dest="date_to", help="終了日。含む。省略すると開始日だけ")
+    roi_parser.add_argument(
+        "--by",
+        default="day,bet_type,surface,odds_band",
+        help="集計キー。カンマ区切り。day、bet_type、surface、odds_band",
+    )
+    roi_parser.add_argument(
+        "--odds-bands",
+        help="オッズ帯の境界。カンマ区切りの増加する正の数。既定は 1,3,5,10,20,50,100",
+    )
+    roi_parser.add_argument(
+        "--format",
+        choices=["table", "csv", "json"],
+        default="table",
+        help="table は見出し、csv は空欄が null、json は --json と同じ",
+    )
+    _prediction_flags(roi_parser)
+    roi_parser.set_defaults(func=cmd_predictions_roi)
 
     args = parser.parse_args()
 
