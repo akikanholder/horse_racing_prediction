@@ -107,8 +107,17 @@ class RaceEntry(BaseModel):
     ``excluded``。ページに無いときは null。着順の ``finished`` はレース前には使わない。
     """
 
-    bracket_number: int = Field(..., description="枠番", ge=1, le=8)
-    horse_number: int = Field(..., description="馬番", ge=1)
+    bracket_number: int | None = Field(
+        None,
+        description="枠番 1–8。枠順確定前でページに無いときは null",
+        ge=1,
+        le=8,
+    )
+    horse_number: int | None = Field(
+        None,
+        description="馬番。枠順確定前でページに無いときは null。馬番は作らない",
+        ge=1,
+    )
     horse_name: str = Field(..., description="馬名")
     horse_id: str | None = Field(None, description="馬ID")
     sex: str | None = Field(None, description="性別 (牡/牝/セ)")

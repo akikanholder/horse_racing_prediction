@@ -57,9 +57,9 @@ python -m backend.cli odds 202605030811 --bet-types wide --prefer live --json
 | サブコマンド | `--json` の標準出力 |
 |---|---|
 | `odds` `result` `history` `trends` `track` `predictions` | JSON だけ |
-| `races` `card` `horse` `courses` `venues` | 日本語の見出しのあと JSON |
+| `races` `card` `horse` `courses` `venues` | JSON だけ。見出しは出さない |
 
-混ざるコマンドは標準出力全体を `json.loads` しない。末尾の JSON 値を読む。見つからないとき（出馬表・馬・コース）は日本語の1行だけで、`--json` でも JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
+`--json` の標準出力は JSON だけ。見出しは出さない。見つからないとき（出馬表・馬・コース）は日本語の1行を標準エラーに出し、JSON は出ない。終了コードは 0。例外は標準エラーに出て終了コード 1。
 
 HTTP は JSON だけ。見つからないレース・馬・コースは 404。サービス未初期化は 503。スクレイパ例外は 500。オッズ、確定結果、レース傾向は欠測でも 200 で、本体の `status` / `warning` を見る。傾向で日付も recent meeting も無いときは 400。
 
@@ -81,7 +81,8 @@ HTTP は JSON だけ。見つからないレース・馬・コースは 404。�
 | `python -m backend.cli trends --today --venue 東京 --json` | `GET /api/races/trends?today=true&venue=東京` | 今日（Asia/Tokyo）の確定かつ complete なレースだけ。未確定は `races_pending` |
 | `python -m backend.cli trends --date 20261018 --venue 東京 --surface 芝 --json` | `GET /api/races/trends?date=20261018&venue=東京&surface=芝` | その開催日だけ。`YYYY-MM-DD` も同じ。確定レースの人気・枠・脚質・騎手・父の集計。予想の入力にしない |
 | `python -m backend.cli trends --recent-meeting --venue 東京 --json` | `GET /api/races/trends?recent_meeting=true&venue=東京` | 当日（Asia/Tokyo）の確定と、同じ競馬場の前開催日 |
-| `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds` |
+| `python -m backend.cli odds <race_id> --bet-types win,wide,umaren,sanrenpuku --prefer live --json` | `GET /api/races/{race_id}/odds?bet_types=win,wide,umaren,sanrenpuku&prefer=live` | `RaceOdds`。`odds_phase` と `is_official_market` |
+| `python -m backend.cli race-id 2026-11-01 東京 11 --json` | （CLI のみ） | その日の開催一覧から netkeiba / JRA の race id。`--date` は付けない。日付と場とレース番号は位置引数 |
 | `python -m backend.cli final-odds <race_id> --bet-types wide,umaren,sanrenpuku --json` | `GET /api/races/{race_id}/final-odds?bet_types=wide,umaren,sanrenpuku` | `FinalRaceOdds`。過去の確定ワイド・馬連・三連複 |
 | `python -m backend.cli courses --json` | `GET /api/courses` | `Course` の配列 |
 | `python -m backend.cli courses --venue 東京 --json` | `GET /api/courses/{venue}` | `Course` |
@@ -130,8 +131,8 @@ python -m backend.cli card 202605030811 --json
 
 | フィールド | 意味 | null |
 |---|---|---|
-| `bracket_number` | 枠番 1–8 | 必須 |
-| `horse_number` | 馬番 | 必須 |
+| `bracket_number` | 枠番 1–8 | 枠順確定前でページに無いとき null |
+| `horse_number` | 馬番 | 枠順確定前でページに無いとき null。馬番は作らない |
 | `horse_name` | 馬名 | 必須 |
 | `horse_id` | netkeiba の馬ID | リンクが無いとき null。この馬は `/horses` に出ない |
 | `sex` | 牡/牝/セ | ページに無いとき null |
@@ -149,6 +150,8 @@ python -m backend.cli card 202605030811 --json
 | `fetched_at` | その区分を得た時刻 | 読めないとき null |
 
 印字が無い出走馬は `entered`。`status_label` は null。`unknown` は、区分の欄に `取消` 以外の短い文字があるとき。その文字が `status_label`。JRA の印字を優先し、JRA が無いときは netkeiba。両方に印字があるときも JRA。馬番は作らない。過去走の着順（`td.past` の `取消` / `除外`）と `非当選・非抽選馬情報` は今走の印字ではない。馬番の欄自体が `取消` の行は残す。その馬番は、並びの中で欠けている整数（4 の次が `取消` でその次が 6 なら 5）。その整数が隣の馬番と重なるときは作らない。
+
+枠順確定前（枠番・馬番のセルが空、または列自体がまだ無い）は、馬名がある行を残す。`bracket_number` と `horse_number` は null。`warning` は `post positions were not on the page`。空の出馬表にはしない。馬番は並びから作らない。EUC-JP のページは Unicode にしてから JSON（UTF-8）にする。呼び出しが `utf-8` を指定していても、バイトが EUC-JP でメタか Content-Type が EUC-JP のときは EUC-JP で読む。
 
 出馬表の表が空、または区分が埋まっていないときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、入っていればヘッドレス描画の順で足す。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いときは `headless browser is not installed`。区分がそれでも無い馬は `status` が null で、`warning` に `scratch status was not on the page`。
 
@@ -396,7 +399,20 @@ Playwright を入れる CI ワークフローはこのリポジトリに無い�
 | `warning` | 取消・除外が読めない理由。価格の失敗は `reason`。読めれば null |
 | `fetched_at` | 取得時刻。必須 |
 
-`race_phase` は API の `status` から決める。`yoso` と `middle` は `pre`（レース前）。`result` は `post`（レース後の確定オッズ）。
+`race_phase` は API の `status` から決める。`yoso` と `middle` は `pre`（レース前）。`result` は `post`（レース後の確定オッズ）。前日暫定の status 名（`provisional` など）も `pre`。
+
+`odds_phase` は発売の局面で、`race_phase` と `status` は置き換えない。
+
+| 局面 | `odds_phase` | `is_official_market` | 既存の `status` / `kind` |
+|---|---|---|---|
+| 予想オッズ（API `yoso`） | `forecast` | false | `status=yoso`、`kind=yoso` |
+| 前日暫定（status が `provisional` など、または `middle` で理由・ラベルに `暫定`） | `provisional` | false | 数字があるときは `kind=live` のまま。`status` も `live` |
+| 発売中（`middle` で暫定の印が無い） | `live` | true | `status=live`、`kind=live` |
+| 確定（`result`） | `final` | true | 発売中の `odds` は `kind=live` のまま。確定オッズの報告は `kind=result` |
+
+局面が読めない失敗は `odds_phase` も `is_official_market` も null。価格が空でも、API が `result` または `middle` と名乗ったときはその局面を残す。フラグから価格は作らない。馬券種で局面が食い違うときは両方 null と `odds phase sources disagree`。
+
+オッズ API の一時的な失敗は、同じリクエストを最大3回、待ちを 0.5 秒から倍にして取り直す。対象は、本文がオッズ API の `status` も `reason` も持たない HTTP 400、HTTP 408、HTTP 425、5xx、タイムアウト、接続エラー。`status` または `reason` がある HTTP 400 は API の答えなので取り直さない。その本文の数値は価格にしない。401、403、429、captcha、チャレンジ、ログイン画面は1回で止め、取り直さない。429 はこちらへのレート制限なので、`warning` は `netkeiba odds returned 429`、`reason` は `http 429`。User-Agent は変えない。`card` `odds` `result` `final-odds` の `--date` が日付でないとき（`2026-11-31` など）は開催一覧を開かず、`warning` に `track race date was not a date` を付ける。
 
 `OddsQuote`:
 

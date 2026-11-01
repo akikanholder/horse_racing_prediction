@@ -563,7 +563,8 @@ def test_window_cf_chl_opt_and_challenge_markers_stop_without_headless_or_cache(
 
 def test_odds_wait_stays_until_visible_cells_are_filled():
     node = shutil.which("node")
-    assert node
+    if node is None:
+        pytest.skip("node is not installed; node-based odds-wait checks are skipped")
     probe = """
 const ready = eval(process.argv[1]);
 const cases = JSON.parse(process.argv[2]);
@@ -629,7 +630,8 @@ def _dom_json(html: str) -> str:
 
 def _odds_cells_ready(html: str) -> bool:
     node = shutil.which("node")
-    assert node
+    if node is None:
+        pytest.skip("node is not installed; node-based odds-wait checks are skipped")
     probe = """
 const ready = eval(process.argv[1]);
 const root = JSON.parse(process.argv[2]);
