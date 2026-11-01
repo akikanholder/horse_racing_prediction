@@ -153,11 +153,12 @@ python -m backend.cli card 202605030811 --json
 
 枠順確定前（枠番・馬番のセルが空、または列自体がまだ無い）は、馬名がある行を残す。`bracket_number` と `horse_number` は null。`warning` は `post positions were not on the page`。空の出馬表にはしない。馬番は並びから作らない。EUC-JP のページは Unicode にしてから JSON（UTF-8）にする。呼び出しが `utf-8` を指定していても、バイトが EUC-JP でメタか Content-Type が EUC-JP のときは EUC-JP で読む。
 
-出馬表の表が空、または区分が埋まっていないときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、入っていればヘッドレス描画の順で足す。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いときは `headless browser is not installed`。区分がそれでも無い馬は `status` が null で、`warning` に `scratch status was not on the page`。
+出馬表の表が空、または区分が埋まっていないときは、ページ内の JSON、ページ自身が呼ぶ同一サイトの URL、入っていればヘッドレス描画の順で足す。403 とログイン画面は止め、User-Agent の差し替え、captcha、ログインはしない。ブラウザが無いときは `headless browser is not installed`。区分がそれでも無い馬は `status` が null で、`warning` に `scratch status was not on the page`。馬が 0 頭のときは `race card was not found`。`Race {race_id}` と競馬場 `不明` の空の表は、その警告付きで返す。
 
 `warning` の例:
 
 - `scratch status was not on the page`
+- `race card was not found`
 - `JRA shutuba returned 403`
 - `JRA shutuba requires login`
 - `netkeiba shutuba returned 403`
@@ -270,7 +271,7 @@ python -m backend.cli result 202605030811 --json
 | `payout_note` | 金額を作らなかった馬券種の注記 | 無ければ null |
 | `warning` | 着順が取れない、または頭数・区分・確定印・公式払戻が揃わない理由。複数は `; ` でつなぐ | 揃っていれば null |
 
-`results` はカードの全頭。着順表がページの `N頭` より短い、速報の `FirstDisplay` だけの表（`Table_Show_All` が無く、`5着まで` / `全着順を見る` かちょうど5行）、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
+`results` はカードの全頭。着順表がページの `N頭` より短い、速報の `FirstDisplay` だけの表（`Table_Show_All` が無く、`5着まで` / `全着順を見る` かちょうど5行）、空、壊れているときは、そのページに埋め込まれた JSON、ページ自身が呼ぶ同一サイトの結果 JSON、入っていればヘッドレス描画の順で足す。`summary` が `全着順` の表が二つあるときは、速報ではない方、同じなら行が多い方を着順にする。払戻表は着順にしない。`Table_Show_All` が付いていても、行が全部 `FirstDisplay` で `5着まで` か `全着順を見る` と書いてある表は速報のまま。着順表が無い（未確定）ときはこの順に進まない。403 とログイン画面は止め、別の身元では取りにいかない。ログインは環境変数の資格情報を渡したセッションだけ。
 
 `complete` の頭数は、返した行から取消（`scratched`）と除外（`excluded`）を引いた数と、`N頭` から同じ取消・除外を引いた数を比べる。中止と失格は走った馬として数える。速報が `N頭` を見えている5頭に書き換えていても、`Table_Show_All` の無い `FirstDisplay` だけの表は `complete: false` と `race result incomplete: N runners on the early result, full order not on the page`。`N頭` の方が大きいときは `race result incomplete: 5 of 16 runners` のように走った頭数で書く。
 
@@ -634,9 +635,21 @@ python -m backend.cli trends --today --venue 東京 --json
 python -m backend.cli trends --date 20261018 --venue 東京 --surface 芝 --json
 python -m backend.cli trends --from 2025-06-01 --to 2025-06-08 --venue 東京 --surface 芝 --distance 1600 --class 未勝利 --going 良 --json
 python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 --json
+python -m backend.cli trends 20261018 東京 --surface 芝 --timeout 20 --retries 2 --concurrency 1 --time-budget 180 --json
 ```
 
 `GET /api/races/trends`。`today` も `date` も `date_from` も `recent_meeting` も無いときは 400。`today=true` と別の日付を一緒に渡したときも 400。欠測の集計は 200 で、rate は null、`warning` を見る。
+
+CLI は `trends <開催日> <競馬場>` も受け付ける。`--date` と `--venue` と同じ。
+
+| オプション | 既定 | 意味 |
+|---|---|---|
+| `--timeout` | 20 | 1リクエストの秒数。403 を避けるための短縮ではない |
+| `--retries` | 2 | タイムアウト、5xx、接続断だけ、間隔を広げてやり直す。403、captcha、チャレンジ、ログインはやり直さない |
+| `--concurrency` | 1 | 同時に進めるレース数の上限。1 から 4。共有の HTTP セッションなので取得は 1 本ずつ |
+| `--time-budget` | なし | 全体の秒数。超えたら、取り終えたレースの集計を返し、残りは `trend time budget exhausted after {秒}s`。失敗で全体を捨てない |
+
+1レースがタイムアウトなどで落ちても、そのレースは `transient fetch failed` として残し、あとのレースは続ける。403 とログインはそこで止め、再試行しない。
 
 | クエリ | 意味 |
 |---|---|
@@ -769,7 +782,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 - `; JRA baba returned 403`
 - `; JRA baba fetch failed`
 
-403 は資格情報不足ではない。個別の `/keiba/baba/{venue}.html` は見ない。認証用の環境変数は無い。
+403 は資格情報不足ではない。個別の `/keiba/baba/{venue}.html` は見ない。認証用の環境変数は無い。accessD が 403 で、馬場情報の見出しからもラベルが取れないときは `inside_outside` と `pace_bias` は null、`blocked_reason` は `http_403`、`warning` は `day-of track bias unavailable: JRA accessD returned 403`。403 本文からラベルは作らない。馬場情報の公開ページに同じ見出しがあるときは、そのラベルを使う。それは別の公開ページであり、拒否の回避ではない。そのときは `blocked_reason` は null。
 
 見出しがあるときの形:
 
@@ -783,6 +796,7 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
   "pace_bias": "先行有利",
   "source": "accessd",
   "data_sufficiency": "sufficient",
+  "blocked_reason": null,
   "warning": null
 }
 ```
@@ -798,8 +812,9 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
   "inside_outside": null,
   "pace_bias": null,
   "source": null,
-  "data_sufficiency": "unavailable",
-  "warning": "day-of track bias unavailable without a race card"
+    "data_sufficiency": "unavailable",
+    "blocked_reason": null,
+    "warning": "day-of track bias unavailable without a race card"
 }
 ```
 
@@ -916,11 +931,13 @@ python -m backend.cli trends --recent-meeting --venue 東京 --as-of 2025-06-08 
 
 `WeeklyVenueSchedule`: `venue`, `venue_code`, `dates`, `round_number`, `conditions`, `fetched_at`。
 
+週間情報の日付は測定時刻ではない。月の無い `31日` がその月に無いときは前月（1月なら前年の12月）。月のある `12月` を1月に読んだときは前年、`1月` を12月に読んだときは翌年。`32日` と `2月31日` のように存在しない日は行にしない。
+
 `TrackInfo`（`GET /api/tracks` の値、`cli track --json` の各値）: `racecourse`, `date`, `weather`, `weather_source`, `weather_fetched_at`, `turf`, `dirt`, `grass_info`, `weekly_info`, `source`（`JRA` / `Netkeiba` / `JRA+Netkeiba`。オッズの `source` とは別の語）, `measured_at`, `is_today`, `stale`, `http_status`, `login_required`, `blocked_reason`（`captcha` / `challenge` / `login` / `http_403`、止まっていなければ null）, `warning`, `post_time`, `post_time_source`, `post_time_fetched_at`, `scraped_at`。
 
 `http_status` と `login_required` は馬場ページの取得が HTTP 401 / 403 またはログイン画面で止まったときだけ付く。本文に `403` という数字があっても付けない。captcha とチャレンジは `blocked_reason` だけで止め、`http_status` は null。JRA が 403 のとき、このフラグが付いた JRA の値は null のまま、同じ場の netkeiba 公開ページへ戻る。その netkeiba のページに測定時刻が無ければ `stale` は null。`stale` が null なことは待ちの理由にしない。
 
-`measured_at` はページに印字された測定時刻（Asia/Tokyo の ISO、例 `2026-10-16T12:00:00+09:00`）。JRA では馬場状態・クッション値・含水率の各節のうち最も新しい印字。週間情報の時刻（`10月18日（日曜） 8時現在` など）は測定にしない。節を開いた見出しより下の段の見出しは、知らない名前なら節の中に残す。h2 の中の h4 `測定時刻` は節を終わらせない。その下のドロップダウンの時刻は測定に入る。`週間情報`、`使用コース`、`芝の状態`、`散水情報` は、どの段の見出しでも、見出しでない行やラベルでも、その節を終わらせる。h2 の下の h3 `週間情報` も、行の `散水情報` も、含水率の節を終わらせ、その時刻は `measured_at` に入らない。データ行の `計測情報` のような語では終わらない。年が印字に無いときは null。`fetched_at` からは作らない。`発走` の時刻に加え、`発表予定` など発表・予定と印字された時刻も測定時刻にしない。除外は、その時刻から同じ行の次の時刻まで（次が無ければ行末まで）の、その時刻に属する文字だけを見る。`15時40分 ブラジルC 発走` のように、その時刻の直後にある `発走` は測定にしない。`5時30分 測定 発走は15時40分` の 5:30 は測定で、`発走は` は次の時刻側である。`7時00分 測定（次回発表 12時）` の 7:00 は測定で、括弧内の次回発表は 12時側である。前の行や次の行の `発表予定` は別の行の測定を消さない。分の無い `8時現在` は `08:00`、`8時半` は `08:30`、`正午現在` は `12:00`（Asia/Tokyo）。同じ行の `発走`・`発表`・`予定` は、分の無い時刻でも、その時刻に属するときだけ測定にしない。各クッション値・含水率は自分の `measured_at` と `source` と `fetched_at` を持つ。時刻の無い数値は現在の測定ではない。`measured_at` は null、`is_today` と `stale` も null のまま、`warning` に `moisture reading has no measurement time and is not current` または `cushion reading has no measurement time and is not current` を付ける。`is_today` は測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null。`stale` は測定日がレース日と違うとき true。レース日は `--date`（`YYYYMMDD` または `YYYY-MM-DD`）。省略したときは今日。日付として読めない文字列は `stale` を null のまま `track race date was not a date`。馬場ページに印字された別の日をレース日には使わない。netkeiba の開催日は、選択中のタブの `kaisai_date` を優先する。`script` や `style` の中の日付（例 `2026/04/02`）は開催日にしない。
+`measured_at` はページに印字された測定時刻（Asia/Tokyo の ISO、例 `2026-10-16T12:00:00+09:00`）。JRA では馬場状態・クッション値・含水率の各節のうち最も新しい印字。同じ節に古い測定が並んでいても、選ばれているドロップダウンか、それが無いときは最も新しい時刻を使う。データファイルの `unit` も最も新しい時刻の行を使い、先頭の古い行は使わない。馬場状態の時刻だけがレース日と違うときは `going reading is not the race date: YYYY-MM-DD`。クッション値・含水率の時刻がレース日なら、その数値を古い馬場状態の時刻では日付付けしない。週間情報の時刻（`10月18日（日曜） 8時現在` など）は測定にしない。節を開いた見出しより下の段の見出しは、知らない名前なら節の中に残す。h2 の中の h4 `測定時刻` は節を終わらせない。その下のドロップダウンの時刻は測定に入る。`週間情報`、`使用コース`、`芝の状態`、`散水情報` は、どの段の見出しでも、見出しでない行やラベルでも、その節を終わらせる。h2 の下の h3 `週間情報` も、行の `散水情報` も、含水率の節を終わらせ、その時刻は `measured_at` に入らない。データ行の `計測情報` のような語では終わらない。年が印字に無いときは null。`fetched_at` からは作らない。`発走` の時刻に加え、`発表予定` など発表・予定と印字された時刻も測定時刻にしない。除外は、その時刻から同じ行の次の時刻まで（次が無ければ行末まで）の、その時刻に属する文字だけを見る。`15時40分 ブラジルC 発走` のように、その時刻の直後にある `発走` は測定にしない。`5時30分 測定 発走は15時40分` の 5:30 は測定で、`発走は` は次の時刻側である。`7時00分 測定（次回発表 12時）` の 7:00 は測定で、括弧内の次回発表は 12時側である。前の行や次の行の `発表予定` は別の行の測定を消さない。分の無い `8時現在` は `08:00`、`8時半` は `08:30`、`正午現在` は `12:00`（Asia/Tokyo）。同じ行の `発走`・`発表`・`予定` は、分の無い時刻でも、その時刻に属するときだけ測定にしない。各クッション値・含水率は自分の `measured_at` と `source` と `fetched_at` を持つ。時刻の無い数値は現在の測定ではない。`measured_at` は null、`is_today` と `stale` も null のまま、`warning` に `moisture reading has no measurement time and is not current` または `cushion reading has no measurement time and is not current` を付ける。`is_today` は測定日が今日（Asia/Tokyo）のとき true。測定時刻が無ければ null。`stale` は測定日がレース日と違うとき true。レース日は `--date`（`YYYYMMDD` または `YYYY-MM-DD`）。省略したときは今日。日付として読めない文字列は `stale` を null のまま `track race date was not a date`。馬場ページに印字された別の日をレース日には使わない。netkeiba の開催日は、選択中のタブの `kaisai_date` を優先する。`script` や `style` の中の日付（例 `2026/04/02`）は開催日にしない。
 
 測定日がレース日でないときは `warning` に `track measurement is not the race date: YYYY-MM-DD`。応答ヘッダ（`x-cache` / `x-cache-status` / `cf-cache-status` / `x-akamai-cache`）が `HIT` のときは `track response was a cached copy`。`Age` だけでは HIT にしない。数値は HIT の本文のまま返す。
 

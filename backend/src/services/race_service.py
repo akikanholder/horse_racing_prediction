@@ -42,6 +42,7 @@ from backend.scrapers.netkeiba_scraper import NetkeibaScraper
 from backend.scrapers.runner_status import (
     JRA_ODDS_FETCH_FAILED,
     POST_POSITIONS_MISSING,
+    RACE_CARD_NOT_FOUND,
     SCRATCH_STATUS_MISSING,
     ScratchPage,
     apply_scratch_page,
@@ -417,6 +418,10 @@ class RaceService:
         as_of: date | None = None,
         today: bool = False,
         fetch_mode: str | None = None,
+        request_timeout: float | None = None,
+        retries: int = 0,
+        concurrency: int = 1,
+        time_budget: float | None = None,
     ) -> RaceTrendReport:
         """Win, top-2, top-3, and ROI tables over settled history.
 
@@ -436,10 +441,14 @@ class RaceService:
                 on_date=on_date,
                 date_from=date_from,
                 date_to=date_to,
-                recent_meeting=recent_meeting,
-                as_of=as_of,
-                today=today,
-            )
+            recent_meeting=recent_meeting,
+            as_of=as_of,
+            today=today,
+            request_timeout=request_timeout,
+            retries=retries,
+            concurrency=concurrency,
+            time_budget=time_budget,
+        )
 
     def get_final_combination_odds(
         self,
@@ -792,6 +801,8 @@ class RaceService:
         if race.entry_count is None and entries:
             race = race.model_copy(update={"entry_count": len(entries)})
         warning = join_warnings(jra_card.warning, netkeiba_card.warning)
+        if not entries:
+            warning = join_warnings(warning, RACE_CARD_NOT_FOUND)
         if entries and all(
             entry.bracket_number is not None and entry.horse_number is not None
             for entry in entries
@@ -826,6 +837,7 @@ class RaceService:
                 "source": publication.source,
                 "warning": publication.warning,
                 "data_sufficiency": publication.data_sufficiency,
+                "blocked_reason": publication.blocked_reason,
             }
         )
         race = card.race.model_copy(update={"track_bias": bias})

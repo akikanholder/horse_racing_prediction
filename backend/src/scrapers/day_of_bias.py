@@ -75,6 +75,7 @@ class DayOfBiasPublication:
     source: str | None
     warning: str | None
     data_sufficiency: str
+    blocked_reason: str | None = None
 
 
 def not_loaded_publication() -> DayOfBiasPublication:
@@ -166,13 +167,15 @@ def assemble_publication(
             warning=warning,
             data_sufficiency="thin",
         )
-    return DayOfBiasPublication(
+    publication = DayOfBiasPublication(
         inside_outside=None,
         pace_bias=None,
         source=None,
         warning=_unavailable_warning(accessd_status, baba_status),
         data_sufficiency="unavailable",
+        blocked_reason=_bias_block(accessd_status, baba_status),
     )
+    return publication
 
 
 class DayOfBiasClient:
@@ -256,6 +259,13 @@ class DayOfBiasClient:
         if saw_403:
             return None, "403"
         return None, "no_page"
+
+
+def _bias_block(accessd_status: str, baba_status: str) -> str | None:
+    """403 stops the lookup. A label from the other public JRA page clears it."""
+    if accessd_status == "403" or baba_status == "403":
+        return "http_403"
+    return None
 
 
 def _unavailable_warning(accessd_status: str, baba_status: str) -> str:
