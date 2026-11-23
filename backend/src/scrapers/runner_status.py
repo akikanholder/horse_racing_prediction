@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 SCRATCH_STATUS_MISSING = "scratch status was not on the page"
 POST_POSITIONS_MISSING = "post positions were not on the page"
+RACE_CARD_NOT_FOUND = "race card was not found"
 JRA_SHUTUBA_FORBIDDEN = "JRA shutuba returned 403"
 JRA_SHUTUBA_LOGIN = "JRA shutuba requires login"
 NETKEIBA_SHUTUBA_FORBIDDEN = "netkeiba shutuba returned 403"

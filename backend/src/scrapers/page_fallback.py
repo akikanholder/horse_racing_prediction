@@ -33,6 +33,11 @@ _JSON_URL = re.compile(
     r"""(?:url|URL)\s*:\s*['"]([^'"]+)['"]""",
 )
 _RESULT_API = re.compile(r"/api/[^\"'\s]*result", re.IGNORECASE)
+# A script can call the result API with $.get or fetch, not only ``url:``.
+_RESULT_CALL = re.compile(
+    r"""['"]([^'"]*(?:/api/[^'"\s]*result|ajax_result|result_all)[^'"]*)['"]""",
+    re.IGNORECASE,
+)
 _HORSE_RESULT_PATH = re.compile(
     r"/horse/[^\"'\s]*result|/api/[^\"'\s]*result",
     re.IGNORECASE,
@@ -304,9 +309,11 @@ def headless_browser_installed() -> bool:
 # incomplete. A 401/403 is raised before this runs and is not retried.
 RESULT_TABLE_WAIT_MS = 15_000
 RESULT_TABLE_READY_JS = """() => {
-  const table = document.querySelector('#All_Result_Table, table[summary="全着順"]');
-  if (!table) return false;
-  const rows = Array.from(table.querySelectorAll('tr')).filter((tr) => tr.querySelector('td'));
+  const tables = Array.from(document.querySelectorAll('#All_Result_Table, table[summary="全着順"]'));
+  if (!tables.length) return false;
+  const dataRows = (table) => Array.from(table.querySelectorAll('tr')).filter((tr) => tr.querySelector('td'));
+  const table = tables.reduce((best, item) => dataRows(item).length > dataRows(best).length ? item : best);
+  const rows = dataRows(table);
   if (!rows.length) return false;
   const className = String(table.className || '');
   const flash = !className.includes('Table_Show_All')
@@ -469,9 +476,12 @@ def same_site_result_urls(html: str, page_url: str) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
     page = urlparse(page_url)
-    for match in _JSON_URL.finditer(html):
-        raw = match.group(1).strip()
-        if not _RESULT_API.search(raw.split("?", 1)[0]):
+    raw_urls = [match.group(1).strip() for match in _JSON_URL.finditer(html)]
+    raw_urls.extend(match.group(1).strip() for match in _RESULT_CALL.finditer(html))
+    for raw in raw_urls:
+        if _BLOCKED_URL.search(raw):
+            continue
+        if not _RESULT_API.search(raw.split("?", 1)[0]) and not _RESULT_CALL.search(f"'{raw}'"):
             continue
         absolute = urljoin(page_url, raw)
         parsed = urlparse(absolute)

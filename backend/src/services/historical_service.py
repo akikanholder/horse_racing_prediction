@@ -16,6 +16,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import requests
+
 from backend.models.historical import (
     HISTORICAL_REQUEST_DELAY,
     HISTORICAL_START,
@@ -104,6 +106,9 @@ class HistoricalService:
     ):
         self.delay_seconds = delay_seconds
         self._sleeper = sleeper
+        self._race_retries = 0
+        self._keep_partial = False
+        self._concurrency = 1
         self._owns_clients = netkeiba is None and jra is None and odds is None
         self.http: CachingHTTPClient | None = None
         if self._owns_clients:
@@ -151,6 +156,10 @@ class HistoricalService:
         flat_only: bool = True,
         priority_venues: bool = False,
         resume_from: str | None = None,
+        request_timeout: float | None = None,
+        retries: int = 0,
+        concurrency: int = 1,
+        time_budget: float | None = None,
     ) -> HistoricalBatch:
         """One race, one day, or an inclusive date range.
 
@@ -158,18 +167,49 @@ class HistoricalService:
         with ``delay_seconds`` between them. A direct ``race_id`` is returned
         even when it is out of scope, with ``in_scope`` false.
 
-        A 403 or a login wall on the race list or the result page stops the
-        range. That request is not retried, and later races are not opened.
+        A 403, a 429, or a login wall on the race list or the result page
+        stops the range. That request is not retried, and later races are not
+        opened. 429 is a rate limit: the warning is ``http_429``.
         A confirmed and complete result page already stored in the cache is
         not requested again. A result page that is not final is not a cache
         hit, so a later run can read the settled page. ``resume_from`` loads
         earlier races from the cache only. ``progress.json`` is written on
         export and is not a cursor this method reads.
+
+        ``request_timeout`` is the per-request limit in seconds. ``retries``
+        repeats a race only after a timeout, a 5xx, or a connection reset.
+        403, 429, captcha, a challenge, and a login wall are not retried and
+        still stop the range. ``concurrency`` is accepted in 1..4. The shared
+        session fetches one race at a time, so a higher cap does not open
+        extra connections. ``time_budget`` stops before the next race once
+        that many seconds have passed and returns the races already read,
+        with the rest listed and a warning. It does not drop those races.
         """
+        if concurrency < 1 or concurrency > 4:
+            raise ValueError("concurrency must be from 1 to 4")
+        self._concurrency = concurrency
+        if request_timeout is not None:
+            self._apply_timeout(request_timeout)
+        self._race_retries = max(0, retries)
+        self._keep_partial = self._race_retries > 0 or time_budget is not None
         fetched_at = tokyo_now()
         selected = _venue_filter(venues, priority_venues)
         if race_id:
-            record, blocked = self._one(race_id, fetched_at)
+            record, blocked, transient = self._one_with_retry(race_id, fetched_at)
+            if transient:
+                return HistoricalBatch(
+                    races=[record],
+                    skipped=0,
+                    flat_only=flat_only,
+                    venues=list(selected),
+                    date_from=None,
+                    date_to=None,
+                    stopped_at_race_id=None,
+                    completed_race_ids=[],
+                    remaining_race_ids=[],
+                    fetched_at=fetched_at,
+                    warning=record.warning,
+                )
             record = _apply_scope(record, venues=selected, flat_only=flat_only)
             if blocked:
                 return HistoricalBatch(
@@ -225,6 +265,10 @@ class HistoricalService:
             try:
                 listed = self.netkeiba.get_races_by_date(day)
             except Exception as exc:
+                if _rate_limited(exc):
+                    logger.warning("Race list rate limited for %s: %s", day, exc)
+                    notes.append("race list returned 429")
+                    break
                 block = _list_block_warning(exc)
                 if block is not None:
                     logger.warning("Race list blocked for %s: %s", day, exc)
@@ -272,7 +316,14 @@ class HistoricalService:
         stopped_at: str | None = None
         remaining: list[str] = []
         network_started = False
+        started = time.monotonic()
+        if time_budget is not None and time_budget < 0:
+            raise ValueError("time_budget must be a finite number >= 0")
         for index, planned_id in enumerate(planned):
+            if time_budget is not None and time.monotonic() - started >= time_budget:
+                notes.append(f"trend time budget exhausted after {time_budget:g}s")
+                remaining = planned[index:]
+                break
             cached = self._result_cached(planned_id)
             if index < start_at and not cached:
                 continue
@@ -280,7 +331,11 @@ class HistoricalService:
                 if network_started and self.delay_seconds > 0:
                     self._sleeper(self.delay_seconds)
                 network_started = True
-            record, blocked = self._one(planned_id, tokyo_now())
+            record, blocked, transient = self._one_with_retry(planned_id, tokyo_now())
+            if transient:
+                notes.append(f"{planned_id}: transient fetch failed")
+                races.append(record)
+                continue
             record = _apply_scope(record, venues=selected, flat_only=flat_only)
             if blocked:
                 notes.append(_stop_line(planned_id, record.result.warning))
@@ -383,6 +438,45 @@ class HistoricalService:
             fetched_at=fetched_at,
             warning=join_warnings(*notes),
         )
+
+    def _apply_timeout(self, seconds: float) -> None:
+        """Set the per-request timeout on the clients this service owns."""
+        from backend.scrapers.track_freshness import require_finite_seconds
+
+        limit = require_finite_seconds(seconds, "timeout")
+        clients = [self.http]
+        for scraper in (self.netkeiba, self.jra, self.odds):
+            clients.append(getattr(scraper, "http_client", None))
+        for client in clients:
+            if client is not None and hasattr(client, "timeout"):
+                client.timeout = limit
+
+    def _one_with_retry(self, race_id: str, fetched_at: datetime) -> tuple[HistoricalRace, bool, bool]:
+        """One race. Transient errors retry. A refusal does not.
+
+        The third value is true when the race was given up after a timeout,
+        a 5xx, or a connection reset. The record stays in the batch.
+        """
+        attempts = self._race_retries + 1
+        last: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                record, blocked = self._one(race_id, fetched_at)
+                return record, blocked, False
+            except Exception as exc:
+                if _rate_limited(exc):
+                    return _failed_race(race_id, fetched_at, "http_429"), True, False
+                if not _transient_failure(exc):
+                    raise
+                last = exc
+                if attempt + 1 >= attempts:
+                    if not self._keep_partial:
+                        raise
+                    break
+                self._sleeper(min(8.0, 0.5 * (2**attempt)))
+        warning = "transient fetch failed"
+        logger.warning("Transient fetch failed for %s: %s", race_id, last)
+        return _failed_race(race_id, fetched_at, warning), False, True
 
     def _one(self, race_id: str, fetched_at: datetime) -> tuple[HistoricalRace, bool]:
         stamped = self._cached_stamp(race_id) or fetched_at
@@ -568,6 +662,51 @@ class HistoricalService:
         return self.http.cached_fetched_at("GET", RESULT_URL, {"race_id": race_id})
 
 
+def _failed_race(race_id: str, fetched_at: datetime, warning: str) -> HistoricalRace:
+    """A race the network gave up on. No finishers are invented."""
+    settled = SettledRaceResult(
+        race_id=race_id,
+        fetched_at=fetched_at,
+        complete=False,
+        results=[],
+        payouts=[],
+        warning=warning,
+    )
+    return HistoricalRace(
+        race_id=race_id,
+        in_scope=True,
+        result=settled,
+        fetched_at=fetched_at,
+        warning=warning,
+    )
+
+
+def _rate_limited(exc: BaseException) -> bool:
+    """HTTP 429 is a rate limit. Do not retry it and do not keep fetching."""
+    if getattr(exc, "reason", None) == "http_429":
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 429
+
+
+def _transient_failure(exc: BaseException) -> bool:
+    """Timeouts, 5xx, and connection resets. A refusal or a 429 is not transient."""
+    if isinstance(exc, AccessBlocked) or _rate_limited(exc):
+        return False
+    reason = getattr(exc, "reason", None)
+    if reason in {"captcha", "challenge", "login", "http_403", "http_429"}:
+        return False
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {401, 403, 429}:
+        return False
+    if status in {500, 502, 503, 504}:
+        return True
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "connection reset" in text
+
+
 def _is_result_block(warning: str | None) -> bool:
     """A refused result page stops the range. Odds gaps do not."""
     if not warning:
@@ -576,7 +715,9 @@ def _is_result_block(warning: str | None) -> bool:
 
 
 def _stop_line(race_id: str, warning: str | None) -> str:
-    if warning and RACE_RESULT_LOGIN in warning:
+    if warning and "http_429" in warning:
+        reason = "http_429"
+    elif warning and RACE_RESULT_LOGIN in warning:
         reason = RACE_RESULT_LOGIN
     else:
         reason = RACE_RESULT_FORBIDDEN

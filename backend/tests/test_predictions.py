@@ -390,6 +390,32 @@ def test_scratched_horse_is_refunded_at_stake(tmp_path: Path):
     assert lines["roi"] == 0.2
 
 
+def test_excluded_is_refunded_and_a_non_finish_is_not(tmp_path: Path):
+    """除外 returns the stake. 中止 and 失格 do not."""
+    bets = [
+        _bet("win", [2], stake=200),
+        _bet("win", [3], stake=200),
+        _bet("win", [4], stake=200),
+    ]
+    store = _store(tmp_path)
+    store.add([_with_bets(bets)])
+    fetched = _settled(
+        results=[
+            _finish(1, 1),
+            _finish(2, None, "excluded"),
+            _finish(3, None, "did_not_finish"),
+            _finish(4, None, "disqualified"),
+        ],
+        payouts=[_payout("単勝", "1", 150)],
+        refunds=None,
+    )
+    _settle(store, lambda _race_id: fetched)
+    lines = store.read(datetime.strptime(DAY, "%Y-%m-%d").date())[0]["result"]["settlement"]["bets"]
+    assert lines[0] == {"index": 0, "hit": False, "refunded": True, "payout_yen": 200}
+    assert lines[1] == {"index": 1, "hit": False, "refunded": False, "payout_yen": 0}
+    assert lines[2] == {"index": 2, "hit": False, "refunded": False, "payout_yen": 0}
+
+
 def test_refund_list_does_not_spread_to_other_tickets(tmp_path: Path):
     bets = [
         _bet("win", [5], stake=100),
