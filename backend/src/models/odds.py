@@ -11,6 +11,8 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from backend.models.race import RacePayout
+
 OddsSource = Literal[
     "netkeiba_yoso",
     "netkeiba_live",
@@ -333,4 +335,12 @@ class FinalRaceOdds(RaceOdds):
     odds_final: bool = Field(
         False,
         description="result_phase が confirmed、complete が true、確定オッズを載せたときだけ true",
+    )
+    payouts: list[RacePayout] = Field(
+        default_factory=list,
+        description=(
+            "確定払戻のうち、依頼した馬券種だけ。ワイド・馬連・三連複。"
+            "着順が confirmed かつ complete のときだけ載せる。"
+            "ページに無い馬券種は入れない。オッズからも金額は作らない。"
+        ),
     )

@@ -359,6 +359,13 @@ def test_confirmed_race_returns_final_combination_odds():
     assert by_key[("sanrenpuku", "1-3-5")].odds == 40.6
     assert all(quote.source == "jra_html" for quote in snapshot.quotes)
     assert all(quote.bet_type != "win" for quote in snapshot.quotes)
+    assert [(row.bet_type, row.combination, row.payout) for row in snapshot.payouts] == [
+        ("ワイド", "1-3", 280),
+        ("ワイド", "1-5", 500),
+        ("ワイド", "3-5", 610),
+        ("馬連", "1-3", 1240),
+        ("3連複", "1-3-5", 4060),
+    ]
     assert "1.1" not in _prices(snapshot)
 
 
@@ -372,6 +379,7 @@ def test_payout_disagreement_keeps_the_printed_odds():
     quote = _by_key(snapshot.quotes)[("umaren", "1-3")]
     assert quote.odds == 12.4
     assert snapshot.warning == "final odds and payout disagree: umaren 1-3"
+    assert [(row.bet_type, row.payout) for row in snapshot.payouts] == [("馬連", 2000)]
 
 
 def test_provisional_result_does_not_open_odds_pages():
@@ -386,6 +394,7 @@ def test_provisional_result_does_not_open_odds_pages():
     assert snapshot.race_phase is None
     assert snapshot.result_phase == "provisional"
     assert snapshot.warning == "result phase is provisional"
+    assert snapshot.payouts == []
     _assert_final_clock(snapshot)
 
 
@@ -419,6 +428,17 @@ def test_result_403_does_not_open_odds_pages():
     assert snapshot.quotes == []
     assert snapshot.odds_final is False
     assert snapshot.warning == "race result returned 403"
+
+
+def test_missing_combination_payout_is_named_and_not_invented():
+    pages = PublicOddsPages([_page(_load("jra_last_odds.html"))], None, False)
+    html = _result_html(payouts=_payout_row("ワイド", [("1", "3")], [280], [2]))
+    service, _client, _jra = _service(html, pages)
+    snapshot = service.get(RACE_ID)
+
+    assert [(row.bet_type, row.payout) for row in snapshot.payouts] == [("ワイド", 280)]
+    assert snapshot.warning == "confirmed payout was not on the result: umaren, sanrenpuku"
+    assert all(row.bet_type != "馬連" for row in snapshot.payouts)
 
 
 def test_live_board_is_not_copied_onto_a_confirmed_race():
