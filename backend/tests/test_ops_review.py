@@ -316,16 +316,12 @@ def test_time_budget_returns_the_races_already_read(monkeypatch: pytest.MonkeyPa
     assert "trend time budget exhausted after 10s" in batch.warning
 
 
-def test_cli_trends_help_lists_the_budget_options():
-    import subprocess
-
-    completed = subprocess.run(
-        ["python3", "-m", "backend.cli", "trends", "--help"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    help_text = completed.stdout
+def test_cli_trends_help_lists_the_budget_options(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["backend.cli", "trends", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        cli_main()
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
     for flag in ("--timeout", "--retries", "--concurrency", "--time-budget", "20261018"):
         assert flag in help_text
 
