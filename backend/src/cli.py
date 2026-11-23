@@ -1562,7 +1562,8 @@ def main():
             "少ない標本も sample_size 付きで残す。計算できない値は null と warning。"
             "入れるのは result_phase が confirmed かつ complete が true のレースだけ。"
             "未確定は races_pending に数え、着順は作らない。"
-            "403 とログイン画面は再試行せず、User-Agent の差し替えや captcha はしない。"
+            "403、429、ログイン画面は再試行せず、User-Agent の差し替えや captcha はしない。"
+            "429 はレート制限で、http_429 を記録してその先のレースは開かない。"
             "--today は今日（Asia/Tokyo）の1日。--date もその開催日だけ。"
             "未確定の result.html と、今日の開催一覧はキャッシュから返さない。"
             "--recent-meeting は当日の確定と、同じ競馬場の前開催日だけ。"
@@ -1614,7 +1615,7 @@ def main():
         "--retries",
         type=int,
         default=2,
-        help="タイムアウト・5xx・接続断だけ再試行する回数。403・captcha・ログインは再試行しない",
+        help="タイムアウト・5xx・接続断だけ再試行する回数。403・429・captcha・ログインは再試行しない",
     )
     trends_parser.add_argument(
         "--concurrency",

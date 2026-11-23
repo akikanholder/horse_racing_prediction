@@ -167,8 +167,9 @@ class HistoricalService:
         with ``delay_seconds`` between them. A direct ``race_id`` is returned
         even when it is out of scope, with ``in_scope`` false.
 
-        A 403 or a login wall on the race list or the result page stops the
-        range. That request is not retried, and later races are not opened.
+        A 403, a 429, or a login wall on the race list or the result page
+        stops the range. That request is not retried, and later races are not
+        opened. 429 is a rate limit: the warning is ``http_429``.
         A confirmed and complete result page already stored in the cache is
         not requested again. A result page that is not final is not a cache
         hit, so a later run can read the settled page. ``resume_from`` loads
@@ -177,8 +178,8 @@ class HistoricalService:
 
         ``request_timeout`` is the per-request limit in seconds. ``retries``
         repeats a race only after a timeout, a 5xx, or a connection reset.
-        403, captcha, a challenge, and a login wall are not retried and still
-        stop the range. ``concurrency`` is accepted in 1..4. The shared
+        403, 429, captcha, a challenge, and a login wall are not retried and
+        still stop the range. ``concurrency`` is accepted in 1..4. The shared
         session fetches one race at a time, so a higher cap does not open
         extra connections. ``time_budget`` stops before the next race once
         that many seconds have passed and returns the races already read,
@@ -264,6 +265,10 @@ class HistoricalService:
             try:
                 listed = self.netkeiba.get_races_by_date(day)
             except Exception as exc:
+                if _rate_limited(exc):
+                    logger.warning("Race list rate limited for %s: %s", day, exc)
+                    notes.append("race list returned 429")
+                    break
                 block = _list_block_warning(exc)
                 if block is not None:
                     logger.warning("Race list blocked for %s: %s", day, exc)
@@ -459,6 +464,8 @@ class HistoricalService:
                 record, blocked = self._one(race_id, fetched_at)
                 return record, blocked, False
             except Exception as exc:
+                if _rate_limited(exc):
+                    return _failed_race(race_id, fetched_at, "http_429"), True, False
                 if not _transient_failure(exc):
                     raise
                 last = exc
@@ -674,17 +681,25 @@ def _failed_race(race_id: str, fetched_at: datetime, warning: str) -> Historical
     )
 
 
+def _rate_limited(exc: BaseException) -> bool:
+    """HTTP 429 is a rate limit. Do not retry it and do not keep fetching."""
+    if getattr(exc, "reason", None) == "http_429":
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 429
+
+
 def _transient_failure(exc: BaseException) -> bool:
-    """Timeouts, 5xx, and connection resets. A refusal is not transient."""
-    if isinstance(exc, AccessBlocked):
+    """Timeouts, 5xx, and connection resets. A refusal or a 429 is not transient."""
+    if isinstance(exc, AccessBlocked) or _rate_limited(exc):
         return False
     reason = getattr(exc, "reason", None)
-    if reason in {"captcha", "challenge", "login", "http_403"}:
+    if reason in {"captcha", "challenge", "login", "http_403", "http_429"}:
         return False
     status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status in {401, 403}:
+    if status in {401, 403, 429}:
         return False
-    if status in {429, 500, 502, 503, 504}:
+    if status in {500, 502, 503, 504}:
         return True
     if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
         return True
@@ -700,7 +715,9 @@ def _is_result_block(warning: str | None) -> bool:
 
 
 def _stop_line(race_id: str, warning: str | None) -> str:
-    if warning and RACE_RESULT_LOGIN in warning:
+    if warning and "http_429" in warning:
+        reason = "http_429"
+    elif warning and RACE_RESULT_LOGIN in warning:
         reason = RACE_RESULT_LOGIN
     else:
         reason = RACE_RESULT_FORBIDDEN

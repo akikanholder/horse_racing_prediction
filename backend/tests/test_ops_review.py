@@ -268,6 +268,61 @@ def test_transient_failures_retry_and_a_403_does_not():
     assert _transient_failure(AccessBlocked(403, "returned 403")) is False
 
 
+def test_http_429_is_not_retried_and_stops_the_range():
+    """A 429 is a rate limit. Do not retry it, and do not open the next race."""
+    day = date(2026, 10, 18)
+    seen: list[str] = []
+    slept: list[float] = []
+    limited = requests.HTTPError("429")
+    response = requests.Response()
+    response.status_code = 429
+    limited.response = response
+
+    class _Net:
+        def get_races_by_date(self, target):
+            assert target == day
+            return [
+                Race(
+                    race_id=race_id,
+                    race_name="テスト",
+                    race_number=number,
+                    race_date=day,
+                    venue="東京",
+                    distance=1600,
+                    track_type="芝",
+                )
+                for number, race_id in enumerate(("202605040701", "202605040702"), start=1)
+            ]
+
+        def get_settled_race_result(self, race_id: str, fetched_at=None):
+            seen.append(race_id)
+            raise limited
+
+        def close(self) -> None:
+            return None
+
+    class _Quiet:
+        def close(self) -> None:
+            return None
+
+    service = HistoricalService(
+        netkeiba=_Net(),  # type: ignore[arg-type]
+        jra=_Quiet(),  # type: ignore[arg-type]
+        odds=_Quiet(),  # type: ignore[arg-type]
+        delay_seconds=0,
+        sleeper=slept.append,
+    )
+    batch = service.get(on_date=day, retries=2)
+    assert _transient_failure(limited) is False
+    assert seen == ["202605040701"]
+    assert slept == []
+    assert batch.stopped_at_race_id == "202605040701"
+    assert batch.remaining_race_ids[0] == "202605040701"
+    assert "202605040702" in batch.remaining_race_ids
+    assert batch.warning is not None
+    assert "http_429" in batch.warning
+
+
 def test_time_budget_returns_the_races_already_read(monkeypatch: pytest.MonkeyPatch):
     day = date(2026, 10, 18)
     seen: list[str] = []
